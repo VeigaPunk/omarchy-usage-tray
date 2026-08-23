@@ -99,6 +99,7 @@ def main() -> int:
         "on-scroll-up": f"{bin_path} cycle next; pkill -x -RTMIN+{sig} waybar",
         "on-scroll-down": f"{bin_path} cycle prev; pkill -x -RTMIN+{sig} waybar",
         "on-click": f"{bin_path} cycle next; pkill -x -RTMIN+{sig} waybar",
+        "on-click-right": f"{bin_path} identity next; pkill -x -RTMIN+{sig} waybar",
     }
     cfg_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     snippet = css_src.read_text(encoding="utf-8").strip()

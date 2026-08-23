@@ -37,13 +37,17 @@ text="$(echo "$json" | jq -r .text)"
 tooltip="$(echo "$json" | jq -r .tooltip)"
 class="$(echo "$json" | jq -r .class)"
 
-# Pinned fixture meters: weekly 75% → 4/5, special 62% → 3/5. One horizontal line.
+# Pinned fixture meters: white-on-gray pango bars, no block-grid glyphs.
 if [[ "$text" == *$'\n'* ]]; then
   echo "FAIL: expected one-line text, got: $text" >&2
   exit 1
 fi
-if [[ "$text" != *'C ▓▓▓▓░ ▓▓▓░░'* ]]; then
-  echo "FAIL: expected 'C ▓▓▓▓░ ▓▓▓░░', got: $text" >&2
+if [[ "$text" != *bgcolor* ]]; then
+  echo "FAIL: expected pango bgcolor meters, got: $text" >&2
+  exit 1
+fi
+if [[ "$text" == *▓* || "$text" == *░* ]]; then
+  echo "FAIL: block-grid glyphs still in text: $text" >&2
   exit 1
 fi
 if [[ -z "$tooltip" ]]; then
@@ -74,7 +78,7 @@ payload = json.loads(out)
 if "—" not in payload["text"] and "–" not in payload["text"]:
     raise SystemExit(f"FAIL: missing window must render em-dash, got {payload['text']!r}")
 # A guessed 0-fill would be five empty blocks without a dash.
-if "░░░░░" in payload["text"] and "—" not in payload["text"]:
+if "░" in payload["text"] and "—" not in payload["text"]:
     raise SystemExit("FAIL: invented empty-bar percent for missing window")
 print("MISSING_WINDOW_OK")
 
@@ -102,7 +106,7 @@ if "\n" in text:
     raise SystemExit(f"FAIL: unauth chip must be one line, got {text!r}")
 if "—" not in text and "–" not in text:
     raise SystemExit(f"FAIL: unauth text must contain em-dash, got {text!r}")
-if "░░░░░" in text:
+if "░" in text or "▓" in text:
     raise SystemExit(f"FAIL: unauth must not render empty-block 0%, got {text!r}")
 if payload.get("class") and "ok" == payload["class"]:
     raise SystemExit(f"FAIL: unauth class looks ok: {payload['class']!r}")

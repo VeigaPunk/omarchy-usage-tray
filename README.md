@@ -1,7 +1,8 @@
 # omarchy-usage-tray
 
 Waybar chip for Omarchy: Codex, Grok, Kimi, and Alibaba Token Plan usage.
-Click or scroll to cycle providers.
+Left-click or scroll to cycle providers; right-click cycles identities for the
+selected provider when supported.
 
 ## Install
 
@@ -22,7 +23,8 @@ Re-run the same line to update.
 
 | Gesture | Action |
 |---|---|
-| Click | Next provider |
+| Left-click | Next provider |
+| Right-click | Next identity (Token Plan: `team` / `gmail`) |
 | Scroll | Cycle providers |
 
 ## Local clone

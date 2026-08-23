@@ -23,7 +23,10 @@ from urllib.parse import urlencode
 import tomllib
 
 VERSION = 1
-METER_WIDTH = 5
+METER_WIDTH = 6
+METER_FILL = "#f2f2f2"
+METER_TRACK = "#3a3a3a"
+NBSP = "\u00a0"
 TUI_METER_WIDTH = 20
 STALE_AFTER_SEC = 20 * 60
 CODEX_CMD = ["codex", "-s", "read-only", "-a", "never", "app-server"]
@@ -530,9 +533,67 @@ def probe_codex(fixture: str | None = None) -> dict:
 # --- Token Plan --------------------------------------------------------------
 
 
+def token_plan_conf() -> Path:
+    return Path(
+        os.environ.get(
+            "AI_USAGE_TOKEN_PLAN_CONF",
+            Path.home() / ".config" / "alibaba-token-plan",
+        )
+    )
+
+
+def token_plan_identities() -> list[dict]:
+    path = token_plan_conf() / "slots"
+    out: list[dict] = []
+    if not path.is_file():
+        return out
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        sid = parts[0].strip()
+        if not sid:
+            continue
+        title = parts[2].strip() if len(parts) > 2 else sid
+        ident = parts[3].strip() if len(parts) > 3 else ""
+        out.append({"id": sid, "label": sid, "title": title, "ident": ident})
+    return out
+
+
+def token_plan_active_id() -> str | None:
+    path = token_plan_conf() / "active"
+    if not path.is_file():
+        return None
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def attach_token_plan_identity(rec: dict) -> dict:
+    slots = token_plan_identities()
+    if not slots:
+        return rec
+    active = token_plan_active_id() or slots[0]["id"]
+    match = next((s for s in slots if s["id"] == active), slots[0])
+    rec["identity"] = {
+        "id": match["id"],
+        "label": match["id"],
+        "title": match.get("title") or match["id"],
+    }
+    rec["identities"] = [{"id": s["id"], "label": s["id"]} for s in slots]
+    return rec
+
+
 def probe_token_plan() -> dict:
     if not which("bl"):
-        return empty_provider("token-plan", "unknown", "no_cli")
+        return attach_token_plan_identity(empty_provider("token-plan", "unknown", "no_cli"))
     try:
         proc = subprocess.run(
             ["bl", "usage", "token-plan", "--output", "json"],
@@ -543,7 +604,9 @@ def probe_token_plan() -> dict:
             env=child_env(),
         )
     except Exception as exc:
-        return empty_provider("token-plan", "unknown", redact(str(exc))[:200])
+        return attach_token_plan_identity(
+            empty_provider("token-plan", "unknown", redact(str(exc))[:200])
+        )
     stdout = proc.stdout or ""
     payload = None
     try:
@@ -560,16 +623,22 @@ def probe_token_plan() -> dict:
             msg = str(err)
         low = msg.lower()
         if "console" in low or "access token" in low:
-            return empty_provider("token-plan", "unauth", "need_console_login")
-        return empty_provider("token-plan", "unauth", redact(msg)[:200] or "unauth")
+            return attach_token_plan_identity(
+                empty_provider("token-plan", "unauth", "need_console_login")
+            )
+        return attach_token_plan_identity(
+            empty_provider("token-plan", "unauth", redact(msg)[:200] or "unauth")
+        )
     combined = blob.lower()
     if "no console access token" in combined or "bl auth login --console" in combined:
-        return empty_provider("token-plan", "unauth", "need_console_login")
+        return attach_token_plan_identity(
+            empty_provider("token-plan", "unauth", "need_console_login")
+        )
     if not isinstance(payload, dict):
         reason = "no_json"
         if proc.returncode:
             reason = f"exit_{proc.returncode}"
-        return empty_provider("token-plan", "unknown", reason)
+        return attach_token_plan_identity(empty_provider("token-plan", "unknown", reason))
     weekly = fraction_to_pct(payload.get("per1WeekPercentage"))
     session = fraction_to_pct(payload.get("per5HourPercentage"))
     windows = [
@@ -588,7 +657,7 @@ def probe_token_plan() -> dict:
     }
     if rec["status"] != "ok":
         rec["reason"] = "no_used_pct"
-    return rec
+    return attach_token_plan_identity(rec)
 
 
 # --- Grok --------------------------------------------------------------------
@@ -2023,12 +2092,19 @@ def round_half_up(n: float) -> int:
 
 
 def meter(pct) -> str:
+    """Gray track, white fill — no block-grid characters."""
     value = as_pct(pct)
     if value is None:
         return "—"
     filled = round_half_up(value * METER_WIDTH / 100.0)
     filled = max(0, min(METER_WIDTH, filled))
-    return "▓" * filled + "░" * (METER_WIDTH - filled)
+    rest = METER_WIDTH - filled
+    inner = ""
+    if filled:
+        inner += f"<span bgcolor='{METER_FILL}'>{NBSP * filled}</span>"
+    if rest:
+        inner += NBSP * rest
+    return f"<span bgcolor='{METER_TRACK}'>{inner}</span>"
 
 
 def window_by_kind(rec: dict, kind: str) -> dict | None:
@@ -2070,7 +2146,12 @@ def cmd_waybar() -> int:
     if not isinstance(rec, dict):
         rec = empty_provider(pid if pid in PROVIDER_INDEX else "codex", "unknown", "no_cache")
         rec["logo"] = PROVIDER_INDEX.get(pid, ("?", "?"))[1] if pid in PROVIDER_INDEX else "?"
+    if pid == "token-plan":
+        rec = attach_token_plan_identity(dict(rec))
     logo = str(rec.get("logo") or PROVIDER_INDEX.get(pid, ("?", "?"))[1])
+    ident = rec.get("identity") if isinstance(rec.get("identity"), dict) else {}
+    ident_id = str(ident.get("id") or ident.get("label") or "").strip()
+    mark = f"{logo} {ident_id}" if ident_id else logo
     weekly = window_by_kind(rec, "weekly") or {}
     extra = extra_window(rec)
     extra_bits = extra.get("extra") if isinstance(extra.get("extra"), dict) else {}
@@ -2079,7 +2160,7 @@ def cmd_waybar() -> int:
         extra_txt = f"${usd:.0f}" if usd >= 10 else f"${usd:.2f}"
     else:
         extra_txt = meter(extra.get("used_pct"))
-    text = f"{pango_escape(logo)} {meter(weekly.get('used_pct'))} {extra_txt}"
+    text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {extra_txt}"
     status = rec.get("status") or "unknown"
     classes = [status]
     age = cache_age_sec(cache)
@@ -2092,6 +2173,9 @@ def cmd_waybar() -> int:
     elif known and max(known) >= 80:
         classes.append("warn")
     lines = [f"{rec.get('name') or pid}" + (f" ({rec['plan']})" if rec.get("plan") else "")]
+    if ident_id:
+        title = str(ident.get("title") or ident_id)
+        lines.append(f"identity: {ident_id}" + (f" · {title}" if title and title != ident_id else ""))
     if rec.get("reason"):
         lines.append(str(rec["reason"]))
     if rec.get("last_error"):
@@ -2148,6 +2232,43 @@ def cmd_cycle(direction: str) -> int:
     if path.exists():
         atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
     print(nxt)
+    return 0
+
+
+def cmd_identity(direction: str) -> int:
+    """Cycle identities for the selected provider. Token Plan swaps keys via token-plan-swap."""
+    cache = load_cache()
+    selected = pick_selected(cache)
+    if selected != "token-plan":
+        print(f"{selected}: no identity cycle configured")
+        return 0
+    swap = os.environ.get("AI_USAGE_TOKEN_PLAN_SWAP") or which("token-plan-swap")
+    if swap is None:
+        print("token-plan: token-plan-swap not found", file=sys.stderr)
+        return 1
+    action = "toggle" if direction in ("next", "prev") else direction
+    proc = subprocess.run(
+        [swap, action],
+        env=child_env(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    rec = cache.get("providers", {}).get("token-plan")
+    if not isinstance(rec, dict):
+        rec = empty_provider("token-plan", "unknown", "no_cache")
+    rec = attach_token_plan_identity(rec)
+    upsert(cache, rec)
+    path = cache_path()
+    if path.exists():
+        atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+    ident = (rec.get("identity") or {}).get("id") or "?"
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        msg = err[-1] if err else f"exit {proc.returncode}"
+        print(f"token-plan identity {ident} swap-failed: {redact(msg)[:120]}", file=sys.stderr)
+        return proc.returncode
+    print(ident)
     return 0
 
 
@@ -2211,6 +2332,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("waybar", help="print Waybar JSON from cache only")
     cyc = sub.add_parser("cycle", help="rotate selected provider")
     cyc.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
+    ident = sub.add_parser("identity", help="rotate identity inside the selected provider")
+    ident.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
     sub.add_parser("validate", help="schema-check cache")
     sub.add_parser("refresh", help="probe all providers")
     tui = sub.add_parser("tui", help="Quattro-like usage dashboard")
@@ -2237,6 +2360,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_waybar()
     if args.cmd == "cycle":
         return cmd_cycle(args.direction)
+    if args.cmd == "identity":
+        return cmd_identity(args.direction)
     if args.cmd == "validate":
         return cmd_validate()
     if args.cmd == "tui":
