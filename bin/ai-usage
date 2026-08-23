@@ -287,6 +287,8 @@ def grok_bin() -> str | None:
 def keep_last_good(old: dict | None, new: dict) -> dict:
     if new.get("status") == "ok":
         return new
+    if new.get("reason") == "switched":
+        return new
     if not old or old.get("status") != "ok":
         return new
     if not any("used_pct" in w for w in old.get("windows") or [] if isinstance(w, dict)):
@@ -2235,6 +2237,25 @@ def cmd_cycle(direction: str) -> int:
     return 0
 
 
+def blank_usage_windows(rec: dict) -> dict:
+    """Drop used_pct after an identity flip so the chip does not keep the other key's meters."""
+    rec = dict(rec)
+    rec["windows"] = [
+        {k: v for k, v in w.items() if k != "used_pct"}
+        for w in (rec.get("windows") or [])
+        if isinstance(w, dict)
+    ]
+    burst = rec.get("burst")
+    if isinstance(burst, dict) and "used_pct" in burst:
+        burst = dict(burst)
+        burst.pop("used_pct", None)
+        rec["burst"] = burst
+    rec["status"] = "unknown"
+    rec["reason"] = "switched"
+    rec.pop("last_error", None)
+    return rec
+
+
 def cmd_identity(direction: str) -> int:
     """Cycle identities for the selected provider. Token Plan swaps keys via token-plan-swap."""
     cache = load_cache()
@@ -2247,29 +2268,37 @@ def cmd_identity(direction: str) -> int:
         print("token-plan: token-plan-swap not found", file=sys.stderr)
         return 1
     action = "toggle" if direction in ("next", "prev") else direction
-    proc = subprocess.run(
-        [swap, action],
-        env=child_env(),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    swap_env = child_env()
+    conf = token_plan_conf()
+    if conf.name == "alibaba-token-plan":
+        swap_env["XDG_CONFIG_HOME"] = str(conf.parent)
+    try:
+        proc = subprocess.run(
+            [swap, action],
+            env=swap_env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        print("token-plan swap-failed: helper unavailable", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print(f"token-plan swap-failed: exit {proc.returncode}", file=sys.stderr)
+        return proc.returncode
     rec = cache.get("providers", {}).get("token-plan")
     if not isinstance(rec, dict):
         rec = empty_provider("token-plan", "unknown", "no_cache")
     rec = dict(rec)
     rec["id"] = "token-plan"
+    rec = blank_usage_windows(rec)
     rec = attach_token_plan_identity(rec)
-    upsert(cache, rec)
+    cache.setdefault("providers", {})["token-plan"] = rec
     path = cache_path()
     if path.exists():
         atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
     ident = (rec.get("identity") or {}).get("id") or "?"
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip().splitlines()
-        msg = err[-1] if err else f"exit {proc.returncode}"
-        print(f"token-plan identity {ident} swap-failed: {redact(msg)[:120]}", file=sys.stderr)
-        return proc.returncode
     print(ident)
     return 0
 

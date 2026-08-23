@@ -76,6 +76,6 @@ fi
 
 echo "omarchy-usage-tray installed"
 echo "  binary  $HOME/.local/bin/ai-usage -> $BIN"
-echo "  waybar  custom/ai-usage  (click or scroll to cycle providers)"
+echo "  waybar  custom/ai-usage  (left/scroll = providers; right-click = identity)"
 echo "  timer   systemd --user ai-usage.timer (5 min)"
 echo "  backup  $CFG.bak.$STAMP"

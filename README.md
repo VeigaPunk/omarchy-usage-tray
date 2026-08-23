@@ -27,6 +27,16 @@ Re-run the same line to update.
 | Right-click | Next identity (Token Plan: `team` / `gmail`) |
 | Scroll | Cycle providers |
 
+Token Plan right-click runs `token-plan-swap toggle`. That helper flips
+`~/.config/alibaba-token-plan/active` and rewrites `~/.bailian/config.json`
+from the matching local key file (`keys/team` or `keys/gmail`). Codex, xask,
+and `token-plan-key` all read that slot. 1Password is only used by
+`token-plan-swap pull`.
+
+OAuth multi-account (not used on this host) is documented in
+[`docs/identity-swap.md`](docs/identity-swap.md). Right-click is a no-op
+until a provider has two live stores.
+
 ## Local clone
 
 ```bash

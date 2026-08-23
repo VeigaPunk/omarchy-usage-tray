@@ -11,6 +11,5 @@
     "on-scroll-up": "ai-usage cycle next; pkill -x -RTMIN+11 waybar",
     "on-scroll-down": "ai-usage cycle prev; pkill -x -RTMIN+11 waybar",
     "on-click": "ai-usage cycle next; pkill -x -RTMIN+11 waybar",
-    "on-click-right": "ai-usage identity next; pkill -x -RTMIN+11 waybar",
     "on-click-right": "ai-usage identity next; pkill -x -RTMIN+11 waybar"
 }
