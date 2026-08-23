@@ -1,0 +1,24 @@
+# USD per 1M tokens. Unknown models are skipped; never guessed.
+# Pin source + date. Do not add a row without a public price sheet.
+
+[models."gpt-5.3-codex"]
+input = 1.75
+cache = 0.175
+output = 14.0
+source = "https://developers.openai.com/api/docs/models/gpt-5.3-codex"
+date = "2026-08-23"
+
+[models."gpt-5.4"]
+input = 2.50
+cache = 0.25
+output = 15.0
+source = "https://developers.openai.com/api/docs/models/gpt-5.4"
+date = "2026-08-23"
+
+[models."grok-4.6"]
+input = 2.00
+cache = 0.50
+output = 6.00
+note = "<200k prompt tokens"
+source = "https://docs.x.ai/developers/models"
+date = "2026-08-23"

@@ -1,0 +1,10 @@
+.cache/
+*.pyc
+__pycache__/
+auth.json
+credentials*.json
+.env
+status.json
+*.bak.*
+.xbgst/
+deploy/op.env

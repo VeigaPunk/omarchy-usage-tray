@@ -1,0 +1,2251 @@
+#!/usr/bin/env python3
+"""Cache AI CLI usage windows and render a Waybar chip. waybar reads cache only."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import select
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
+from urllib.parse import urlencode
+import tomllib
+
+VERSION = 1
+METER_WIDTH = 5
+TUI_METER_WIDTH = 20
+STALE_AFTER_SEC = 20 * 60
+CODEX_CMD = ["codex", "-s", "read-only", "-a", "never", "app-server"]
+RPC_TIMEOUT_SEC = 20.0
+SCAN_REUSE_SECONDS = 20
+SCAN_LIMITS_REUSE_SECONDS = 900
+USD_CENTS = Decimal("0.01")
+MILLION = Decimal("1000000")
+
+PROVIDERS = (
+    ("codex", "Codex", "C"),
+    ("token-plan", "Token Plan", "T"),
+    ("grok", "Grok", "G"),
+    ("kimi", "Kimi", "K"),
+)
+PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
+
+
+def ensure_path() -> None:
+    extra = [
+        str(Path.home() / ".local/bin"),
+        str(Path.home() / ".grok/bin"),
+        str(Path.home() / ".local/share/mise/shims"),
+        str(Path.home() / ".local/share/mise/installs/node/latest/bin"),
+        "/usr/local/bin",
+        "/usr/bin",
+    ]
+    cur = os.environ.get("PATH", "")
+    os.environ["PATH"] = ":".join(dict.fromkeys(extra + cur.split(":")))
+
+
+def cache_path() -> Path:
+    return Path(os.environ.get("AI_USAGE_CACHE", Path.home() / ".cache/ai-usage/status.json"))
+
+
+def selected_path() -> Path:
+    return Path(os.environ.get("AI_USAGE_SELECTED", Path.home() / ".config/ai-usage/selected"))
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def prices_path() -> Path:
+    return Path(os.environ.get("AI_USAGE_PRICES", repo_root() / "prices.toml"))
+
+
+def quattro_state_dir() -> Path:
+    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    return Path(state) / "omarchy" / "agents" / "usage"
+
+
+def poke_waybar() -> None:
+    subprocess.run(
+        ["pkill", "-x", "-RTMIN+11", "waybar"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def iso_from_unix(ts) -> str | None:
+    if ts is None or ts == "":
+        return None
+    if isinstance(ts, str) and "T" in ts and not ts.strip().isdigit():
+        return ts
+    try:
+        n = float(ts)
+        if n >= 1e12:
+            n = n / 1000.0
+        return datetime.fromtimestamp(int(n), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def as_pct(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pct != pct or pct in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, min(100.0, pct))
+
+
+def fraction_to_pct(value) -> float | None:
+    """Token-plan fractions in [0, 1]; already-percent values stay as-is."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n != n or n in (float("inf"), float("-inf")):
+        return None
+    if n <= 1.5:
+        n = n * 100.0
+    return as_pct(n)
+
+
+def ratio(used, limit) -> float | None:
+    try:
+        u = float(used)
+        lim = float(limit)
+    except (TypeError, ValueError):
+        return None
+    if lim <= 0:
+        return None
+    return as_pct(100.0 * u / lim)
+
+
+def window(kind: str, label: str, used_pct, resets_at=None, extra=None) -> dict:
+    out = {"kind": kind, "label": label}
+    pct = as_pct(used_pct)
+    if pct is not None:
+        # Preserve ints from provider JSON (75 not 75.0) when exact.
+        out["used_pct"] = int(pct) if float(pct) == int(pct) else pct
+    if resets_at:
+        out["resets_at"] = resets_at
+    if extra:
+        out["extra"] = extra
+    return out
+
+
+def empty_provider(pid: str, status: str, reason: str | None = None, plan: str | None = None) -> dict:
+    name, logo = PROVIDER_INDEX[pid]
+    rec = {
+        "id": pid,
+        "name": name,
+        "logo": logo,
+        "status": status,
+        "windows": [
+            {"kind": "weekly", "label": "Weekly"},
+            {"kind": "special", "label": "Special"},
+        ],
+    }
+    if reason:
+        rec["reason"] = reason
+    if plan:
+        rec["plan"] = plan
+    return rec
+
+
+def redact(text: str) -> str:
+    text = re.sub(r"(?i)Bearer\s+\S+", "[redacted]", text)
+    text = re.sub(r"eyJ[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-\.]+", "[redacted]", text)
+    text = re.sub(r"sk-[A-Za-z0-9]{8,}", "[redacted]", text)
+    text = re.sub(r"(?i)Bearer\s*", "", text)
+    return text
+
+
+def ensure_dir(path: Path, mode: int = 0o700) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def atomic_write(path: Path, data: str, mode: int = 0o600) -> None:
+    parent_mode = 0o700 if path.name == "status.json" or path.parent.name == "ai-usage" else 0o755
+    ensure_dir(path.parent, parent_mode)
+    fd, tmp = tempfile.mkstemp(prefix=".ai-usage-", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_cache() -> dict:
+    path = cache_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": VERSION, "updated_at": None, "selected": None, "providers": {}}
+    if not isinstance(data, dict):
+        return {"version": VERSION, "updated_at": None, "selected": None, "providers": {}}
+    data.setdefault("version", VERSION)
+    data.setdefault("providers", {})
+    if not isinstance(data["providers"], dict):
+        data["providers"] = {}
+    return data
+
+
+def save_cache(data: dict) -> None:
+    data["version"] = VERSION
+    data["updated_at"] = iso_now()
+    atomic_write(cache_path(), json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def read_selected(cache: dict | None = None) -> str | None:
+    path = selected_path()
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    if cache:
+        return cache.get("selected")
+    return None
+
+
+def write_selected(pid: str) -> None:
+    path = selected_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, pid + "\n", mode=0o644)
+
+
+def which(name: str) -> str | None:
+    for d in os.environ.get("PATH", "").split(":"):
+        if not d:
+            continue
+        cand = Path(d) / name
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+def child_env() -> dict:
+    env = os.environ.copy()
+    for key in ("XAI_API_KEY", "GROK_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"):
+        env.pop(key, None)
+    return env
+
+
+def grok_bin() -> str | None:
+    explicit = os.environ.get("GROK_BIN")
+    if explicit:
+        p = Path(explicit)
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    home = Path.home() / ".grok" / "bin" / "grok"
+    if home.is_file() and os.access(home, os.X_OK):
+        return str(home)
+    return which("grok")
+
+
+def keep_last_good(old: dict | None, new: dict) -> dict:
+    if new.get("status") == "ok":
+        return new
+    if not old or old.get("status") != "ok":
+        return new
+    if not any("used_pct" in w for w in old.get("windows") or [] if isinstance(w, dict)):
+        return new
+    kept = dict(old)
+    if new.get("reason"):
+        kept["last_error"] = new["reason"]
+    return kept
+
+
+def upsert(cache: dict, rec: dict) -> None:
+    providers = cache.setdefault("providers", {})
+    pid = rec["id"]
+    providers[pid] = keep_last_good(providers.get(pid) if isinstance(providers.get(pid), dict) else None, rec)
+
+
+def pick_selected(cache: dict) -> str:
+    current = read_selected(cache)
+    present = [pid for pid, _, _ in PROVIDERS if pid in cache.get("providers", {})]
+    if current in present:
+        return current
+    for pid, rec in cache.get("providers", {}).items():
+        if isinstance(rec, dict) and rec.get("status") == "ok":
+            return pid
+    if present:
+        return present[0]
+    return "codex"
+
+
+# --- Codex RPC ---------------------------------------------------------------
+
+
+def _send(proc: subprocess.Popen, obj: dict) -> None:
+    line = json.dumps(obj, separators=(",", ":")) + "\n"
+    proc.stdin.write(line.encode("utf-8"))
+    proc.stdin.flush()
+
+
+def _recv_until(proc: subprocess.Popen, pred, deadline: float, buf: bytearray) -> dict:
+    while time.time() < deadline:
+        if proc.poll() is not None and not buf:
+            raise RuntimeError(f"rpc exited {proc.returncode}")
+        timeout = max(0.05, min(0.5, deadline - time.time()))
+        r, _, _ = select.select([proc.stdout], [], [], timeout)
+        if r:
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"rpc exited {proc.returncode}")
+                continue
+            buf.extend(chunk)
+        while True:
+            nl = buf.find(b"\n")
+            if nl < 0:
+                break
+            raw = bytes(buf[:nl])
+            del buf[: nl + 1]
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if pred(msg):
+                return msg
+    raise TimeoutError("rpc timed out")
+
+
+def _id_match(msg: dict, rid) -> bool:
+    return "id" in msg and msg["id"] == rid and ("result" in msg or "error" in msg)
+
+
+def codex_rate_limits() -> dict:
+    """JSON-RPC: initialize → initialized → account/read → account/rateLimits/read."""
+    if not which("codex"):
+        raise FileNotFoundError("codex")
+    proc = subprocess.Popen(
+        CODEX_CMD,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=child_env(),
+        start_new_session=True,
+    )
+    buf = bytearray()
+    deadline = time.time() + RPC_TIMEOUT_SEC
+    try:
+        _send(
+            proc,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "ai-usage",
+                        "title": "Omarchy usage tray",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {"experimentalApi": True},
+                },
+            },
+        )
+        init = _recv_until(proc, lambda m: _id_match(m, 1), deadline, buf)
+        if "error" in init:
+            raise RuntimeError(redact(str(init["error"])))
+        _send(proc, {"method": "initialized"})
+        _send(proc, {"id": 2, "method": "account/read", "params": {"refreshToken": False}})
+        acct = _recv_until(proc, lambda m: _id_match(m, 2), deadline, buf)
+        if "error" in acct:
+            raise RuntimeError(redact(str(acct["error"])))
+        _send(proc, {"id": 3, "method": "account/rateLimits/read"})
+        limits = _recv_until(proc, lambda m: _id_match(m, 3), deadline, buf)
+        if "error" in limits:
+            raise RuntimeError(redact(str(limits["error"])))
+        result = limits.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("rateLimits/read missing result")
+        account = (acct.get("result") or {}).get("account") if isinstance(acct.get("result"), dict) else None
+        if isinstance(account, dict):
+            result = dict(result)
+            result["_planType"] = account.get("planType")
+            result["_accountType"] = account.get("type")
+        return result
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _pick_spark(by_id: dict) -> tuple[dict | None, dict | None]:
+    spark = by_id.get("codex_bengalfox")
+    if not isinstance(spark, dict):
+        return None, None
+    secondary = spark.get("secondary")
+    primary = spark.get("primary")
+    if isinstance(secondary, dict) and "usedPercent" in secondary:
+        return spark, secondary
+    if isinstance(primary, dict) and "usedPercent" in primary:
+        return spark, primary
+    return spark, None
+
+
+def normalize_codex(raw: dict) -> dict:
+    rate = raw.get("rateLimits") if isinstance(raw.get("rateLimits"), dict) else {}
+    by_id = raw.get("rateLimitsByLimitId") if isinstance(raw.get("rateLimitsByLimitId"), dict) else {}
+    plan = rate.get("planType") or raw.get("_planType") or raw.get("planType")
+    primary = rate.get("primary") if isinstance(rate.get("primary"), dict) else None
+    rec = {
+        "id": "codex",
+        "name": "Codex",
+        "logo": "C",
+        "status": "unknown",
+        "windows": [],
+    }
+    if plan:
+        rec["plan"] = str(plan)
+    windows = []
+    if primary and "usedPercent" in primary:
+        windows.append(
+            window(
+                "weekly",
+                "Weekly",
+                primary.get("usedPercent"),
+                iso_from_unix(primary.get("resetsAt")),
+                extra={"window_mins": primary.get("windowDurationMins")},
+            )
+        )
+    spark, special_win = _pick_spark(by_id)
+    spark_label = "Spark"
+    if isinstance(spark, dict):
+        spark_label = spark.get("limitName") or spark_label
+        burst = spark.get("primary") if isinstance(spark.get("primary"), dict) else None
+        if special_win is burst:
+            burst = None
+        if burst and "usedPercent" in burst:
+            rec["burst"] = window(
+                "burst",
+                "Spark 5h",
+                burst.get("usedPercent"),
+                iso_from_unix(burst.get("resetsAt")),
+                extra={"window_mins": burst.get("windowDurationMins")},
+            )
+    if special_win and "usedPercent" in special_win:
+        windows.append(
+            window(
+                "special",
+                str(spark_label),
+                special_win.get("usedPercent"),
+                iso_from_unix(special_win.get("resetsAt")),
+                extra={"window_mins": special_win.get("windowDurationMins")},
+            )
+        )
+    else:
+        windows.append({"kind": "special", "label": spark_label})
+    rec["windows"] = windows
+    if any("used_pct" in w for w in windows):
+        rec["status"] = "ok"
+    else:
+        rec["status"] = "unknown"
+        rec["reason"] = "no_used_pct"
+    return rec
+
+
+def probe_codex(fixture: str | None = None) -> dict:
+    rec: dict
+    try:
+        if fixture:
+            raw = json.loads(Path(fixture).read_text(encoding="utf-8"))
+            if "providers" in raw and "codex" in (raw.get("providers") or {}):
+                rec = raw["providers"]["codex"]
+                rec.setdefault("id", "codex")
+            elif isinstance(raw, dict):
+                rec = normalize_codex(raw)
+            else:
+                rec = empty_provider("codex", "unknown", "bad_payload")
+        else:
+            raw = codex_rate_limits()
+            if not isinstance(raw, dict):
+                rec = empty_provider("codex", "unknown", "bad_payload")
+            else:
+                rec = normalize_codex(raw)
+    except FileNotFoundError:
+        rec = empty_provider("codex", "unknown", "no_cli")
+    except Exception as exc:
+        rec = empty_provider("codex", "unknown", redact(str(exc))[:200])
+    if fixture is None:
+        rec = attach_codex_local_stats(rec)
+    return rec
+
+
+# --- Token Plan --------------------------------------------------------------
+
+
+def probe_token_plan() -> dict:
+    if not which("bl"):
+        return empty_provider("token-plan", "unknown", "no_cli")
+    try:
+        proc = subprocess.run(
+            ["bl", "usage", "token-plan", "--output", "json"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+            env=child_env(),
+        )
+    except Exception as exc:
+        return empty_provider("token-plan", "unknown", redact(str(exc))[:200])
+    stdout = proc.stdout or ""
+    payload = None
+    try:
+        payload = json.loads(stdout) if stdout.strip() else None
+    except json.JSONDecodeError:
+        payload = None
+    blob = stdout + "\n" + (proc.stderr or "")
+    if payload and isinstance(payload, dict) and payload.get("error"):
+        err = payload["error"]
+        msg = ""
+        if isinstance(err, dict):
+            msg = str(err.get("message") or err.get("hint") or err)
+        else:
+            msg = str(err)
+        low = msg.lower()
+        if "console" in low or "access token" in low:
+            return empty_provider("token-plan", "unauth", "need_console_login")
+        return empty_provider("token-plan", "unauth", redact(msg)[:200] or "unauth")
+    combined = blob.lower()
+    if "no console access token" in combined or "bl auth login --console" in combined:
+        return empty_provider("token-plan", "unauth", "need_console_login")
+    if not isinstance(payload, dict):
+        reason = "no_json"
+        if proc.returncode:
+            reason = f"exit_{proc.returncode}"
+        return empty_provider("token-plan", "unknown", reason)
+    weekly = fraction_to_pct(payload.get("per1WeekPercentage"))
+    session = fraction_to_pct(payload.get("per5HourPercentage"))
+    windows = [
+        window("weekly", "Weekly", weekly, iso_from_unix(payload.get("per1WeekResetTime"))),
+    ]
+    if "per5HourPercentage" in payload:
+        windows.append(
+            window("session", "5h", session, iso_from_unix(payload.get("per5HourResetTime")))
+        )
+    rec = {
+        "id": "token-plan",
+        "name": "Token Plan",
+        "logo": "T",
+        "status": "ok" if weekly is not None or session is not None else "unknown",
+        "windows": windows,
+    }
+    if rec["status"] != "ok":
+        rec["reason"] = "no_used_pct"
+    return rec
+
+
+# --- Grok --------------------------------------------------------------------
+
+KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+KIMI_DEFAULT_BASE = "https://api.kimi.ai/coding/v1"
+KIMI_DEFAULT_OAUTH = "https://auth.kimi.ai"
+KIMI_USER_AGENT = "kimi-code/0.38.0"
+
+
+class _KimiUnauth(Exception):
+    pass
+
+
+def _rpc_error_text(err) -> str:
+    if isinstance(err, dict):
+        parts = [err.get("message"), err.get("data"), err.get("code")]
+        msg = " ".join(str(p) for p in parts if p is not None)
+        return redact(msg or str(err))
+    return redact(str(err))
+
+
+def grok_billing() -> dict:
+    bin_path = grok_bin()
+    if not bin_path:
+        raise FileNotFoundError("grok")
+    proc = subprocess.Popen(
+        [bin_path, "agent", "--no-leader", "stdio"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=child_env(),
+        start_new_session=True,
+    )
+    buf = bytearray()
+    deadline = time.time() + RPC_TIMEOUT_SEC
+    try:
+        _send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"fs": {}, "terminal": False},
+                    "_meta": {
+                        "startupHints": {
+                            "nonInteractive": True,
+                            "skipGitStatus": True,
+                            "skipProjectLayout": True,
+                        },
+                        "clientType": "omarchy-usage-tray",
+                        "clientVersion": "0.2.0",
+                    },
+                },
+            },
+        )
+        init = _recv_until(proc, lambda m: _id_match(m, 1), deadline, buf)
+        if "error" in init:
+            raise RuntimeError(_rpc_error_text(init["error"]))
+        _send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "_x.ai/billing", "params": {}})
+        billed = _recv_until(proc, lambda m: _id_match(m, 2), deadline, buf)
+        if "error" in billed:
+            raise RuntimeError(_rpc_error_text(billed["error"]))
+        result = billed.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("billing missing result")
+        return result
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _cents(value) -> int | None:
+    if isinstance(value, dict) and "val" in value:
+        try:
+            return int(value.get("val") or 0)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def grok_team_id() -> str | None:
+    path = Path.home() / ".grok" / "auth.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for entry in data.values():
+        if isinstance(entry, dict) and isinstance(entry.get("team_id"), str) and entry["team_id"]:
+            return entry["team_id"]
+    return None
+
+
+def grok_management_prepaid() -> dict | None:
+    """Business/API prepaid via management API. Needs XAI_MANAGEMENT_KEY or XAI_API_KEY (not OAuth)."""
+    key = os.environ.get("XAI_MANAGEMENT_KEY") or os.environ.get("XAI_API_KEY")
+    if not key:
+        return None
+    team = grok_team_id()
+    if not team:
+        return {"error": "no_team_id"}
+    url = f"https://management-api.x.ai/v1/billing/teams/{team}/prepaid/balance"
+    headers = {"Accept": "application/json", "User-Agent": "omarchy-usage-tray/0.2"}
+    last = None
+    for auth_header in ({"Authorization": "Bearer " + key}, {"X-Api-Key": key}):
+        req = urllib.request.Request(url, headers={**headers, **auth_header}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last = f"http_{exc.code}"
+            continue
+        except Exception as exc:
+            last = redact(str(exc))[:80]
+            continue
+        if not isinstance(payload, dict):
+            last = "bad_payload"
+            continue
+        remaining = None
+        limit = None
+        for path in (
+            ("remaining_balance",),
+            ("balance",),
+            ("remaining",),
+            ("amount_remaining",),
+            ("prepaid_balance",),
+            ("credits", "remaining"),
+        ):
+            cur: object = payload
+            ok = True
+            for part in path:
+                if not isinstance(cur, dict) or part not in cur:
+                    ok = False
+                    break
+                cur = cur[part]
+            if ok:
+                try:
+                    remaining = float(cur)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if remaining is None:
+            # cents-style {val: N}
+            val = payload.get("val") or payload.get("amount")
+            if isinstance(val, dict) and "val" in val:
+                remaining = float(val["val"]) / 100.0
+            elif isinstance(val, (int, float)) and val > 1000:
+                remaining = float(val) / 100.0
+            elif isinstance(val, (int, float)):
+                remaining = float(val)
+        if remaining is None:
+            last = "no_remaining_field"
+            continue
+        if remaining > 10000:
+            remaining = remaining / 100.0  # cents
+        for lim_key in ("limit", "prepaid_limit", "total"):
+            if lim_key in payload:
+                try:
+                    limit = float(payload[lim_key])
+                    if limit > 10000:
+                        limit = limit / 100.0
+                except (TypeError, ValueError):
+                    limit = None
+        return {"remaining_usd": remaining, "limit_usd": limit, "source": "management-api"}
+    return {"error": last or "unauth"}
+
+
+def grok_api_credits_window(config: dict, api_prepaid: dict | None = None) -> dict | None:
+    """Second SuperGrok meter: business API credits (management key), not OAuth prepaid=0."""
+    if isinstance(api_prepaid, dict) and api_prepaid.get("remaining_usd") is not None:
+        rem = float(api_prepaid["remaining_usd"])
+        extra = {"remaining_usd": rem, "source": api_prepaid.get("source") or "management-api"}
+        lim = api_prepaid.get("limit_usd")
+        if isinstance(lim, (int, float)) and lim > 0:
+            extra["limit_usd"] = float(lim)
+            used_pct = as_pct(100.0 * max(0.0, (float(lim) - rem) / float(lim)))
+            return window("credits", "API credits", used_pct, extra=extra)
+        return window("credits", "API credits", None, extra=extra)
+    cap = _cents(config.get("onDemandCap"))
+    used = _cents(config.get("onDemandUsed"))
+    prepaid = _cents(config.get("prepaidBalance"))
+    extra: dict = {}
+    if cap is not None and cap > 0:
+        spent = 0 if used is None else abs(used)
+        pct = as_pct(100.0 * spent / cap)
+        extra["on_demand_cap_cents"] = cap
+        extra["on_demand_used_cents"] = spent
+        extra["remaining_usd"] = max(0, cap - spent) / 100.0
+        return window("credits", "API credits", pct, extra=extra)
+    if prepaid is not None and abs(prepaid) > 0:
+        rem = abs(prepaid) / 100.0
+        extra["remaining_usd"] = rem
+        extra["source"] = "oauth-prepaid"
+        return window("credits", "API credits", None, extra=extra)
+    return None
+
+
+def normalize_grok(raw: dict, api_prepaid: dict | None = None) -> dict:
+    rec = {
+        "id": "grok",
+        "name": "Grok",
+        "logo": "G",
+        "status": "unknown",
+        "windows": [{"kind": "weekly", "label": "Weekly"}],
+    }
+    config = raw.get("config") if isinstance(raw.get("config"), dict) else {}
+    if not config:
+        rec["reason"] = "no_config"
+        return rec
+    tier = raw.get("subscription_tier")
+    if tier:
+        rec["plan"] = str(tier)
+    period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
+    ptype = str(period.get("type") or "")
+    resets = period.get("end") or config.get("billingPeriodEnd")
+    resets_at = resets if isinstance(resets, str) else iso_from_unix(resets)
+    pct = config.get("creditUsagePercent")
+    windows: list[dict] = []
+    if "WEEKLY" in ptype.upper() or not ptype:
+        if pct is None and "WEEKLY" in ptype.upper():
+            pct = 0
+        weekly = window("weekly", "Weekly", as_pct(pct), resets_at)
+        windows.append(weekly)
+    cred = grok_api_credits_window(config, api_prepaid)
+    if cred:
+        windows.append(cred)
+    rec["windows"] = windows or rec["windows"]
+    if any("used_pct" in w or (w.get("extra") or {}).get("remaining_usd") is not None for w in rec["windows"]):
+        rec["status"] = "ok"
+    else:
+        rec["reason"] = "no_used_pct"
+    if isinstance(api_prepaid, dict) and api_prepaid.get("error"):
+        rec.setdefault("reason", api_prepaid["error"])
+    return rec
+
+
+def probe_grok() -> dict:
+    api_prepaid = grok_management_prepaid()
+    try:
+        raw = grok_billing()
+    except FileNotFoundError:
+        return empty_provider("grok", "unknown", "no_cli")
+    except Exception as exc:
+        msg = redact(str(exc))[:200]
+        low = msg.lower()
+        if "auth" in low or "login" in low:
+            return empty_provider("grok", "unauth", "need_grok_login")
+        if "method not found" in low or "-32601" in msg:
+            return empty_provider("grok", "unknown", "acp_method_not_found")
+        return empty_provider("grok", "unknown", msg or "probe_failed")
+    if not isinstance(raw, dict):
+        return empty_provider("grok", "unknown", "bad_payload")
+    return normalize_grok(raw, api_prepaid if isinstance(api_prepaid, dict) and "remaining_usd" in api_prepaid else api_prepaid)
+
+
+# --- Kimi --------------------------------------------------------------------
+
+
+def _toml_section(text: str, header: str) -> str:
+    m = re.search(rf"^\[{re.escape(header)}\]\s*$", text, re.M)
+    if not m:
+        return ""
+    rest = text[m.end() :]
+    nxt = re.search(r"^\[", rest, re.M)
+    return rest[: nxt.start()] if nxt else rest
+
+
+def _toml_str(section: str, key: str) -> str | None:
+    m = re.search(rf"^{re.escape(key)}\s*=\s*\"([^\"]*)\"", section, re.M)
+    return m.group(1) if m else None
+
+
+def _kimi_config() -> tuple[str, str, str]:
+    base = os.environ.get("KIMI_CODE_BASE_URL") or ""
+    oauth_host = os.environ.get("KIMI_CODE_OAUTH_HOST") or ""
+    key = os.environ.get("KIMI_CODE_OAUTH_KEY") or ""
+    cfg = Path.home() / ".kimi-code" / "config.toml"
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    if text:
+        prov = _toml_section(text, 'providers."managed:kimi-code"')
+        oauth = _toml_section(text, 'providers."managed:kimi-code".oauth')
+        if not base:
+            base = _toml_str(prov, "base_url") or ""
+        if not oauth_host:
+            oauth_host = _toml_str(oauth, "oauth_host") or ""
+        if not key:
+            key = _toml_str(oauth, "key") or ""
+    base = (base or KIMI_DEFAULT_BASE).rstrip("/")
+    oauth_host = (oauth_host or KIMI_DEFAULT_OAUTH).rstrip("/")
+    slot = key[6:] if key.startswith("oauth/") else key
+    return base, oauth_host, slot
+
+
+def _kimi_cred_paths(slot: str) -> tuple[Path | None, Path | None]:
+    cred_dir = Path.home() / ".kimi-code" / "credentials"
+    lock_dir = Path.home() / ".kimi-code" / "oauth"
+    if slot:
+        return cred_dir / f"{slot}.json", lock_dir / slot
+    if not cred_dir.is_dir():
+        return None, None
+    files = sorted(
+        (p for p in cred_dir.glob("*.json") if p.stat().st_size > 0),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        return None, None
+    path = files[0]
+    return path, lock_dir / path.stem
+
+
+def _kimi_read_creds(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _kimi_is_tombstone(data: dict) -> bool:
+    access = data.get("access_token")
+    refresh = data.get("refresh_token")
+    if not access and not refresh:
+        return True
+    try:
+        if data.get("expires_at") is not None and float(data.get("expires_at")) == 0 and not access:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _kimi_needs_refresh(data: dict) -> bool:
+    if not data.get("access_token"):
+        return True
+    ea = data.get("expires_at")
+    if ea is None or ea == "":
+        return True
+    try:
+        n = float(ea)
+    except (TypeError, ValueError):
+        return True
+    if n >= 1e12:
+        n = n / 1000.0
+    return n - time.time() < 300
+
+
+def _kimi_write_creds(path: Path, data: dict) -> None:
+    ensure_dir(path.parent, 0o700)
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _kimi_flock(lock_path: Path) -> int:
+    ensure_dir(lock_path.parent, 0o700)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    deadline = time.time() + 10
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() >= deadline:
+                os.close(fd)
+                raise TimeoutError("kimi_oauth_lock")
+            time.sleep(0.05)
+
+
+def _kimi_unflock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _kimi_http(url: str, method: str, headers: dict, data: bytes | None = None, timeout: float = 10):
+    hdrs = dict(headers)
+    hdrs.setdefault("User-Agent", KIMI_USER_AGENT)
+    hdrs.setdefault("Accept", "application/json")
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return getattr(resp, "status", 200), resp.read()
+    except urllib.error.HTTPError as exc:
+        body = b""
+        try:
+            body = exc.read()
+        except Exception:
+            pass
+        return exc.code, body
+
+
+def _kimi_decode(body: bytes | None):
+    if not body:
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _kimi_cloudflare(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("cloudflare_error"):
+        return True
+    name = str(payload.get("error_name") or "").lower()
+    cat = str(payload.get("error_category") or "").lower()
+    return "cloudflare" in name or "cloudflare" in cat or name == "browser_signature_banned"
+
+
+def _kimi_refresh(oauth_host: str, refresh_token: str) -> dict:
+    url = oauth_host.rstrip("/") + "/api/oauth/token"
+    form = urlencode(
+        {
+            "client_id": KIMI_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+    ).encode("ascii")
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    last_err = "refresh_failed"
+    for attempt in range(3):
+        code, body = _kimi_http(url, "POST", headers, form, timeout=30)
+        if code in (429, 500, 502, 503, 504):
+            time.sleep(2**attempt)
+            last_err = f"http_{code}"
+            continue
+        payload = _kimi_decode(body)
+        if _kimi_cloudflare(payload):
+            raise RuntimeError(f"http_{code}")
+        err = None
+        if isinstance(payload, dict):
+            raw_err = payload.get("error")
+            if isinstance(raw_err, str):
+                err = raw_err
+            elif isinstance(raw_err, dict):
+                err = str(raw_err.get("code") or raw_err.get("error") or "")
+            else:
+                err = str(payload.get("code") or "") or None
+        if code in (401, 403) or err in ("invalid_grant", "unauthenticated"):
+            if err == "invalid_grant" or code == 401 or err == "unauthenticated":
+                raise _KimiUnauth("need_login")
+            raise RuntimeError(f"http_{code}")
+        if isinstance(payload, dict):
+            if code >= 400:
+                raise RuntimeError(f"http_{code}")
+            access = payload.get("access_token")
+            rotated = payload.get("refresh_token")
+            expires_in = payload.get("expires_in")
+            if not isinstance(access, str) or not access or not isinstance(rotated, str) or not rotated:
+                raise RuntimeError("bad_refresh")
+            try:
+                exp = int(expires_in)
+            except (TypeError, ValueError):
+                raise RuntimeError("bad_refresh")
+            if exp <= 0:
+                raise RuntimeError("bad_refresh")
+            out = {
+                "access_token": access,
+                "refresh_token": rotated,
+                "expires_in": exp,
+                "token_type": payload.get("token_type") or "Bearer",
+                "expires_at": int(time.time()) + exp,
+            }
+            if payload.get("scope"):
+                out["scope"] = payload.get("scope")
+            return out
+        last_err = f"http_{code}" if code >= 400 else "bad_refresh"
+        break
+    raise RuntimeError(last_err)
+
+
+def _kimi_usages(base: str, access: str) -> tuple[int, dict | None]:
+    url = base.rstrip("/") + "/usages"
+    headers = {"Authorization": "Bearer " + access, "Accept": "application/json"}
+    code, body = _kimi_http(url, "GET", headers, None, timeout=10)
+    return code, _kimi_decode(body)
+
+
+def _kimi_window_is_5h(item: dict) -> bool:
+    win = item.get("window")
+    unit = ""
+    dur_f = None
+    if isinstance(win, dict):
+        unit = str(win.get("timeUnit") or win.get("unit") or "").lower()
+        try:
+            dur_f = float(win.get("duration"))
+        except (TypeError, ValueError):
+            dur_f = None
+    elif win is not None:
+        s = str(win).lower()
+        return s in ("5h", "5hr", "300m", "300 minutes")
+    else:
+        unit = str(item.get("timeUnit") or item.get("unit") or "").lower()
+        try:
+            dur_f = float(item.get("duration"))
+        except (TypeError, ValueError):
+            dur_f = None
+    if dur_f is None:
+        return False
+    if "minute" in unit and dur_f == 300:
+        return True
+    if "hour" in unit and dur_f == 5:
+        return True
+    if "minute" in unit and dur_f >= 60 and dur_f % 60 == 0 and dur_f / 60 == 5:
+        return True
+    return False
+
+
+def _kimi_detail_reset(detail: dict):
+    reset = detail.get("resetTime") or detail.get("resetsAt")
+    if isinstance(reset, (int, float)):
+        return iso_from_unix(reset)
+    if reset is not None:
+        return str(reset)
+    return None
+
+
+def _kimi_pct(detail: dict) -> float | None:
+    if not isinstance(detail, dict):
+        return None
+    pct = ratio(detail.get("used"), detail.get("limit"))
+    if pct is not None:
+        return pct
+    if detail.get("remaining") is None or detail.get("limit") is None:
+        return None
+    try:
+        rem = float(detail.get("remaining"))
+        lim = float(detail.get("limit"))
+    except (TypeError, ValueError):
+        return None
+    if lim <= 0:
+        return None
+    return as_pct(100.0 * (lim - rem) / lim)
+
+
+def _kimi_windows(payload: dict) -> list[dict]:
+    windows: list[dict] = []
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+    if usage:
+        pct = _kimi_pct(usage)
+        reset = usage.get("resetTime") or usage.get("resetsAt") or usage.get("reset_at")
+        if isinstance(reset, (int, float)):
+            reset = iso_from_unix(reset)
+        elif reset is not None:
+            reset = str(reset)
+        if pct is not None:
+            windows.append(window("weekly", "Weekly", pct, reset))
+    limits = payload.get("limits") if isinstance(payload.get("limits"), list) else []
+    for item in limits:
+        if not isinstance(item, dict) or not _kimi_window_is_5h(item):
+            continue
+        detail = item.get("detail") if isinstance(item.get("detail"), dict) else item
+        if not isinstance(detail, dict):
+            continue
+        pct = _kimi_pct(detail)
+        if pct is None:
+            continue
+        windows.append(window("session", "5h", pct, _kimi_detail_reset(detail), extra={"window_mins": 300}))
+        break
+    if not any(w.get("kind") == "weekly" for w in windows):
+        windows.insert(0, {"kind": "weekly", "label": "Weekly"})
+    return windows
+
+
+def probe_kimi() -> dict:
+    base, oauth_host, slot = _kimi_config()
+    cred_path, lock_path = _kimi_cred_paths(slot)
+    if cred_path is None or lock_path is None or not cred_path.is_file():
+        return empty_provider("kimi", "unauth", "need_login")
+
+    def load() -> dict | None:
+        return _kimi_read_creds(cred_path)
+
+    def refresh_locked(old: dict) -> dict:
+        rt = old.get("refresh_token")
+        if not isinstance(rt, str) or not rt:
+            raise _KimiUnauth("need_login")
+        new = _kimi_refresh(oauth_host, rt)
+        merged = dict(old)
+        merged.update(new)
+        _kimi_write_creds(cred_path, merged)
+        return merged
+
+    creds: dict | None
+    try:
+        fd = _kimi_flock(lock_path)
+        try:
+            creds = load()
+            if not creds or _kimi_is_tombstone(creds):
+                return empty_provider("kimi", "unauth", "need_login")
+            if _kimi_needs_refresh(creds):
+                creds = refresh_locked(creds)
+        finally:
+            _kimi_unflock(fd)
+    except _KimiUnauth:
+        return empty_provider("kimi", "unauth", "need_login")
+    except TimeoutError:
+        return empty_provider("kimi", "unknown", "lock_timeout")
+    except Exception as exc:
+        msg = redact(str(exc))[:200]
+        low = msg.lower()
+        if "invalid_grant" in low or "401" in msg or "unauth" in low:
+            return empty_provider("kimi", "unauth", "need_login")
+        return empty_provider("kimi", "unknown", msg or "refresh_failed")
+
+    access = creds.get("access_token") if isinstance(creds, dict) else None
+    if not isinstance(access, str) or not access:
+        return empty_provider("kimi", "unauth", "need_login")
+
+    def usages_unauth(code, payload) -> bool:
+        if _kimi_cloudflare(payload):
+            return False
+        if code == 401:
+            return True
+        if not isinstance(payload, dict):
+            return False
+        code_s = str(payload.get("code") or payload.get("error") or "").lower()
+        if code_s in ("unauthenticated", "invalid_grant", "unauthorized"):
+            return True
+        details = payload.get("details")
+        if isinstance(details, list):
+            for item in details:
+                if not isinstance(item, dict):
+                    continue
+                dbg = item.get("debug") if isinstance(item.get("debug"), dict) else {}
+                if "INVALID_AUTH" in str(dbg.get("reason") or ""):
+                    return True
+        return False
+
+    try:
+        code, payload = _kimi_usages(base, access)
+    except Exception as exc:
+        return empty_provider("kimi", "unknown", redact(str(exc))[:200])
+
+    if usages_unauth(code, payload):
+        try:
+            fd = _kimi_flock(lock_path)
+            try:
+                creds = load()
+                if not creds or _kimi_is_tombstone(creds):
+                    return empty_provider("kimi", "unauth", "need_login")
+                creds = refresh_locked(creds)
+            finally:
+                _kimi_unflock(fd)
+        except _KimiUnauth:
+            return empty_provider("kimi", "unauth", "need_login")
+        except Exception as exc:
+            msg = redact(str(exc))[:200]
+            if "invalid_grant" in msg.lower():
+                return empty_provider("kimi", "unauth", "need_login")
+            return empty_provider("kimi", "unknown", msg)
+        access = creds.get("access_token") if isinstance(creds, dict) else None
+        if not isinstance(access, str) or not access:
+            return empty_provider("kimi", "unauth", "need_login")
+        try:
+            code, payload = _kimi_usages(base, access)
+        except Exception as exc:
+            return empty_provider("kimi", "unknown", redact(str(exc))[:200])
+        if usages_unauth(code, payload):
+            return empty_provider("kimi", "unauth", "need_login")
+
+    if code != 200 or not isinstance(payload, dict):
+        if usages_unauth(code, payload):
+            return empty_provider("kimi", "unauth", "need_login")
+        return empty_provider("kimi", "unknown", f"http_{code}" if code else "bad_payload")
+
+    rec = {
+        "id": "kimi",
+        "name": "Kimi",
+        "logo": "K",
+        "status": "ok",
+        "windows": _kimi_windows(payload),
+    }
+    if not any("used_pct" in w for w in rec["windows"]):
+        rec["status"] = "unknown"
+        rec["reason"] = "no_used_pct"
+    return rec
+
+
+# --- Local Codex tokens (Quattro scan_native_codex_sessions) -----------------
+
+
+def _tok_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _model_name(raw) -> str:
+    value = str(raw or "codex")
+    return value if value else "codex"
+
+
+def _local_day(value) -> str:
+    if value is None:
+        return datetime.now().strftime("%Y-%m-%d")
+    if isinstance(value, (int, float)):
+        if value > 10_000_000_000:
+            value = value / 1000
+        try:
+            return datetime.fromtimestamp(value).strftime("%Y-%m-%d")
+        except (OSError, OverflowError, ValueError):
+            return datetime.now().strftime("%Y-%m-%d")
+    text = str(value)
+    try:
+        if text.endswith("Z"):
+            dt = datetime.fromisoformat(text[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def _empty_bucket() -> dict:
+    return {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    }
+
+
+def empty_local_stats() -> dict:
+    now = datetime.now()
+    dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+    return {
+        "todayPrompts": 0,
+        "todaySessions": 0,
+        "todayTotalTokens": 0,
+        "todayTokensByModel": {},
+        "recentDays": [{"date": day, "messageCount": 0} for day in dates],
+        "totalPrompts": 0,
+        "totalSessions": 0,
+        "activeDays": 0,
+        "activeDates": [],
+        "modelUsage": {},
+        "hasLocalStats": False,
+    }
+
+
+def scan_native_codex_sessions() -> dict:
+    """Quattro algorithm: last_token_usage only, jsonl mtime within 30d.
+
+    Session tokens are never quota percents.
+    """
+    stats = empty_local_stats()
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    recent_dates = [row["date"] for row in stats["recentDays"]]
+    recent = {day: 0 for day in recent_dates}
+    model_usage: dict[str, dict] = {}
+    today_tokens_by_model: dict[str, int] = {}
+    today_sessions: set[str] = set()
+    total_sessions: set[str] = set()
+    active_days: set[str] = set()
+    today_prompts = 0
+    today_total_tokens = 0
+    total_prompts = 0
+
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    roots = [codex_home / "sessions", codex_home / "archived_sessions"]
+    files: list[Path] = []
+    cutoff = time.time() - 30 * 24 * 60 * 60
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*.jsonl"):
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    files.append(path)
+            except OSError:
+                pass
+
+    saw_any = False
+    for path in files:
+        current_model = "codex"
+        try:
+            with path.open(errors="replace") as handle:
+                for raw in handle:
+                    try:
+                        entry = json.loads(raw)
+                    except Exception:
+                        continue
+                    if entry.get("type") == "turn_context":
+                        payload = entry.get("payload") or {}
+                        current_model = _model_name(
+                            payload.get("model") or payload.get("model_slug") or current_model
+                        )
+                        continue
+                    payload = entry.get("payload") or entry
+                    if entry.get("type") == "response_item" and isinstance(payload, dict):
+                        payload = payload.get("payload") or payload
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("type") != "token_count":
+                        continue
+                    info = payload.get("info") or {}
+                    usage = info.get("last_token_usage") or {}
+                    if not isinstance(usage, dict):
+                        continue
+                    cache_read = _tok_int(usage.get("cached_input_tokens"))
+                    cache_write = _tok_int(usage.get("cache_write_input_tokens"))
+                    input_tokens = max(0, _tok_int(usage.get("input_tokens")) - cache_read - cache_write)
+                    output_tokens = _tok_int(usage.get("output_tokens"))
+                    if not (input_tokens or output_tokens or cache_read or cache_write):
+                        continue
+                    saw_any = True
+                    day = _local_day(entry.get("timestamp") or path.stat().st_mtime)
+                    session_key = str(path)
+                    total = input_tokens + output_tokens + cache_read + cache_write
+                    total_prompts += 1
+                    total_sessions.add(session_key)
+                    active_days.add(day)
+                    bucket = model_usage.setdefault(current_model, _empty_bucket())
+                    bucket["inputTokens"] += input_tokens
+                    bucket["outputTokens"] += output_tokens
+                    bucket["cacheReadInputTokens"] += cache_read
+                    bucket["cacheCreationInputTokens"] += cache_write
+                    if day in recent:
+                        recent[day] += total
+                    if day == today:
+                        today_prompts += 1
+                        today_sessions.add(session_key)
+                        today_total_tokens += total
+                        today_tokens_by_model[current_model] = (
+                            today_tokens_by_model.get(current_model, 0) + total
+                        )
+        except OSError:
+            continue
+
+    stats.update(
+        {
+            "todayPrompts": today_prompts,
+            "todaySessions": len(today_sessions),
+            "todayTotalTokens": today_total_tokens,
+            "todayTokensByModel": today_tokens_by_model,
+            "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent_dates],
+            "totalPrompts": total_prompts,
+            "totalSessions": len(total_sessions),
+            "activeDays": len(active_days),
+            "activeDates": sorted(active_days),
+            "modelUsage": model_usage,
+            "hasLocalStats": saw_any,
+        }
+    )
+    return stats
+
+
+def scan_cache_path() -> Path:
+    return cache_path().parent / "codex-scan.json"
+
+
+def cached_codex_scan(force: bool = False) -> dict:
+    today = datetime.now().strftime("%Y-%m-%d")
+    path = scan_cache_path()
+    max_age = 0 if force else SCAN_LIMITS_REUSE_SECONDS
+    if max_age > 0 and path.is_file():
+        try:
+            age = time.time() - path.stat().st_mtime
+            if 0 <= age <= max_age:
+                cached = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("schemaVersion") == 1
+                    and cached.get("scanDate") == today
+                    and isinstance(cached.get("stats"), dict)
+                ):
+                    return cached["stats"]
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    stats = scan_native_codex_sessions()
+    try:
+        atomic_write(
+            path,
+            json.dumps({"schemaVersion": 1, "scanDate": today, "stats": stats}, ensure_ascii=False) + "\n",
+        )
+    except OSError:
+        pass
+    return stats
+
+
+def attach_codex_local_stats(rec: dict, force: bool = False) -> dict:
+    out = dict(rec)
+    try:
+        stats = cached_codex_scan(force=force)
+    except Exception:
+        return out
+    if not isinstance(stats, dict):
+        return out
+    for key in (
+        "todayPrompts",
+        "todaySessions",
+        "todayTotalTokens",
+        "todayTokensByModel",
+        "recentDays",
+        "totalPrompts",
+        "totalSessions",
+        "activeDays",
+        "activeDates",
+        "modelUsage",
+        "hasLocalStats",
+    ):
+        if key in stats:
+            out[key] = stats[key]
+    return out
+
+
+# --- Prices / API-equivalent cost --------------------------------------------
+
+
+def load_prices() -> dict:
+    path = prices_path()
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return {}
+    out = {}
+    for name, row in models.items():
+        if not isinstance(row, dict):
+            continue
+        try:
+            inp = Decimal(str(row["input"]))
+            cache = Decimal(str(row["cache"]))
+            output = Decimal(str(row["output"]))
+        except (KeyError, ArithmeticError, ValueError):
+            continue
+        key = str(name).strip().lower()
+        if not key:
+            continue
+        entry = {"input": inp, "cache": cache, "output": output}
+        if "cache_write" in row:
+            try:
+                entry["cache_write"] = Decimal(str(row["cache_write"]))
+            except (ArithmeticError, ValueError):
+                pass
+        out[key] = entry
+    return out
+
+
+def lookup_price(model: str, prices: dict) -> dict | None:
+    if not model or not prices:
+        return None
+    key = str(model).strip().lower()
+    if key.startswith("openai/"):
+        key = key[7:]
+    return prices.get(key)
+
+
+def _usd_tokens(n: int, per_million: Decimal) -> Decimal:
+    if n <= 0:
+        return Decimal("0")
+    return (Decimal(n) * per_million) / MILLION
+
+
+def api_equivalent_cost(model_usage, prices: dict) -> tuple[Decimal | None, list[str]]:
+    """Priced buckets only. Unknown models are skipped, never guessed.
+
+    Returns (amount, skipped_model_ids). None amount means cost unknown.
+    """
+    if not isinstance(model_usage, dict) or not model_usage:
+        return None, []
+    if not prices:
+        return None, list(model_usage)
+    total = Decimal("0")
+    skipped: list[str] = []
+    priced_any = False
+    for model, bucket in model_usage.items():
+        rate = lookup_price(str(model), prices)
+        if rate is None or not isinstance(bucket, dict):
+            skipped.append(str(model))
+            continue
+        priced_any = True
+        inp = _tok_int(bucket.get("inputTokens"))
+        out = _tok_int(bucket.get("outputTokens"))
+        cache_read = _tok_int(bucket.get("cacheReadInputTokens"))
+        cache_write = _tok_int(bucket.get("cacheCreationInputTokens"))
+        total += _usd_tokens(inp, rate["input"])
+        total += _usd_tokens(out, rate["output"])
+        total += _usd_tokens(cache_read, rate["cache"])
+        write_rate = rate.get("cache_write")
+        if write_rate is not None:
+            total += _usd_tokens(cache_write, write_rate)
+    if not priced_any:
+        return None, skipped
+    return total, skipped
+
+
+def format_usd(amount: Decimal) -> str:
+    return f"${amount.quantize(USD_CENTS, rounding=ROUND_HALF_UP)}"
+
+
+def export_quattro(pid: str, rec: dict) -> None:
+    """Fail-soft upgrade copy. State dir, not omarchy share."""
+    if not isinstance(rec, dict):
+        return
+    try:
+        dest_dir = quattro_state_dir()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        limits = []
+        for w in rec.get("windows") or []:
+            if not isinstance(w, dict) or "used_pct" not in w:
+                continue
+            pct = as_pct(w.get("used_pct"))
+            if pct is None:
+                continue
+            limits.append(
+                {
+                    "label": w.get("label") or w.get("kind") or "Limit",
+                    "percent": float(pct) / 100.0,
+                    "resetsAt": w.get("resets_at") or "",
+                }
+            )
+        record = {
+            "schemaVersion": 1,
+            "id": pid,
+            "name": rec.get("name") or pid,
+            "updatedAt": iso_now(),
+            "ready": rec.get("status") == "ok",
+            "hasLocalStats": bool(rec.get("hasLocalStats")),
+            "tierLabel": rec.get("plan") or "",
+            "usageStatusText": "" if rec.get("status") == "ok" else str(rec.get("reason") or rec.get("status") or ""),
+            "authHelpText": str(rec.get("reason") or ""),
+            "limits": limits,
+        }
+        for key in (
+            "todayPrompts",
+            "todaySessions",
+            "todayTotalTokens",
+            "todayTokensByModel",
+            "recentDays",
+            "totalPrompts",
+            "totalSessions",
+            "activeDays",
+            "activeDates",
+            "modelUsage",
+        ):
+            if key in rec:
+                record[key] = rec[key]
+        atomic_write(dest_dir / f"{pid}.json", json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        return
+
+
+# --- TUI ---------------------------------------------------------------------
+
+
+def format_token_count(n) -> str:
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return "0"
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def parse_reset(ts) -> datetime | None:
+    if not ts:
+        return None
+    text = str(ts).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        iso = iso_from_unix(ts)
+        if not iso:
+            return None
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def format_reset_in(ts) -> str:
+    dt = parse_reset(ts)
+    if dt is None:
+        return ""
+    remaining = dt - datetime.now(timezone.utc)
+    ms = remaining.total_seconds() * 1000
+    if not (ms > 0):
+        return "now"
+    minutes = int(ms // 60000)
+    hours = minutes // 60
+    days = hours // 24
+    if days > 0:
+        return f"{days}d {hours % 24}h"
+    if hours > 0:
+        return f"{hours}h {minutes % 60}m"
+    return f"{max(1, minutes)}m"
+
+
+def tui_meter(pct, width: int = TUI_METER_WIDTH) -> str:
+    value = as_pct(pct)
+    if value is None:
+        return "—"
+    filled = round_half_up(value * width / 100.0)
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def token_meter(n: int, peak: int, width: int = TUI_METER_WIDTH) -> str:
+    if peak <= 0:
+        return "░" * width
+    ratio = min(1.0, max(0.0, n / peak))
+    filled = round_half_up(ratio * width)
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _pct_label(pct) -> str:
+    value = as_pct(pct)
+    if value is None:
+        return "—"
+    if float(value) == int(value):
+        return f"{int(value)}%"
+    return f"{value}%"
+
+
+def render_dashboard(cache: dict | None = None, selected: str | None = None, prices: dict | None = None) -> str:
+    cache = cache if cache is not None else load_cache()
+    pid = selected or pick_selected(cache)
+    rec = cache.get("providers", {}).get(pid)
+    if not isinstance(rec, dict):
+        rec = empty_provider(pid if pid in PROVIDER_INDEX else "codex", "unknown", "no_cache")
+    if pid == "codex" and not rec.get("hasLocalStats") and not rec.get("modelUsage"):
+        rec = attach_codex_local_stats(rec)
+    if prices is None:
+        prices = load_prices()
+
+    name = rec.get("name") or pid
+    plan = rec.get("plan")
+    header = f"{name}  ({plan})" if plan else str(name)
+    lines = [header]
+    if rec.get("status") and rec.get("status") != "ok":
+        bit = rec.get("status")
+        if rec.get("reason"):
+            bit += f"  {rec['reason']}"
+        lines.append(str(bit))
+    lines.append("")
+
+    chips = []
+    for cid, cname, _logo in PROVIDERS:
+        label = cname
+        if cid == pid:
+            chips.append(f"[{label}]")
+        else:
+            chips.append(f" {label} ")
+    lines.append(" ".join(chips))
+    lines.append("")
+
+    lines.append("LIMITS")
+    limit_rows = []
+    for w in rec.get("windows") or []:
+        if isinstance(w, dict):
+            limit_rows.append(w)
+    burst = rec.get("burst")
+    if isinstance(burst, dict):
+        limit_rows.append(burst)
+    if not limit_rows:
+        lines.append("  —")
+    else:
+        for w in limit_rows:
+            label = str(w.get("label") or w.get("kind") or "Limit")
+            pct = w.get("used_pct") if "used_pct" in w else None
+            lines.append(f"{label:<28} {_pct_label(pct):>4}")
+            lines.append(tui_meter(pct))
+            reset = format_reset_in(w.get("resets_at"))
+            if reset:
+                prefix = "Resets in " if reset != "now" else "Resets "
+                lines.append(prefix + reset)
+            lines.append("")
+
+    days = rec.get("recentDays") if isinstance(rec.get("recentDays"), list) else []
+    models = rec.get("modelUsage") if isinstance(rec.get("modelUsage"), dict) else {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    if days:
+        lines.append("TOKENS BY DAY")
+        peak = 0
+        for d in days:
+            if isinstance(d, dict):
+                try:
+                    peak = max(peak, int(d.get("messageCount") or 0))
+                except (TypeError, ValueError):
+                    pass
+        for d in days:
+            if not isinstance(d, dict):
+                continue
+            date = str(d.get("date") or "")
+            try:
+                count = int(d.get("messageCount") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            is_today = date == today
+            try:
+                label = "Today" if is_today else datetime.strptime(date, "%Y-%m-%d").strftime("%a")
+            except ValueError:
+                label = date or "?"
+            mark = "*" if is_today else " "
+            lines.append(f"{mark}{label:<6} {token_meter(count, peak)} {format_token_count(count):>7}")
+        lines.append("")
+
+    if models:
+        lines.append("TOKENS BY MODEL")
+        rows = []
+        for mid, bucket in models.items():
+            if not isinstance(bucket, dict):
+                continue
+            total = (
+                _tok_int(bucket.get("inputTokens"))
+                + _tok_int(bucket.get("outputTokens"))
+                + _tok_int(bucket.get("cacheReadInputTokens"))
+                + _tok_int(bucket.get("cacheCreationInputTokens"))
+            )
+            rows.append((str(mid), total, bucket))
+        rows.sort(key=lambda r: r[1], reverse=True)
+        peak_m = rows[0][1] if rows else 0
+        for mid, total, _bucket in rows[:8]:
+            lines.append(f"{mid:<28} {token_meter(total, peak_m, 16)} {format_token_count(total):>7}")
+        lines.append("")
+
+    lines.append("COST")
+    amount, _skipped = api_equivalent_cost(models or None, prices)
+    if amount is None:
+        lines.append("cost unknown")
+    else:
+        lines.append(f"API would have cost {format_usd(amount)}")
+    lines.append("OAuth incremental $0")
+    lines.append("")
+    lines.append("h/l or 1-4 switch · r refresh · q quit")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_select(pid: str) -> int:
+    if pid not in PROVIDER_INDEX:
+        print(f"unknown provider: {pid}", file=sys.stderr)
+        return 1
+    write_selected(pid)
+    cache = load_cache()
+    cache["selected"] = pid
+    path = cache_path()
+    if path.exists():
+        atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+    poke_waybar()
+    print(pid)
+    return 0
+
+
+def _tui_loop(stdscr) -> int:
+    import curses
+
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.nodelay(False)
+    ids = [pid for pid, _, _ in PROVIDERS]
+    while True:
+        text = render_dashboard()
+        stdscr.erase()
+        maxy, maxx = stdscr.getmaxyx()
+        for i, line in enumerate(text.splitlines()):
+            if i >= maxy:
+                break
+            try:
+                stdscr.addnstr(i, 0, line, max(0, maxx - 1))
+            except curses.error:
+                pass
+        stdscr.refresh()
+        try:
+            ch = stdscr.get_wch()
+        except curses.error:
+            continue
+        if ch in ("q", "Q"):
+            return 0
+        if ch in ("r", "R"):
+            cmd_probe([], None)
+            cache = load_cache()
+            rec = cache.get("providers", {}).get("codex")
+            if isinstance(rec, dict):
+                cache["providers"]["codex"] = attach_codex_local_stats(rec, force=True)
+                save_cache(cache)
+            continue
+        if ch in ("l", "L") or ch == curses.KEY_RIGHT:
+            cmd_cycle("next")
+            poke_waybar()
+            continue
+        if ch in ("h", "H") or ch == curses.KEY_LEFT:
+            cmd_cycle("prev")
+            poke_waybar()
+            continue
+        if isinstance(ch, str) and ch in "1234":
+            cmd_select(ids[int(ch) - 1])
+            continue
+        if ch == curses.KEY_RESIZE:
+            continue
+    return 0
+
+
+def cmd_tui(dump: bool = False) -> int:
+    if dump or not sys.stdout.isatty():
+        sys.stdout.write(render_dashboard())
+        return 0
+    try:
+        import curses
+
+        return curses.wrapper(_tui_loop)
+    except Exception:
+        sys.stdout.write(render_dashboard())
+        return 0
+
+
+PROBERS = {
+    "codex": probe_codex,
+    "token-plan": probe_token_plan,
+    "grok": probe_grok,
+    "kimi": probe_kimi,
+}
+
+
+def probe_one(pid: str, fixture: str | None = None) -> dict:
+    if pid == "codex":
+        return probe_codex(fixture)
+    fn = PROBERS.get(pid)
+    if not fn:
+        raise SystemExit(f"unknown provider: {pid}")
+    return fn()
+
+
+def summarize(rec: dict) -> str:
+    bits = [rec.get("id", "?"), rec.get("status", "?")]
+    if rec.get("reason"):
+        bits.append(str(rec["reason"]))
+    for w in rec.get("windows") or []:
+        if isinstance(w, dict) and "used_pct" in w:
+            bits.append(f"{w.get('kind')}={w['used_pct']}")
+    return " ".join(bits)
+
+
+def cmd_probe(ids: list[str], fixture: str | None) -> int:
+    cache = load_cache()
+    targets = ids or [pid for pid, _, _ in PROVIDERS]
+    for pid in targets:
+        rec = probe_one(pid, fixture if pid == "codex" else None)
+        upsert(cache, rec)
+        print(summarize(rec))
+    cache["selected"] = pick_selected(cache)
+    write_selected(cache["selected"])
+    save_cache(cache)
+    for pid, rec in (cache.get("providers") or {}).items():
+        if isinstance(rec, dict):
+            export_quattro(pid, rec)
+    return 0
+
+
+# --- Renderer ----------------------------------------------------------------
+
+
+def round_half_up(n: float) -> int:
+    return int(n + 0.5) if n >= 0 else int(n - 0.5)
+
+
+def meter(pct) -> str:
+    value = as_pct(pct)
+    if value is None:
+        return "—"
+    filled = round_half_up(value * METER_WIDTH / 100.0)
+    filled = max(0, min(METER_WIDTH, filled))
+    return "▓" * filled + "░" * (METER_WIDTH - filled)
+
+
+def window_by_kind(rec: dict, kind: str) -> dict | None:
+    for w in rec.get("windows") or []:
+        if isinstance(w, dict) and w.get("kind") == kind:
+            return w
+    return None
+
+
+def extra_window(rec: dict) -> dict:
+    special = window_by_kind(rec, "special")
+    if special is not None:
+        return special
+    credits = window_by_kind(rec, "credits")
+    if credits is not None:
+        return credits
+    return window_by_kind(rec, "session") or {}
+
+
+def pango_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def cache_age_sec(cache: dict) -> float | None:
+    stamp = cache.get("updated_at")
+    if not stamp:
+        return None
+    try:
+        dt = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return max(0.0, time.time() - dt.timestamp())
+
+
+def cmd_waybar() -> int:
+    cache = load_cache()
+    pid = pick_selected(cache)
+    rec = cache.get("providers", {}).get(pid)
+    if not isinstance(rec, dict):
+        rec = empty_provider(pid if pid in PROVIDER_INDEX else "codex", "unknown", "no_cache")
+        rec["logo"] = PROVIDER_INDEX.get(pid, ("?", "?"))[1] if pid in PROVIDER_INDEX else "?"
+    logo = str(rec.get("logo") or PROVIDER_INDEX.get(pid, ("?", "?"))[1])
+    weekly = window_by_kind(rec, "weekly") or {}
+    extra = extra_window(rec)
+    extra_bits = extra.get("extra") if isinstance(extra.get("extra"), dict) else {}
+    if extra.get("kind") == "credits" and extra_bits.get("remaining_usd") is not None:
+        usd = float(extra_bits["remaining_usd"])
+        extra_txt = f"${usd:.0f}" if usd >= 10 else f"${usd:.2f}"
+    else:
+        extra_txt = meter(extra.get("used_pct"))
+    text = f"{pango_escape(logo)} {meter(weekly.get('used_pct'))} {extra_txt}"
+    status = rec.get("status") or "unknown"
+    classes = [status]
+    age = cache_age_sec(cache)
+    if age is not None and age > STALE_AFTER_SEC:
+        classes.append("stale")
+    pcts = [as_pct(weekly.get("used_pct")), as_pct(extra.get("used_pct"))]
+    known = [p for p in pcts if p is not None]
+    if known and max(known) >= 95:
+        classes.append("critical")
+    elif known and max(known) >= 80:
+        classes.append("warn")
+    lines = [f"{rec.get('name') or pid}" + (f" ({rec['plan']})" if rec.get("plan") else "")]
+    if rec.get("reason"):
+        lines.append(str(rec["reason"]))
+    if rec.get("last_error"):
+        lines.append("last error: " + str(rec["last_error"]))
+    for w in rec.get("windows") or []:
+        if not isinstance(w, dict):
+            continue
+        label = w.get("label") or w.get("kind")
+        if "used_pct" in w:
+            bit = f"{label}: {w['used_pct']}%"
+        else:
+            bit = f"{label}: —"
+        extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
+        if extra_bits.get("remaining_usd") is not None:
+            bit += f"  ${float(extra_bits['remaining_usd']):.2f} left"
+        if w.get("resets_at"):
+            bit += f"  reset {w['resets_at']}"
+        lines.append(bit)
+    burst = rec.get("burst")
+    if isinstance(burst, dict) and "used_pct" in burst:
+        bit = f"{burst.get('label') or 'burst'}: {burst['used_pct']}%"
+        if burst.get("resets_at"):
+            bit += f"  reset {burst['resets_at']}"
+        lines.append(bit)
+    if age is not None:
+        lines.append(f"cache {int(age)}s ago")
+    payload = {
+        "text": text,
+        "tooltip": pango_escape("\n".join(lines)),
+        "class": " ".join(classes),
+        "alt": pid,
+    }
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return 0
+
+
+def cmd_cycle(direction: str) -> int:
+    cache = load_cache()
+    present = [pid for pid, _, _ in PROVIDERS if pid in cache.get("providers", {})]
+    if not present:
+        print("no providers in cache")
+        return 1
+    current = pick_selected(cache)
+    if current not in present:
+        nxt = present[0]
+    else:
+        idx = present.index(current)
+        delta = -1 if direction == "prev" else 1
+        nxt = present[(idx + delta) % len(present)]
+    cache["selected"] = nxt
+    write_selected(nxt)
+    # Persist selection without bumping probe freshness.
+    path = cache_path()
+    if path.exists():
+        atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+    print(nxt)
+    return 0
+
+
+def cmd_validate() -> int:
+    path = cache_path()
+    if not path.exists():
+        print("INVALID: no cache")
+        return 1
+    mode = stat.S_IMODE(path.stat().st_mode)
+    cache = load_cache()
+    ok = True
+    notes = [f"cache: {path}", f"mode: {mode:o}"]
+    if mode != 0o600:
+        ok = False
+        notes.append("mode must be 0600")
+    if cache.get("version") != VERSION:
+        ok = False
+        notes.append(f"version {cache.get('version')} != {VERSION}")
+    selected = pick_selected(cache)
+    notes.append(f"selected: {selected}")
+    providers = cache.get("providers") or {}
+    if selected not in providers:
+        ok = False
+        notes.append("selected provider missing")
+    for pid, rec in providers.items():
+        if not isinstance(rec, dict):
+            ok = False
+            notes.append(f"{pid}: not an object")
+            continue
+        status = rec.get("status")
+        if status not in ("ok", "unauth", "unknown"):
+            ok = False
+            notes.append(f"{pid}: bad status {status!r}")
+        kinds = []
+        for w in rec.get("windows") or []:
+            if not isinstance(w, dict):
+                ok = False
+                continue
+            kinds.append(w.get("kind"))
+            if "used_pct" in w and as_pct(w.get("used_pct")) is None:
+                ok = False
+                notes.append(f"{pid}: invented/non-numeric used_pct")
+        line = f"{pid}: {status}"
+        if rec.get("reason"):
+            line += f" {rec['reason']}"
+        for w in rec.get("windows") or []:
+            if isinstance(w, dict) and "used_pct" in w:
+                line += f" {w.get('kind')}={w['used_pct']}"
+        notes.append(line)
+    print("\n".join(notes))
+    print("VALID" if ok else "INVALID")
+    return 0 if ok else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ai-usage", description="AI CLI usage chip for Waybar")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    probe = sub.add_parser("probe", help="fetch provider windows into cache")
+    probe.add_argument("id", nargs="?", help="provider id (default: all)")
+    probe.add_argument("--fixture", help="Codex RPC snapshot JSON (no network)")
+    sub.add_parser("waybar", help="print Waybar JSON from cache only")
+    cyc = sub.add_parser("cycle", help="rotate selected provider")
+    cyc.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
+    sub.add_parser("validate", help="schema-check cache")
+    sub.add_parser("refresh", help="probe all providers")
+    tui = sub.add_parser("tui", help="Quattro-like usage dashboard")
+    tui.add_argument("--dump", action="store_true", help="print dashboard and exit")
+    sel = sub.add_parser("select", help="set selected provider")
+    sel.add_argument("id")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    ensure_path()
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.cmd == "probe":
+        ids = [args.id] if args.id else []
+        return cmd_probe(ids, args.fixture)
+    if args.cmd == "refresh":
+        return cmd_probe([], None)
+    if args.cmd == "waybar":
+        return cmd_waybar()
+    if args.cmd == "cycle":
+        return cmd_cycle(args.direction)
+    if args.cmd == "validate":
+        return cmd_validate()
+    if args.cmd == "tui":
+        return cmd_tui(dump=args.dump)
+    if args.cmd == "select":
+        return cmd_select(args.id)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

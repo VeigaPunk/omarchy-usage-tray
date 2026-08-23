@@ -1,0 +1,21 @@
+{
+  "usage": {
+    "remaining": 100,
+    "limit": 100,
+    "resetTime": "2026-08-27T16:25:35Z"
+  },
+  "limits": [
+    {
+      "name": "session",
+      "window": {
+        "duration": 300,
+        "timeUnit": "TIME_UNIT_MINUTE"
+      },
+      "detail": {
+        "remaining": 100,
+        "limit": 100,
+        "resetTime": "2026-08-23T07:25:35Z"
+      }
+    }
+  ]
+}

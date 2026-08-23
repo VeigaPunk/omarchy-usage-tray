@@ -1,0 +1,23 @@
+/* One-line meters at 12px on a 32px bar. */
+#custom-ai-usage {
+  font-size: 12px;
+  font-family: 'JetBrainsMono Nerd Font';
+  min-width: 0;
+  margin: 0 8px 0 4px;
+  padding: 0 2px;
+  color: @foreground;
+}
+
+#custom-ai-usage.unauth,
+#custom-ai-usage.unknown {
+  opacity: 0.7;
+}
+
+#custom-ai-usage.stale {
+  opacity: 0.55;
+}
+
+#custom-ai-usage.warn,
+#custom-ai-usage.critical {
+  color: #a55555;
+}
