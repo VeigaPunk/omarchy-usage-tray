@@ -24,7 +24,7 @@ Re-run the same line to update.
 | Gesture | Action |
 |---|---|
 | Left-click | Next provider |
-| Right-click | Next identity (Token Plan: `team` / `gmail`) |
+| Right-click | Next identity (Token Plan: `team` / `gmail`; Cursor: parked OAuth) |
 | Scroll | Cycle providers |
 
 Token Plan right-click runs `token-plan-swap toggle`. That helper flips
@@ -33,9 +33,9 @@ from the matching local key file (`keys/team` or `keys/gmail`). Codex, xask,
 and `token-plan-key` all read that slot. 1Password is only used by
 `token-plan-swap pull`.
 
-OAuth multi-account (not used on this host) is documented in
-[`docs/identity-swap.md`](docs/identity-swap.md). Right-click is a no-op
-until a provider has two live stores.
+Cursor dual-OAuth uses `cursor-oauth-swap` (same Token Plan shape). Codex /
+Grok / Kimi stay no-ops until a second store exists. See
+[`docs/identity-swap.md`](docs/identity-swap.md).
 
 ## Local clone
 

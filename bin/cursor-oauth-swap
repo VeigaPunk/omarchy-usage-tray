@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Park and swap Cursor OAuth sessions. Never prints token bytes.
+# Usage: cursor-oauth-swap [status|capture <id>|toggle|<id>]
+set -euo pipefail
+
+CONF="${CURSOR_OAUTH_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/cursor-oauth}"
+LIVE="${CURSOR_AUTH_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/cursor/auth.json}"
+SLOTS_FILE="$CONF/slots"
+ACTIVE_FILE="$CONF/active"
+IDENT_DIR="$CONF/identities"
+
+mkdir -p "$IDENT_DIR"
+chmod 700 "$CONF" "$IDENT_DIR" 2>/dev/null || true
+
+ensure_slots() {
+  if [[ ! -f "$SLOTS_FILE" ]]; then
+    umask 077
+    cat >"$SLOTS_FILE" <<'EOF'
+# id|ref|title|ident
+primary||Cursor OAuth primary|
+second||Cursor OAuth second|
+EOF
+    chmod 600 "$SLOTS_FILE"
+  fi
+}
+
+slot_meta() {
+  local id="$1"
+  awk -F'|' -v id="$id" '$1==id {print; found=1} END{if(!found) exit 1}' "$SLOTS_FILE"
+}
+
+active_id() {
+  if [[ -f "$ACTIVE_FILE" ]]; then
+    tr -d '[:space:]' <"$ACTIVE_FILE"
+  else
+    printf ''
+  fi
+}
+
+normalize_id() {
+  case "$1" in
+    a | one | main | gravy | primary | '') printf 'primary' ;;
+    b | two | other | mint | second) printf 'second' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+slot_file() {
+  printf '%s/%s/auth.json' "$IDENT_DIR" "$1"
+}
+
+parked_ids() {
+  local id
+  while IFS='|' read -r id _rest; do
+    [[ "$id" == \#* || -z "$id" ]] && continue
+    if [[ -f "$(slot_file "$id")" ]]; then
+      printf '%s\n' "$id"
+    fi
+  done <"$SLOTS_FILE"
+}
+
+ensure_slot_line() {
+  local id="$1" title="$2"
+  if slot_meta "$id" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf '%s||%s|\n' "$id" "$title" >>"$SLOTS_FILE"
+}
+
+atomic_copy() {
+  local src="$1" dest="$2"
+  local tmp dest_dir
+  dest_dir="$(dirname "$dest")"
+  mkdir -p "$dest_dir"
+  chmod 700 "$dest_dir" 2>/dev/null || true
+  tmp="$(mktemp "$dest_dir/.auth.XXXXXX")"
+  cp -a "$src" "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$dest"
+  chmod 600 "$dest"
+}
+
+harvest_live() {
+  local cur dest
+  cur="$(active_id)"
+  [[ -z "$cur" ]] && return 0
+  [[ -f "$LIVE" ]] || return 0
+  dest="$(slot_file "$cur")"
+  atomic_copy "$LIVE" "$dest"
+}
+
+print_status() {
+  local cur id title ident f mark
+  ensure_slots
+  cur="$(active_id)"
+  printf 'active slot: %s\n' "${cur:-none}"
+  printf 'live file:   %s (%s)\n' "$LIVE" "$( [[ -f "$LIVE" ]] && printf present || printf missing )"
+  if [[ -f "$CONF/last-swap" ]]; then
+    printf 'last swap:   %s\n' "$(tr -d '[:space:]' <"$CONF/last-swap")"
+  fi
+  while IFS='|' read -r id _ref title ident; do
+    [[ "$id" == \#* || -z "$id" ]] && continue
+    mark=' '
+    [[ "$id" == "$cur" ]] && mark='*'
+    f="$(slot_file "$id")"
+    if [[ -f "$f" ]]; then
+      printf ' %s %-12s  %s  local=yes\n' "$mark" "$id" "${title:-$id}"
+    else
+      printf ' %s %-12s  %s  local=MISSING\n' "$mark" "$id" "${title:-$id}"
+    fi
+  done <"$SLOTS_FILE"
+}
+
+capture_slot() {
+  local id dest
+  ensure_slots
+  id="$(normalize_id "$1")"
+  if [[ ! -f "$LIVE" ]]; then
+    printf 'cursor-oauth-swap: live auth missing (%s). run: cursor-agent login\n' "$LIVE" >&2
+    exit 1
+  fi
+  dest="$(slot_file "$id")"
+  atomic_copy "$LIVE" "$dest"
+  ensure_slot_line "$id" "Cursor OAuth $id"
+  if [[ ! -f "$ACTIVE_FILE" || -z "$(active_id)" ]]; then
+    printf '%s\n' "$id" >"$ACTIVE_FILE"
+    chmod 600 "$ACTIVE_FILE"
+  fi
+  printf 'captured live Cursor OAuth -> %s\n' "$id"
+}
+
+apply_slot() {
+  local id dest
+  ensure_slots
+  id="$(normalize_id "$1")"
+  dest="$(slot_file "$id")"
+  if [[ ! -f "$dest" ]]; then
+    printf 'cursor-oauth-swap: no parked auth for %s. run: cursor-oauth-swap capture %s\n' "$id" "$id" >&2
+    exit 2
+  fi
+  harvest_live
+  mkdir -p "$(dirname "$LIVE")"
+  atomic_copy "$dest" "$LIVE"
+  printf '%s\n' "$id" >"$ACTIVE_FILE"
+  chmod 600 "$ACTIVE_FILE"
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$CONF/last-swap"
+  chmod 600 "$CONF/last-swap"
+  printf 'switched Cursor OAuth -> %s\n' "$id"
+}
+
+toggle_slot() {
+  local cur next found=0 id
+  ensure_slots
+  harvest_live
+  cur="$(active_id)"
+  mapfile -t ids < <(parked_ids)
+  if (( ${#ids[@]} < 2 )); then
+    printf 'cursor-oauth-swap: need two parked sessions. capture the live one, login the other, capture again.\n' >&2
+    printf '  cursor-oauth-swap capture primary\n' >&2
+    printf '  cursor-agent logout && cursor-agent login\n' >&2
+    printf '  cursor-oauth-swap capture second\n' >&2
+    exit 2
+  fi
+  if [[ -z "$cur" ]]; then
+    apply_slot "${ids[0]}"
+    return
+  fi
+  next=""
+  for id in "${ids[@]}"; do
+    if (( found )); then
+      next="$id"
+      break
+    fi
+    [[ "$id" == "$cur" ]] && found=1
+  done
+  if [[ -z "$next" ]]; then
+    next="${ids[0]}"
+  fi
+  apply_slot "$next"
+}
+
+ensure_slots
+cmd="${1:-status}"
+case "$cmd" in
+  status | show | '') print_status ;;
+  capture | park)
+    if [[ -z "${2:-}" ]]; then
+      printf 'Usage: %s capture <id>\n' "${0##*/}" >&2
+      exit 2
+    fi
+    capture_slot "$2"
+    ;;
+  toggle | swap | next) toggle_slot ;;
+  primary | second | a | b | one | two | gravy | mint) apply_slot "$cmd" ;;
+  *)
+    if slot_meta "$(normalize_id "$cmd")" >/dev/null 2>&1 || [[ -f "$(slot_file "$(normalize_id "$cmd")")" ]]; then
+      apply_slot "$cmd"
+    else
+      printf 'Usage: %s [status|capture <id>|toggle|<id>]\n' "${0##*/}" >&2
+      exit 2
+    fi
+    ;;
+esac

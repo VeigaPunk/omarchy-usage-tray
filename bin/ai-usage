@@ -587,6 +587,73 @@ def token_plan_active_id() -> str | None:
     return value or None
 
 
+def cursor_oauth_conf() -> Path:
+    return Path(
+        os.environ.get(
+            "AI_USAGE_CURSOR_OAUTH_CONF",
+            Path.home() / ".config" / "cursor-oauth",
+        )
+    )
+
+
+def cursor_oauth_identities() -> list[dict]:
+    path = cursor_oauth_conf() / "slots"
+    out: list[dict] = []
+    if not path.is_file():
+        return out
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        sid = parts[0].strip()
+        if not sid:
+            continue
+        title = parts[2].strip() if len(parts) > 2 else sid
+        ident = parts[3].strip() if len(parts) > 3 else ""
+        out.append({"id": sid, "label": sid, "title": title or sid, "ident": ident})
+    return out
+
+
+def cursor_oauth_active_id() -> str | None:
+    path = cursor_oauth_conf() / "active"
+    if not path.is_file():
+        return None
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def cursor_oauth_slot_file(sid: str) -> Path:
+    return cursor_oauth_conf() / "identities" / sid / "auth.json"
+
+
+def cursor_parked_identities() -> list[dict]:
+    return [s for s in cursor_oauth_identities() if cursor_oauth_slot_file(s["id"]).is_file()]
+
+
+def attach_cursor_identity(rec: dict) -> dict:
+    parked = cursor_parked_identities()
+    if not parked:
+        return rec
+    rec = dict(rec)
+    active = cursor_oauth_active_id() or parked[0]["id"]
+    match = next((s for s in parked if s["id"] == active), parked[0])
+    rec["identity"] = {
+        "id": match["id"],
+        "label": match["id"],
+        "title": match.get("title") or match["id"],
+    }
+    rec["identities"] = [{"id": s["id"], "label": s["id"]} for s in parked]
+    return rec
+
+
 def attach_token_plan_identity(rec: dict) -> dict:
     slots = token_plan_identities()
     if not slots:
@@ -1588,7 +1655,7 @@ def normalize_cursor(raw: dict) -> dict:
         rec["status"] = "ok"
     else:
         rec["reason"] = "no_used_pct"
-    return rec
+    return attach_cursor_identity(rec)
 
 
 def probe_cursor(fixture: str | None = None) -> dict:
@@ -1598,29 +1665,29 @@ def probe_cursor(fixture: str | None = None) -> dict:
             if "providers" in raw and "cursor" in (raw.get("providers") or {}):
                 rec = raw["providers"]["cursor"]
                 rec.setdefault("id", "cursor")
-                return rec
+                return attach_cursor_identity(rec)
             if isinstance(raw, dict):
                 return normalize_cursor(raw)
         except (OSError, json.JSONDecodeError):
             pass
-        return empty_provider("cursor", "unknown", "bad_payload")
+        return attach_cursor_identity(empty_provider("cursor", "unknown", "bad_payload"))
     try:
         raw = _cursor_usages()
         if raw is None:
-            return empty_provider("cursor", "unauth", "need_cursor_login")
+            return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
         if not isinstance(raw, dict):
-            return empty_provider("cursor", "unknown", "bad_payload")
+            return attach_cursor_identity(empty_provider("cursor", "unknown", "bad_payload"))
         return normalize_cursor(raw)
     except _KimiUnauth:
-        return empty_provider("cursor", "unauth", "need_cursor_login")
+        return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
     except FileNotFoundError:
-        return empty_provider("cursor", "unauth", "need_cursor_login")
+        return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
     except Exception as exc:
         msg = redact(str(exc))[:200]
         low = msg.lower()
         if "auth" in low or "login" in low or "401" in msg:
-            return empty_provider("cursor", "unauth", "need_cursor_login")
-        return empty_provider("cursor", "unknown", msg or "probe_failed")
+            return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
+        return attach_cursor_identity(empty_provider("cursor", "unknown", msg or "probe_failed"))
 
 
 # --- Local Codex tokens (Quattro scan_native_codex_sessions) -----------------
@@ -2383,6 +2450,8 @@ def cmd_waybar() -> int:
         rec["logo"] = PROVIDER_INDEX.get(pid, ("?", "?"))[1] if pid in PROVIDER_INDEX else "?"
     if pid == "token-plan":
         rec = attach_token_plan_identity(dict(rec))
+    elif pid == "cursor":
+        rec = attach_cursor_identity(dict(rec))
     logo = str(rec.get("logo") or PROVIDER_INDEX.get(pid, ("?", "?"))[1])
     ident = rec.get("identity") if isinstance(rec.get("identity"), dict) else {}
     ident_id = str(ident.get("id") or ident.get("label") or "").strip()
@@ -2489,50 +2558,88 @@ def blank_usage_windows(rec: dict) -> dict:
     return rec
 
 
+def _identity_helper_failed(pid: str, proc: subprocess.CompletedProcess[str] | None, unavailable: bool) -> int:
+    if unavailable:
+        print(f"{pid} swap-failed: helper unavailable", file=sys.stderr)
+        return 1
+    assert proc is not None
+    print(f"{pid} swap-failed: exit {proc.returncode}", file=sys.stderr)
+    return proc.returncode
+
+
 def cmd_identity(direction: str) -> int:
-    """Cycle identities for the selected provider. Token Plan swaps keys via token-plan-swap."""
+    """Cycle identities for the selected provider via its local swap helper."""
     cache = load_cache()
     selected = pick_selected(cache)
-    if selected != "token-plan":
-        print(f"{selected}: no identity cycle configured")
-        return 0
-    swap = os.environ.get("AI_USAGE_TOKEN_PLAN_SWAP") or which("token-plan-swap")
-    if swap is None:
-        print("token-plan: token-plan-swap not found", file=sys.stderr)
-        return 1
     action = "toggle" if direction in ("next", "prev") else direction
-    swap_env = child_env()
-    conf = token_plan_conf()
-    if conf.name == "alibaba-token-plan":
-        swap_env["XDG_CONFIG_HOME"] = str(conf.parent)
-    try:
-        proc = subprocess.run(
-            [swap, action],
-            env=swap_env,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        print("token-plan swap-failed: helper unavailable", file=sys.stderr)
-        return 1
-    if proc.returncode != 0:
-        print(f"token-plan swap-failed: exit {proc.returncode}", file=sys.stderr)
-        return proc.returncode
-    rec = cache.get("providers", {}).get("token-plan")
-    if not isinstance(rec, dict):
-        rec = empty_provider("token-plan", "unknown", "no_cache")
-    rec = dict(rec)
-    rec["id"] = "token-plan"
-    rec = blank_usage_windows(rec)
-    rec = attach_token_plan_identity(rec)
-    cache.setdefault("providers", {})["token-plan"] = rec
-    path = cache_path()
-    if path.exists():
-        atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
-    ident = (rec.get("identity") or {}).get("id") or "?"
-    print(ident)
+    if selected == "token-plan":
+        swap = os.environ.get("AI_USAGE_TOKEN_PLAN_SWAP") or which("token-plan-swap")
+        if swap is None:
+            print("token-plan: token-plan-swap not found", file=sys.stderr)
+            return 1
+        swap_env = child_env()
+        conf = token_plan_conf()
+        if conf.name == "alibaba-token-plan":
+            swap_env["XDG_CONFIG_HOME"] = str(conf.parent)
+        try:
+            proc = subprocess.run(
+                [swap, action],
+                env=swap_env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return _identity_helper_failed("token-plan", None, True)
+        if proc.returncode != 0:
+            return _identity_helper_failed("token-plan", proc, False)
+        rec = cache.get("providers", {}).get("token-plan")
+        if not isinstance(rec, dict):
+            rec = empty_provider("token-plan", "unknown", "no_cache")
+        rec = dict(rec)
+        rec["id"] = "token-plan"
+        rec = attach_token_plan_identity(blank_usage_windows(rec))
+        cache.setdefault("providers", {})["token-plan"] = rec
+        path = cache_path()
+        if path.exists():
+            atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+        print((rec.get("identity") or {}).get("id") or "?")
+        return 0
+    if selected == "cursor":
+        swap = os.environ.get("AI_USAGE_CURSOR_OAUTH_SWAP") or which("cursor-oauth-swap")
+        if swap is None:
+            print("cursor: cursor-oauth-swap not found", file=sys.stderr)
+            return 1
+        swap_env = child_env()
+        swap_env["CURSOR_OAUTH_HOME"] = str(cursor_oauth_conf())
+        swap_env["CURSOR_AUTH_FILE"] = str(_cursor_auth_path())
+        try:
+            proc = subprocess.run(
+                [swap, action],
+                env=swap_env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return _identity_helper_failed("cursor", None, True)
+        if proc.returncode != 0:
+            return _identity_helper_failed("cursor", proc, False)
+        rec = cache.get("providers", {}).get("cursor")
+        if not isinstance(rec, dict):
+            rec = empty_provider("cursor", "unknown", "no_cache")
+        rec = dict(rec)
+        rec["id"] = "cursor"
+        rec = attach_cursor_identity(blank_usage_windows(rec))
+        cache.setdefault("providers", {})["cursor"] = rec
+        path = cache_path()
+        if path.exists():
+            atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+        print((rec.get("identity") or {}).get("id") or "?")
+        return 0
+    print(f"{selected}: no identity cycle configured")
     return 0
 
 

@@ -11,7 +11,7 @@ CSS="$WAYBAR_DIR/style.css"
 HYPR="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
 STAMP="$(date +%s)"
 
-chmod +x "$BIN" "$ROOT/install.sh" "$ROOT/deploy/install.sh" || true
+chmod +x "$BIN" "$ROOT/bin/cursor-oauth-swap" "$ROOT/install.sh" "$ROOT/deploy/install.sh" || true
 
 if [[ ! -x "$BIN" ]]; then
   echo "install: missing $BIN" >&2
@@ -29,6 +29,7 @@ python3 "$ROOT/deploy/merge_waybar.py" "$CFG" "$CSS" "$ROOT/deploy/waybar-ai-usa
 
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$BIN" "$HOME/.local/bin/ai-usage"
+ln -sfn "$ROOT/bin/cursor-oauth-swap" "$HOME/.local/bin/cursor-oauth-swap"
 
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 mkdir -p "$UNIT_DIR"

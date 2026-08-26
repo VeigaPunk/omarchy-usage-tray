@@ -24,6 +24,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export AI_USAGE_CACHE="$TMP/status.json"
 export AI_USAGE_SELECTED="$TMP/selected"
+export AI_USAGE_CURSOR_OAUTH_CONF="$TMP/cursor-oauth"
 
 "$BIN" probe cursor --fixture "$FIXTURE"
 

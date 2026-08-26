@@ -5,8 +5,6 @@ provider**. Left-click / scroll still cycle **providers**.
 
 ## Token Plan (shipped)
 
-This is the only adapter with a live swap on this host.
-
 - Keys (mode 0600): `~/.config/alibaba-token-plan/keys/{team,gmail}`
 - Live slot: `~/.config/alibaba-token-plan/active`
 - Swap helper: `token-plan-swap` (`status|team|gmail|toggle|due|pull`)
@@ -20,31 +18,55 @@ This is the only adapter with a live swap on this host.
 (never the key files), blanks Token Plan meters until the next probe, and
 prints the slot id.
 
+## Cursor OAuth (shipped helper)
+
+Same shape as Token Plan. The live file `cursor-agent` already reads is
+`~/.config/cursor/auth.json` (override: `CURSOR_AUTH_FILE`).
+
+- Slots file (names only): `~/.config/cursor-oauth/slots`
+- Active pointer: `~/.config/cursor-oauth/active`
+- Parked sessions: `~/.config/cursor-oauth/identities/<id>/auth.json` (0600)
+- Helper: `cursor-oauth-swap` (`status|capture <id>|toggle|<id>`)
+
+`capture` copies the live file into a slot. `toggle` harvests the live
+file back into the current slot (so a refreshed JWT is not lost), then
+atomic-replaces `auth.json` with the other parked file.
+
+Park the second account yourself:
+
+```bash
+cursor-oauth-swap capture primary
+cursor-agent logout
+cursor-agent login
+cursor-oauth-swap capture second
+cursor-oauth-swap toggle
+```
+
+Right-click on the Cursor chip calls `ai-usage identity next` →
+`cursor-oauth-swap toggle`. Running `cursor-agent` processes keep the old
+JWT in memory until they restart.
+
+Never put tokens in this repo or in Waybar JSON. Never `op` on click.
+
 ## OAuth / extra API keys (outline only)
 
-This host runs **one** OAuth per provider (Codex ChatGPT, Grok OIDC, Kimi
-OAuth). There is nothing to cycle, so right-click is a no-op there. Do not
-build a swapper without a second store to overfit.
+Codex / Grok / Kimi still have one OAuth each on this host, so identity
+cycle stays a no-op there. Do not build a swapper without a second store.
 
 When someone else has two live identities for the **same** provider, copy
-the Token Plan shape. Do not invent a plugin framework.
+the Token Plan / Cursor shape. Do not invent a plugin framework.
 
 1. **Inventory, names only.** Count stores. If count &lt; 2, keep the no-op.
 2. **Slots file without secrets.** Same idea as `alibaba-token-plan/slots`:
    id, title, maybe an `op://` ref for *pull*. Never put tokens in the tray
    repo or in Waybar JSON.
 3. **`active` pointer.** One small file the chip can read on every render.
-4. **A helper that writes what the CLI actually reads.** Token Plan’s helper
-   rewrites `~/.bailian/config.json` from `keys/$id`. An OAuth helper must
-   atomic-replace the **live auth file** the CLI already uses (examples
-   below), then leave the previous file under `slots/$id/` or similar.
-   Right-click only calls that helper.
-5. **Display from `active`.** Suffix the logo (`C work`, `G home`). Blank
-   that provider’s `used_pct` on switch (`reason=switched` so
-   `keep_last_good` cannot resurrect the previous fill).
+4. **A helper that writes what the CLI actually reads.**
+5. **Display from `active`.** Suffix the logo. Blank that provider’s
+   `used_pct` on switch (`reason=switched` so `keep_last_good` cannot
+   resurrect the previous fill).
 6. **`pull` optional.** Vault restore of slot files. Not on the hot path.
 7. **Gate.** Isolated HOME + synthetic tokens; live test is opt-in + restore.
-   This repo will not empirically test a second OAuth on plazir.
 
 ### Where each CLI actually reads auth (this host, names only)
 
@@ -53,12 +75,8 @@ the Token Plan shape. Do not invent a plugin framework.
 | Codex | `~/.codex/auth.json` (`auth_mode=chatgpt`) | no (`OPENAI_API_KEY` unset) |
 | Grok | `~/.grok/auth.json` (OIDC) | no (`XAI_API_KEY` unset in the tray path; management prepaid is a *different* key, not a second OAuth) |
 | Kimi | `~/.kimi-code/credentials/*.json` (one file) | no (`moonshotai` in config.toml is API, not a second OAuth) |
+| Cursor | `~/.config/cursor/auth.json` | **yes** — `cursor-oauth-swap` parks copies under `~/.config/cursor-oauth/identities/` |
 | Token Plan | `keys/$active` + `~/.bailian/config.json` | **yes** — `team` / `gmail` |
-
-A future Codex dual-OAuth would likely be: keep `auth.json` as the live slot
-and `~/.codex/identities/{id}/auth.json` as the store; helper copies the
-chosen file into `auth.json` (mode 0600) and writes `active`. Same for Grok
-(`~/.grok/auth.json`) and Kimi (the credentials json the CLI lists).
 
 Never `op` on right-click. Never print tokens. Never rewrite
 `~/.local/share/omarchy/`.
