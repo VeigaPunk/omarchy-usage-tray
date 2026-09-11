@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Right-click skeleton: only Token Plan delegates to the existing local swapper.
+# Token Plan route swaps preserve OMP fleet usage; other providers remain no-ops.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin/ai-usage"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+export HOME="$TMP/home"
+export XDG_CACHE_HOME="$TMP/cache-home"
+export XDG_CONFIG_HOME="$TMP/config-home"
+export XDG_STATE_HOME="$TMP/state-home"
 export AI_USAGE_CACHE="$TMP/status.json"
 export AI_USAGE_SELECTED="$TMP/selected"
 export AI_USAGE_TOKEN_PLAN_CONF="$TMP/tp"
 export PATH="$TMP/bin:/usr/bin:/bin"
-mkdir -p "$TMP/bin" "$TMP/tp"
+mkdir -p "$TMP/bin" "$TMP/tp" "$HOME"
 printf 'team\n' >"$TMP/tp/active"
 cat >"$TMP/tp/slots" <<'EOF'
 team|local://team|Team|team
@@ -18,43 +22,96 @@ gmail|local://gmail|Gmail|gmail
 EOF
 
 cat >"$AI_USAGE_CACHE" <<'JSON'
-{"version":1,"selected":"token-plan","providers":{"codex":{"status":"ok"},"token-plan":{"status":"ok"}}}
+{
+  "version": 1,
+  "selected": "token-plan",
+  "providers": {
+    "codex": {"id": "codex", "status": "ok", "windows": []},
+    "token-plan": {
+      "id": "token-plan",
+      "name": "Token Plan",
+      "logo": "T",
+      "status": "ok",
+      "windows": [
+        {"kind": "weekly", "label": "3-account average", "used_pct": 1.209},
+        {"kind": "special", "label": "Hottest account", "used_pct": 3.627}
+      ],
+      "account_usage": [
+        {"used_pct": 0, "fetched_at": "2100-01-01T00:00:00Z"},
+        {"used_pct": 3.627, "fetched_at": "2100-01-01T00:01:00Z"},
+        {"used_pct": 0, "fetched_at": "2100-01-01T00:02:00Z"}
+      ],
+      "capacity": {
+        "accounts": 3,
+        "used_accounts": 0.036270291301975,
+        "remaining_accounts": 2.963729708698025
+      },
+      "snapshot": {
+        "reports": 3,
+        "accounts_without_usage": 0,
+        "disabled_credentials": 0
+      },
+      "measured_at": "2100-01-01T00:00:00Z",
+      "identity": {"id": "team", "label": "team", "title": "Team"}
+    }
+  }
+}
 JSON
 printf 'token-plan\n' >"$AI_USAGE_SELECTED"
 
 cat >"$TMP/bin/token-plan-swap" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$AI_USAGE_SWAP_LOG"
+printf 'gmail\n' >"$AI_USAGE_TOKEN_PLAN_CONF/active"
 SH
 chmod +x "$TMP/bin/token-plan-swap"
 export AI_USAGE_SWAP_LOG="$TMP/swap.log"
 export AI_USAGE_TOKEN_PLAN_SWAP="$TMP/bin/token-plan-swap"
+python3 - "$AI_USAGE_CACHE" "$TMP/fleet-before.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    rec = json.load(fh)["providers"]["token-plan"]
+fleet = {
+    key: rec[key]
+    for key in ("windows", "account_usage", "capacity", "snapshot", "measured_at")
+}
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    json.dump(fleet, fh, sort_keys=True)
+PY
 
 out="$("$BIN" identity next 2>&1)"
-[[ "$out" == team ]]
+[[ "$out" == gmail ]]
 [[ "$out" != *synth-* ]]
 [[ "$(cat "$AI_USAGE_SWAP_LOG")" == toggle ]]
 
-python3 - "$BIN" <<'PY'
-import importlib.machinery, importlib.util, sys
-loader = importlib.machinery.SourceFileLoader("ai_usage", sys.argv[1])
-spec = importlib.util.spec_from_loader("ai_usage", loader)
-mod = importlib.util.module_from_spec(spec)
-loader.exec_module(mod)
-old = {"id": "token-plan", "status": "ok", "windows": [{"used_pct": 71}]}
-switched = mod.blank_usage_windows(old)
-if any("used_pct" in w for w in switched["windows"]):
-    raise SystemExit("FAIL: pre-switch usage survived")
-kept = mod.keep_last_good(old, switched)
-if any("used_pct" in w for w in kept.get("windows") or []):
-    raise SystemExit("FAIL: keep_last_good resurrected pre-switch usage")
-if kept.get("reason") != "switched":
-    raise SystemExit("FAIL: switched reason lost")
+python3 - "$AI_USAGE_CACHE" "$TMP/fleet-before.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    rec = json.load(fh)["providers"]["token-plan"]
+with open(sys.argv[2], encoding="utf-8") as fh:
+    before = json.load(fh)
+after = {
+    key: rec[key]
+    for key in ("windows", "account_usage", "capacity", "snapshot", "measured_at")
+}
+if after != before:
+    raise SystemExit("FAIL: successful route swap changed OMP fleet usage")
+if rec.get("status") != "ok":
+    raise SystemExit("FAIL: successful route swap changed fleet status")
+identity = rec.get("identity") or {}
+if identity.get("id") != "gmail":
+    raise SystemExit("FAIL: active route metadata did not change to gmail")
 PY
 
 printf 'codex\n' >"$AI_USAGE_SELECTED"
+cp "$AI_USAGE_CACHE" "$TMP/cache-before-non-token.json"
 "$BIN" identity next >/dev/null
 [[ "$(wc -l <"$AI_USAGE_SWAP_LOG")" == 1 ]]
+cmp -s "$AI_USAGE_CACHE" "$TMP/cache-before-non-token.json"
 
 # A failing helper may emit key material on both streams. identity-next must
 # report only its exit status, never relay helper output.

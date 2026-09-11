@@ -30,7 +30,8 @@ METER_TRACK = "#3a3a3a"
 NBSP = "\u00a0"
 TUI_METER_WIDTH = 20
 STALE_AFTER_SEC = 20 * 60
-CODEX_CMD = ["codex", "-s", "read-only", "-a", "never", "app-server"]
+CODEX_CANDIDATES = ("codex-titanium", "codex")
+CODEX_ARGS = ["-s", "read-only", "-a", "never", "app-server"]
 RPC_TIMEOUT_SEC = 20.0
 SCAN_REUSE_SECONDS = 20
 SCAN_LIMITS_REUSE_SECONDS = 900
@@ -123,21 +124,6 @@ def as_pct(value) -> float | None:
     return max(0.0, min(100.0, pct))
 
 
-def fraction_to_pct(value) -> float | None:
-    """Token-plan fractions in [0, 1]; already-percent values stay as-is."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, str) and not value.strip():
-        return None
-    try:
-        n = float(value)
-    except (TypeError, ValueError):
-        return None
-    if n != n or n in (float("inf"), float("-inf")):
-        return None
-    if n <= 1.5:
-        n = n * 100.0
-    return as_pct(n)
 
 
 def ratio(used, limit) -> float | None:
@@ -281,6 +267,31 @@ def child_env() -> dict:
     return env
 
 
+def codex_cmd() -> list[str]:
+    """First codex binary that actually answers --version on this PATH.
+
+    The legacy `codex` wrapper needs mise+node on PATH (dies in the systemd
+    service's minimal env); codex-titanium is a self-contained rust binary.
+    """
+    for cand in CODEX_CANDIDATES:
+        if not which(cand):
+            continue
+        try:
+            probe = subprocess.run(
+                [cand, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                env=child_env(),
+                check=False,
+            )
+            if probe.returncode == 0 and (probe.stdout or "").strip():
+                return [cand, *CODEX_ARGS]
+        except Exception:
+            continue
+    return ["codex", *CODEX_ARGS]
+
+
 def grok_bin() -> str | None:
     explicit = os.environ.get("GROK_BIN")
     if explicit:
@@ -375,10 +386,11 @@ def _id_match(msg: dict, rid) -> bool:
 
 def codex_rate_limits() -> dict:
     """JSON-RPC: initialize → initialized → account/read → account/rateLimits/read."""
-    if not which("codex"):
-        raise FileNotFoundError("codex")
+    cmd = codex_cmd()
+    if not which(cmd[0]):
+        raise FileNotFoundError(cmd[0])
     proc = subprocess.Popen(
-        CODEX_CMD,
+        cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -669,72 +681,226 @@ def attach_token_plan_identity(rec: dict) -> dict:
     return rec
 
 
+def _token_plan_number(value) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")) or number < 0:
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _token_plan_count(value) -> int | None:
+    number = _token_plan_number(value)
+    if number is None or float(number) != int(number):
+        return None
+    return int(number)
+
+
+def _token_plan_timestamp(value) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or "T" not in value:
+            return None
+    elif not isinstance(value, (int, float)):
+        return None
+    stamp = parse_reset(value)
+    if stamp is None:
+        return None
+    return stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _empty_token_plan(reason: str) -> dict:
+    return attach_token_plan_identity(
+        {
+            "id": "token-plan",
+            "name": "Token Plan",
+            "logo": "T",
+            "status": "unknown",
+            "reason": reason,
+            "windows": [
+                window("weekly", "Account average", None),
+                window("special", "Hottest account", None),
+            ],
+            "account_usage": [],
+            "capacity": {},
+            "snapshot": {
+                "reports": 0,
+                "accounts_without_usage": 0,
+                "disabled_credentials": 0,
+            },
+        }
+    )
+
+
+def _token_plan_report_usage(report: dict) -> dict:
+    usage: dict = {}
+    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
+    if fetched_at:
+        usage["fetched_at"] = fetched_at
+    limits = report.get("limits")
+    if not isinstance(limits, list):
+        return usage
+    for limit in limits:
+        if not isinstance(limit, dict):
+            continue
+        win = limit.get("window")
+        window_id = win.get("id") if isinstance(win, dict) else None
+        if limit.get("id") != "credits:7d" or window_id != "7d":
+            continue
+        if limit.get("status") not in (None, "ok"):
+            return usage
+        amount = limit.get("amount")
+        fraction = _token_plan_number(amount.get("usedFraction")) if isinstance(amount, dict) else None
+        used_pct = as_pct(float(fraction) * 100.0) if fraction is not None and fraction <= 1 else None
+        if used_pct is not None:
+            usage["used_pct"] = used_pct
+        resets_at = _token_plan_timestamp(
+            limit.get("resetsAt") or (win.get("resetsAt") if isinstance(win, dict) else None)
+        )
+        if resets_at:
+            usage["resets_at"] = resets_at
+        return usage
+    return usage
+
+
+def _token_plan_capacity(payload: dict) -> dict:
+    capacity_root = payload.get("capacity")
+    if not isinstance(capacity_root, dict):
+        return {}
+    rows = capacity_root.get("alibaba-token-plan")
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("window") != "7d":
+            continue
+        capacity: dict = {}
+        accounts = _token_plan_count(row.get("accounts"))
+        used_accounts = _token_plan_number(row.get("usedAccounts"))
+        remaining_accounts = _token_plan_number(row.get("remainingAccounts"))
+        if accounts is not None:
+            capacity["accounts"] = accounts
+        if used_accounts is not None:
+            capacity["used_accounts"] = used_accounts
+        if remaining_accounts is not None:
+            capacity["remaining_accounts"] = remaining_accounts
+        return capacity
+    return {}
+
+
 def probe_token_plan() -> dict:
-    if not which("bl"):
-        return attach_token_plan_identity(empty_provider("token-plan", "unknown", "no_cli"))
+    omp = os.environ.get("AI_USAGE_OMP_BIN") or which("omp")
+    if not omp:
+        return _empty_token_plan("no_cli")
     try:
         proc = subprocess.run(
-            ["bl", "usage", "token-plan", "--output", "json"],
+            [omp, "usage", "--provider", "alibaba-token-plan", "--json"],
             capture_output=True,
             text=True,
             timeout=20,
             check=False,
             env=child_env(),
         )
-    except Exception as exc:
-        return attach_token_plan_identity(
-            empty_provider("token-plan", "unknown", redact(str(exc))[:200])
-        )
-    stdout = proc.stdout or ""
-    payload = None
+    except subprocess.TimeoutExpired:
+        return _empty_token_plan("timeout")
+    except OSError:
+        return _empty_token_plan("no_cli")
+    if proc.returncode:
+        return _empty_token_plan(f"exit_{proc.returncode}")
     try:
-        payload = json.loads(stdout) if stdout.strip() else None
+        payload = json.loads(proc.stdout) if proc.stdout and proc.stdout.strip() else None
     except json.JSONDecodeError:
-        payload = None
-    blob = stdout + "\n" + (proc.stderr or "")
-    if payload and isinstance(payload, dict) and payload.get("error"):
-        err = payload["error"]
-        msg = ""
-        if isinstance(err, dict):
-            msg = str(err.get("message") or err.get("hint") or err)
-        else:
-            msg = str(err)
-        low = msg.lower()
-        if "console" in low or "access token" in low:
-            return attach_token_plan_identity(
-                empty_provider("token-plan", "unauth", "need_console_login")
-            )
-        return attach_token_plan_identity(
-            empty_provider("token-plan", "unauth", redact(msg)[:200] or "unauth")
-        )
-    combined = blob.lower()
-    if "no console access token" in combined or "bl auth login --console" in combined:
-        return attach_token_plan_identity(
-            empty_provider("token-plan", "unauth", "need_console_login")
-        )
-    if not isinstance(payload, dict):
-        reason = "no_json"
-        if proc.returncode:
-            reason = f"exit_{proc.returncode}"
-        return attach_token_plan_identity(empty_provider("token-plan", "unknown", reason))
-    weekly = fraction_to_pct(payload.get("per1WeekPercentage"))
-    session = fraction_to_pct(payload.get("per5HourPercentage"))
-    windows = [
-        window("weekly", "Weekly", weekly, iso_from_unix(payload.get("per1WeekResetTime"))),
+        return _empty_token_plan("no_json")
+    if not isinstance(payload, dict) or not isinstance(payload.get("reports"), list):
+        return _empty_token_plan("bad_payload")
+    if "capacity" in payload and not isinstance(payload.get("capacity"), dict):
+        return _empty_token_plan("bad_payload")
+
+    raw_reports = payload["reports"]
+    account_usage = [
+        _token_plan_report_usage(report)
+        for report in raw_reports
+        if isinstance(report, dict) and report.get("provider") == "alibaba-token-plan"
     ]
-    if "per5HourPercentage" in payload:
-        windows.append(
-            window("session", "5h", session, iso_from_unix(payload.get("per5HourResetTime")))
-        )
+    capacity = _token_plan_capacity(payload)
+    capacity_declared = bool(payload.get("capacity"))
+    accounts_without_usage = payload.get("accountsWithoutUsage")
+    disabled_credentials = payload.get("disabledCredentials")
+    usage_lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
+    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
+    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
+    snapshot = {
+        "reports": len(account_usage),
+        "accounts_without_usage": missing_count,
+        "disabled_credentials": disabled_count,
+    }
+
+    accounts = capacity.get("accounts")
+    used_accounts = capacity.get("used_accounts")
+    remaining_accounts = capacity.get("remaining_accounts")
+    consistent_capacity = (
+        isinstance(accounts, int)
+        and accounts > 0
+        and used_accounts is not None
+        and remaining_accounts is not None
+        and abs(float(used_accounts) + float(remaining_accounts) - accounts)
+        <= max(1e-6, accounts * 1e-6)
+    )
+    report_pcts = [as_pct(item.get("used_pct")) for item in account_usage]
+    complete_reports = (
+        bool(account_usage)
+        and len(raw_reports) == len(account_usage)
+        and isinstance(accounts_without_usage, list)
+        and missing_count == 0
+        and all(pct is not None for pct in report_pcts)
+    )
+    if consistent_capacity:
+        average = ratio(used_accounts, accounts)
+        complete_coverage = complete_reports and len(account_usage) == accounts
+        average_accounts = accounts
+    else:
+        average = as_pct(sum(report_pcts) / len(report_pcts)) if complete_reports else None
+        complete_coverage = complete_reports
+        average_accounts = len(account_usage) if complete_reports else None
+    hottest = max(report_pcts) if complete_coverage else None
+    average_label = f"{average_accounts}-account average" if average_accounts else "Account average"
+    windows = [
+        window("weekly", average_label, average),
+        window("special", "Hottest account", hottest),
+    ]
+    status = "ok" if average is not None else "unknown"
     rec = {
         "id": "token-plan",
         "name": "Token Plan",
         "logo": "T",
-        "status": "ok" if weekly is not None or session is not None else "unknown",
+        "status": status,
         "windows": windows,
+        "account_usage": account_usage,
+        "capacity": capacity,
+        "snapshot": snapshot,
     }
-    if rec["status"] != "ok":
+    timestamps = [item.get("fetched_at") for item in account_usage]
+    timestamps_complete = (
+        bool(timestamps)
+        and len(raw_reports) == len(account_usage)
+        and (not consistent_capacity or len(account_usage) == accounts)
+        and all(isinstance(stamp, str) for stamp in timestamps)
+    )
+    if timestamps_complete:
+        rec["measured_at"] = min(timestamps)
+    partial = (
+        not complete_coverage
+        or disabled_count > 0
+        or not usage_lists_valid
+        or not timestamps_complete
+        or (capacity_declared and not consistent_capacity)
+    )
+    if status != "ok":
         rec["reason"] = "no_used_pct"
+    elif partial:
+        rec["reason"] = "partial_usage"
     return attach_token_plan_identity(rec)
 
 
@@ -2033,15 +2199,30 @@ def export_quattro(pid: str, rec: dict) -> None:
                     "resetsAt": w.get("resets_at") or "",
                 }
             )
+        is_token_plan = pid == "token-plan"
+        measured_at = rec.get("measured_at")
+        has_measurement = isinstance(measured_at, str) and bool(measured_at)
+        ready = (
+            rec.get("status") == "ok"
+            and not rec.get("last_error")
+            and (not is_token_plan or (not rec.get("reason") and has_measurement))
+        )
+        error_text = str(
+            rec.get("last_error")
+            or rec.get("reason")
+            or ("measurement_time_unknown" if is_token_plan and not has_measurement else "")
+            or (rec.get("status") if rec.get("status") != "ok" else "")
+        )
+        updated_at = measured_at if is_token_plan and has_measurement else ("" if is_token_plan else iso_now())
         record = {
             "schemaVersion": 1,
             "id": pid,
             "name": rec.get("name") or pid,
-            "updatedAt": iso_now(),
-            "ready": rec.get("status") == "ok",
+            "updatedAt": updated_at,
+            "ready": ready,
             "hasLocalStats": bool(rec.get("hasLocalStats")),
             "tierLabel": rec.get("plan") or "",
-            "usageStatusText": "" if rec.get("status") == "ok" else str(rec.get("reason") or rec.get("status") or ""),
+            "usageStatusText": "" if ready else error_text,
             "authHelpText": str(rec.get("reason") or ""),
             "limits": limits,
         }
@@ -2164,11 +2345,12 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None, pri
     plan = rec.get("plan")
     header = f"{name}  ({plan})" if plan else str(name)
     lines = [header]
-    if rec.get("status") and rec.get("status") != "ok":
-        bit = rec.get("status")
+    status = rec.get("status")
+    if (status and status != "ok") or rec.get("reason"):
+        bit = str(status or "unknown")
         if rec.get("reason"):
             bit += f"  {rec['reason']}"
-        lines.append(str(bit))
+        lines.append(bit)
     lines.append("")
 
     chips = []
@@ -2441,6 +2623,91 @@ def cache_age_sec(cache: dict) -> float | None:
     return max(0.0, time.time() - dt.timestamp())
 
 
+def _timestamp_age_sec(stamp) -> float | None:
+    parsed = parse_reset(stamp)
+    if parsed is None:
+        return None
+    return max(0.0, time.time() - parsed.timestamp())
+
+
+def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
+    weekly = window_by_kind(rec, "weekly") or {}
+    hottest = window_by_kind(rec, "special") or {}
+    mark = f"{logo} @{ident_id}" if ident_id else logo
+    text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {meter(hottest.get('used_pct'))}"
+    classes = [str(rec.get("status") or "unknown")]
+    account_usage = rec.get("account_usage")
+    account_usage = account_usage if isinstance(account_usage, list) else []
+    ages = [
+        _timestamp_age_sec(item.get("fetched_at"))
+        for item in account_usage
+        if isinstance(item, dict)
+    ]
+    if any(age is not None and age > STALE_AFTER_SEC for age in ages):
+        classes.append("stale")
+    hottest_pct = as_pct(hottest.get("used_pct"))
+    if hottest_pct is not None and hottest_pct >= 95:
+        classes.append("critical")
+    elif hottest_pct is not None and hottest_pct >= 80:
+        classes.append("warn")
+
+    lines = [str(rec.get("name") or "Token Plan")]
+    if ident_id:
+        lines.append(f"active route: {ident_id} · routing only; not mapped to a snapshot")
+    if rec.get("reason"):
+        lines.append(str(rec["reason"]))
+    if rec.get("last_error"):
+        lines.append("last error: " + str(rec["last_error"]))
+    lines.append(f"{weekly.get('label') or 'Account average'}: {_pct_label(weekly.get('used_pct'))}")
+
+    hottest_index = None
+    if hottest_pct is not None:
+        for index, item in enumerate(account_usage, 1):
+            if isinstance(item, dict) and as_pct(item.get("used_pct")) == hottest_pct:
+                hottest_index = index
+                break
+    hottest_line = f"{hottest.get('label') or 'Hottest account'}: {_pct_label(hottest.get('used_pct'))}"
+    if hottest_index is not None:
+        hottest_line += f" · snapshot {hottest_index}"
+    lines.append(hottest_line)
+
+    for index, item in enumerate(account_usage, 1):
+        if not isinstance(item, dict):
+            continue
+        fetched_at = item.get("fetched_at")
+        fetched_age = _timestamp_age_sec(fetched_at)
+        fetched_text = str(fetched_at) if fetched_age is not None else "unknown"
+        if fetched_age is not None:
+            fetched_text += f" ({int(fetched_age)}s ago)"
+        bit = f"snapshot {index}: {_pct_label(item.get('used_pct'))} · fetched: {fetched_text}"
+        if item.get("resets_at"):
+            bit += f" · reset {item['resets_at']}"
+        lines.append(bit)
+
+    snapshot = rec.get("snapshot")
+    if isinstance(snapshot, dict):
+        lines.append(
+            "snapshot coverage: "
+            f"{snapshot.get('reports', 0)} reports · "
+            f"{snapshot.get('accounts_without_usage', 0)} without usage · "
+            f"{snapshot.get('disabled_credentials', 0)} disabled"
+        )
+    capacity = rec.get("capacity")
+    if isinstance(capacity, dict) and capacity:
+        lines.append(
+            "capacity: "
+            f"{capacity.get('used_accounts', '—')} / {capacity.get('accounts', '—')} "
+            "account-equivalents used · "
+            f"{capacity.get('remaining_accounts', '—')} remaining"
+        )
+    return {
+        "text": text,
+        "tooltip": pango_escape("\n".join(lines)),
+        "class": " ".join(classes),
+        "alt": "token-plan",
+    }
+
+
 def cmd_waybar() -> int:
     cache = load_cache()
     pid = pick_selected(cache)
@@ -2455,6 +2722,10 @@ def cmd_waybar() -> int:
     logo = str(rec.get("logo") or PROVIDER_INDEX.get(pid, ("?", "?"))[1])
     ident = rec.get("identity") if isinstance(rec.get("identity"), dict) else {}
     ident_id = str(ident.get("id") or ident.get("label") or "").strip()
+    if pid == "token-plan":
+        payload = _token_plan_waybar_payload(rec, logo, ident_id)
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        return 0
     mark = f"{logo} {ident_id}" if ident_id else logo
     weekly = window_by_kind(rec, "weekly") or {}
     extra = extra_window(rec)
@@ -2596,10 +2867,10 @@ def cmd_identity(direction: str) -> int:
             return _identity_helper_failed("token-plan", proc, False)
         rec = cache.get("providers", {}).get("token-plan")
         if not isinstance(rec, dict):
-            rec = empty_provider("token-plan", "unknown", "no_cache")
+            rec = _empty_token_plan("no_cache")
         rec = dict(rec)
         rec["id"] = "token-plan"
-        rec = attach_token_plan_identity(blank_usage_windows(rec))
+        rec = attach_token_plan_identity(rec)
         cache.setdefault("providers", {})["token-plan"] = rec
         path = cache_path()
         if path.exists():

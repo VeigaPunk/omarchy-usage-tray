@@ -47,10 +47,10 @@ payload = json.loads(out)
 blob = json.dumps(payload)
 if "op://" in blob or "credential" in blob:
     raise SystemExit(f"FAIL: leaked slot secret into waybar JSON: {blob}")
-if "gmail" not in payload["text"]:
-    raise SystemExit(f"FAIL: expected gmail on chip, got {payload['text']!r}")
-if "identity: gmail" not in payload.get("tooltip", ""):
-    raise SystemExit(f"FAIL: expected identity in tooltip, got {payload.get('tooltip')!r}")
+if "T @gmail" not in payload["text"]:
+    raise SystemExit(f"FAIL: expected active route on chip, got {payload['text']!r}")
+if "active route: gmail" not in payload.get("tooltip", ""):
+    raise SystemExit(f"FAIL: expected active route in tooltip, got {payload.get('tooltip')!r}")
 if "▓" in payload["text"] or "░" in payload["text"]:
     raise SystemExit("FAIL: grid glyphs in identity chip")
 print("IDENTITY_DISPLAY_OK")
