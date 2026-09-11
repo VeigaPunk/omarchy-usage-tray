@@ -1,6 +1,6 @@
 # omarchy-usage-tray
 
-Waybar chip for Omarchy: Codex, Grok, Kimi, Cursor, and Alibaba Token Plan usage.
+Waybar chip for Omarchy: Codex, Grok, Kimi, Cursor, Devin, and Alibaba Token Plan usage.
 Left-click or scroll to cycle providers; right-click cycles identities for the
 selected provider when supported.
 
@@ -18,6 +18,7 @@ Re-run the same line to update.
 - Symlinks `~/.local/bin/ai-usage`
 - Enables a user systemd timer (5 minutes)
 - Reads Alibaba Token Plan quota through `omp usage --provider alibaba-token-plan --json`
+- Reads Devin quota through the CLI's own `GetUserStatus` session (`~/.local/share/devin/credentials.toml`)
 - Floats the TUI on Hyprland like other Omarchy TUIs
 
 ## Clicks

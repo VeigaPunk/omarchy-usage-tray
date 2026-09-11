@@ -44,6 +44,7 @@ PROVIDERS = (
     ("grok", "Grok", "G"),
     ("kimi", "Kimi", "K"),
     ("cursor", "Cursor", "R"),
+    ("devin", "Devin", "D"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -172,6 +173,7 @@ def empty_provider(pid: str, status: str, reason: str | None = None, plan: str |
 def redact(text: str) -> str:
     text = re.sub(r"(?i)Bearer\s+\S+", "[redacted]", text)
     text = re.sub(r"eyJ[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-\.]+", "[redacted]", text)
+    text = re.sub(r"devin-[A-Za-z0-9_\-]{8,}", "[redacted]", text)
     text = re.sub(r"sk-[A-Za-z0-9]{8,}", "[redacted]", text)
     text = re.sub(r"(?i)Bearer\s*", "", text)
     return text
@@ -1639,7 +1641,12 @@ def probe_kimi() -> dict:
 
 CURSOR_USAGE_URL = "https://cursor.com/api/usage-summary"
 CURSOR_SESSION_COOKIE = "WorkosCursorSessionToken"
+
 CURSOR_DEFAULT_USER_AGENT = "cursor-agent/0.1.0"
+DEVIN_CREDENTIALS = Path.home() / ".local" / "share" / "devin" / "credentials.toml"
+DEVIN_USER_STATUS_RPC = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
+DEVIN_DEFAULT_API_SERVER = "https://server.codeium.com"
+DEVIN_DEFAULT_WEBAPP = "app.devin.ai"
 
 
 class _CursorRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -1854,6 +1861,158 @@ def probe_cursor(fixture: str | None = None) -> dict:
         if "auth" in low or "login" in low or "401" in msg:
             return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
         return attach_cursor_identity(empty_provider("cursor", "unknown", msg or "probe_failed"))
+
+# --- Devin -------------------------------------------------------------------
+
+
+def _devin_credentials_path() -> Path:
+    explicit = os.environ.get("DEVIN_CREDENTIALS_FILE")
+    return Path(explicit) if explicit else DEVIN_CREDENTIALS
+
+
+def _devin_credentials() -> dict | None:
+    try:
+        data = tomllib.loads(_devin_credentials_path().read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    key = os.environ.get("DEVIN_API_KEY")
+    if key:
+        data["windsurf_api_key"] = key
+    server = os.environ.get("DEVIN_API_SERVER")
+    if server:
+        data["api_server_url"] = server
+    return data if data.get("windsurf_api_key") else None
+
+
+def _devin_user_status() -> dict | None:
+    creds = _devin_credentials()
+    if not creds:
+        return None
+    key = creds.get("windsurf_api_key")
+    if not isinstance(key, str) or not key:
+        return None
+    server = creds.get("api_server_url")
+    if not isinstance(server, str) or not server.startswith("https://"):
+        server = DEVIN_DEFAULT_API_SERVER
+    metadata = {
+        "apiKey": key,
+        "ideName": "devin",
+        "ideVersion": "1.0.0",
+        "extensionVersion": "1.0.0",
+        "sessionId": f"{os.getpid()}-{int(time.time())}",
+        "requestId": str(int(time.time() * 1000) % (2**62)),
+        "locale": "en_US",
+        "os": "linux",
+        "appVersion": "1.0.0",
+    }
+    req = urllib.request.Request(
+        server.rstrip("/") + DEVIN_USER_STATUS_RPC,
+        data=json.dumps({"metadata": metadata}).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            "Authorization": f"Bearer {key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read()
+        code = getattr(resp, "status", 200)
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+        try:
+            body = exc.read()
+        except Exception:
+            body = b""
+    except Exception as exc:
+        raise RuntimeError(redact(str(exc))[:200])
+    if code in (401, 403):
+        raise _KimiUnauth("need_devin_login")
+    payload = _cursor_decode(body)
+    if code != 200 or not isinstance(payload, dict):
+        raise RuntimeError(f"http_{code}" if code else "bad_payload")
+    return payload
+
+
+def _devin_quota_pct(remaining) -> float | None:
+    """planStatus reports *remaining* percent; the chip meters used."""
+    rem = as_pct(remaining)
+    if rem is None:
+        return None
+    return as_pct(100.0 - rem)
+
+def _empty_devin(status: str, reason: str) -> dict:
+    rec = empty_provider("devin", status, reason)
+    rec["windows"] = [
+        {"kind": "weekly", "label": "Weekly quota"},
+        {"kind": "special", "label": "Plan cycle"},
+    ]
+    return rec
+
+
+def normalize_devin(raw: dict) -> dict:
+    rec = {
+        "id": "devin",
+        "name": "Devin",
+        "logo": "D",
+        "status": "unknown",
+        "windows": [],
+    }
+    status = raw.get("userStatus") if isinstance(raw.get("userStatus"), dict) else {}
+    plan_status = status.get("planStatus") if isinstance(status.get("planStatus"), dict) else {}
+    plan_info = plan_status.get("planInfo") if isinstance(plan_status.get("planInfo"), dict) else {}
+    plan_name = plan_info.get("planName") or plan_info.get("teamsTier")
+    if isinstance(plan_name, str) and plan_name:
+        rec["plan"] = plan_name.removeprefix("TEAMS_TIER_DEVIN_").removeprefix("TEAMS_TIER_").title() \
+            if plan_name.startswith("TEAMS_TIER_") else plan_name
+    weekly_pct = _devin_quota_pct(plan_status.get("weeklyQuotaRemainingPercent"))
+    weekly_reset = iso_from_unix(plan_status.get("weeklyQuotaResetAtUnix"))
+    windows: list[dict] = [window("weekly", "Weekly quota", weekly_pct, weekly_reset)]
+    if not plan_info.get("hideDailyQuota"):
+        daily_pct = _devin_quota_pct(plan_status.get("dailyQuotaRemainingPercent"))
+        daily_reset = iso_from_unix(plan_status.get("dailyQuotaResetAtUnix"))
+        windows.append(window("session", "Daily quota", daily_pct, daily_reset))
+    else:
+        # Max hides the daily meter; surface the billing-cycle end instead.
+        windows.append(window("special", "Plan cycle", None, plan_status.get("planEnd")))
+    rec["windows"] = windows
+    if any("used_pct" in w for w in windows):
+        rec["status"] = "ok"
+    else:
+        rec["reason"] = "no_used_pct"
+    return rec
+
+
+def probe_devin(fixture: str | None = None) -> dict:
+    if fixture:
+        try:
+            raw = json.loads(Path(fixture).read_text(encoding="utf-8"))
+            if "providers" in raw and "devin" in (raw.get("providers") or {}):
+                rec = raw["providers"]["devin"]
+                rec.setdefault("id", "devin")
+                return rec
+            if isinstance(raw, dict):
+                return normalize_devin(raw)
+        except (OSError, json.JSONDecodeError):
+            pass
+        return _empty_devin("unknown", "bad_payload")
+    try:
+        raw = _devin_user_status()
+        if raw is None:
+            return _empty_devin("unauth", "need_devin_login")
+        return normalize_devin(raw)
+    except _KimiUnauth:
+        return _empty_devin("unauth", "need_devin_login")
+    except Exception as exc:
+        msg = redact(str(exc))[:200]
+        low = msg.lower()
+        if "auth" in low or "login" in low or "401" in msg:
+            return _empty_devin("unauth", "need_devin_login")
+        return _empty_devin("unknown", msg or "probe_failed")
+
 
 
 # --- Local Codex tokens (Quattro scan_native_codex_sessions) -----------------
@@ -2441,7 +2600,7 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None, pri
         lines.append(f"API would have cost {format_usd(amount)}")
     lines.append("OAuth incremental $0")
     lines.append("")
-    lines.append("h/l or 1-5 switch · r refresh · q quit")
+    lines.append("h/l or 1-6 switch · r refresh · q quit")
     return "\n".join(lines) + "\n"
 
 
@@ -2501,7 +2660,7 @@ def _tui_loop(stdscr) -> int:
             cmd_cycle("prev")
             poke_waybar()
             continue
-        if isinstance(ch, str) and ch in "12345":
+        if isinstance(ch, str) and ch in "123456":
             cmd_select(ids[int(ch) - 1])
             continue
         if ch == curses.KEY_RESIZE:
@@ -2528,14 +2687,15 @@ PROBERS = {
     "grok": probe_grok,
     "kimi": probe_kimi,
     "cursor": probe_cursor,
+    "devin": probe_devin,
 }
 
 
 def probe_one(pid: str, fixture: str | None = None) -> dict:
     if pid == "codex":
         return probe_codex(fixture)
-    if pid == "cursor":
-        return probe_cursor(fixture)
+    if pid in ("cursor", "devin"):
+        return PROBERS[pid](fixture)
     fn = PROBERS.get(pid)
     if not fn:
         raise SystemExit(f"unknown provider: {pid}")
@@ -2556,7 +2716,7 @@ def cmd_probe(ids: list[str], fixture: str | None) -> int:
     cache = load_cache()
     targets = ids or [pid for pid, _, _ in PROVIDERS]
     for pid in targets:
-        rec = probe_one(pid, fixture if pid in ("codex", "cursor") else None)
+        rec = probe_one(pid, fixture if pid in ("codex", "cursor", "devin") else None)
         upsert(cache, rec)
         print(summarize(rec))
     cache["selected"] = pick_selected(cache)
