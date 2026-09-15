@@ -30,9 +30,18 @@ Re-run the same line to update.
 | Scroll | Cycle providers |
 
 Token Plan's compact bars show the average utilization across OMP-metered
-credentials and the hottest reported snapshot. The tooltip lists anonymous
-snapshot values because OMP does not expose a stable report-to-slot identity.
-`T @<slot>` is the active execution route, not the owner of either meter.
+credentials and the hottest reported snapshot, followed by remaining/total
+credits. The tooltip lists anonymous snapshot values because OMP does not
+expose a stable report-to-slot identity. `T @<slot>` is the active execution
+route, not the owner of either meter.
+
+Token Plan is metered in credits, not percentages: the `pro` subscription is
+40,000 credits/week and each purchased add-on bundle (Credit Pack, $15) is
+20,000. OMP reports the plan window and the add-on pool separately, and the
+chip combines them, so an account whose plan reads 100% while a Credit Pack
+still holds credits shows its real headroom instead of a false zero. Override
+the pool sizes for another tier with `AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS` and
+`AI_USAGE_TOKEN_PLAN_ADDON_CREDITS`.
 
 Token Plan right-click runs `token-plan-swap toggle`. That helper cycles the
 slots in `~/.config/alibaba-token-plan/slots` and rewrites

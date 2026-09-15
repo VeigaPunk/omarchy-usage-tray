@@ -204,6 +204,13 @@ cat <<'JSON'
           "window": {"id": "7d", "durationMs": 604800000},
           "amount": {"usedFraction": 0},
           "status": "ok"
+        },
+        {
+          "id": "credits:addon",
+          "label": "Credit Pack",
+          "window": {"id": "addon", "durationMs": 604800000},
+          "amount": {"usedFraction": 0.25},
+          "status": "ok"
         }
       ]
     }
@@ -244,28 +251,26 @@ with open(path, encoding="utf-8") as fh:
 rec = cache["providers"]["token-plan"]
 assert rec["status"] == "ok", rec
 assert rec["windows"] == [
-    {"kind": "weekly", "label": "3-account average", "used_pct": 1.209},
-    {"kind": "special", "label": "Hottest account", "used_pct": 3.627},
+    {"kind": "weekly", "label": "3-account credits", "used_pct": 4.6077},
+    {"kind": "special", "label": "Hottest account", "used_pct": 8.3333},
 ], rec["windows"]
-assert rec["capacity"] == {
-    "accounts": 3,
-    "used_accounts": 0.036270291301975,
-    "remaining_accounts": 2.963729708698025,
-}, rec["capacity"]
+assert rec["credits"] == {"total": 140000.0, "used": 6450.81, "remaining": 133549.19}, rec["credits"]
 assert rec["snapshot"] == {
     "reports": 3,
     "accounts_without_usage": 0,
     "disabled_credentials": 0,
 }, rec["snapshot"]
 usage = rec["account_usage"]
-assert [row.get("used_pct") for row in usage] == [0, 3.627, 0], usage
+assert [row.get("used_pct") for row in usage] == [0, 3.627, 8.3333], usage
+assert [row.get("credits_total") for row in usage] == [40000, 40000, 60000], usage
+assert [row.get("credits_remaining") for row in usage] == [40000.0, 38549.19, 55000.0], usage
 assert [row.get("fetched_at") for row in usage] == [
     "2100-01-01T00:00:00Z",
     "2100-01-01T00:01:00Z",
     "2100-01-01T00:02:00Z",
 ], usage
 assert rec["measured_at"] == usage[0]["fetched_at"], rec
-allowed = {"used_pct", "fetched_at", "resets_at"}
+allowed = {"used_pct", "fetched_at", "resets_at", "credits_total", "credits_used", "credits_remaining"}
 assert all(set(row) <= allowed for row in usage), usage
 encoded = json.dumps(cache, sort_keys=True)
 for forbidden in (
@@ -292,20 +297,24 @@ assert payload["alt"] == "token-plan", payload
 assert "ok" in payload["class"].split(), payload
 assert payload["text"].startswith("T @gmail "), payload["text"]
 assert payload["text"].count("bgcolor=") >= 2, payload["text"]
+assert "133.5k/140.0k" in payload["text"], payload["text"]
 tooltip = payload["tooltip"]
 for expected in (
     "Token Plan",
     "active route: gmail · routing only; not mapped to a snapshot",
-    "3-account average: 1.209%",
-    "Hottest account: 3.627% · snapshot 2",
+    "3-account credits: 4.6077%",
+    "credits: 133.5k remaining of 140.0k · 6.45k used",
+    "Hottest account: 8.3333% · snapshot 3",
     "snapshot 1: 0%",
     "snapshot 2: 3.627%",
-    "snapshot 3: 0%",
+    "snapshot 3: 8.3333%",
+    "40.0k/40.0k credits",
+    "38.5k/40.0k credits",
+    "55.0k/60.0k credits",
     "2100-01-01T00:00:00Z",
     "2100-01-01T00:01:00Z",
     "2100-01-01T00:02:00Z",
     "snapshot coverage: 3 reports · 0 without usage · 0 disabled",
-    "capacity: 0.036270291301975 / 3 account-equivalents used · 2.963729708698025 remaining",
 ):
     assert expected in tooltip, (expected, tooltip)
 for forbidden in (
@@ -338,8 +347,8 @@ assert rec["status"] == "ok", rec
 assert rec["last_error"] == "exit_42", rec
 assert rec["measured_at"] == "2100-01-01T00:00:00Z", rec
 assert rec["windows"] == [
-    {"kind": "weekly", "label": "3-account average", "used_pct": 1.209},
-    {"kind": "special", "label": "Hottest account", "used_pct": 3.627},
+    {"kind": "weekly", "label": "3-account credits", "used_pct": 4.6077},
+    {"kind": "special", "label": "Hottest account", "used_pct": 8.3333},
 ], rec
 with open(sys.argv[2], encoding="utf-8") as fh:
     export = json.load(fh)
@@ -355,7 +364,7 @@ PY
 unset AI_USAGE_OMP_FAIL
 export AI_USAGE_OMP_PARTIAL=1
 partial_output="$("$BIN" probe token-plan 2>&1)"
-[[ "$partial_output" == *'token-plan ok partial_usage weekly=10'* ]] || fail "partial OMP probe lost its usable average"
+[[ "$partial_output" == *'token-plan ok partial_usage weekly=15'* ]] || fail "partial OMP probe lost its usable average"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 3 ]] || fail "partial probe invoked OMP more than once"
 partial_waybar="$("$BIN" waybar 2>&1)"
 partial_tui="$("$BIN" tui 2>&1)"
@@ -370,7 +379,7 @@ assert rec["status"] == "ok", rec
 assert rec["reason"] == "partial_usage", rec
 assert rec["measured_at"] == "2100-01-01T00:00:00Z", rec
 assert rec["windows"] == [
-    {"kind": "weekly", "label": "3-account average", "used_pct": 10},
+    {"kind": "weekly", "label": "2-account credits", "used_pct": 15},
     {"kind": "special", "label": "Hottest account"},
 ], rec
 assert [row.get("used_pct") for row in rec["account_usage"]] == [0, None, 30], rec
@@ -388,7 +397,7 @@ PY
 unset AI_USAGE_OMP_PARTIAL
 export AI_USAGE_OMP_SHORT=1
 short_output="$("$BIN" probe token-plan 2>&1)"
-[[ "$short_output" == *'token-plan ok partial_usage weekly=10'* ]] || fail "short OMP snapshot lost its bounded partial state"
+[[ "$short_output" == *'token-plan ok partial_usage weekly=15'* ]] || fail "short OMP snapshot lost its bounded partial state"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 4 ]] || fail "short probe invoked OMP more than once"
 python3 - "$AI_USAGE_CACHE" "$XDG_STATE_HOME/omarchy/agents/usage/token-plan.json" <<'PY'
 import json

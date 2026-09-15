@@ -23,7 +23,9 @@ from pathlib import Path
 from urllib.parse import urlencode
 import tomllib
 
-VERSION = 1
+# Cache schema. 2 replaced the Token Plan `capacity` block with credit totals
+# (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
+VERSION = 2
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
@@ -683,6 +685,44 @@ def attach_token_plan_identity(rec: dict) -> dict:
     return rec
 
 
+# QwenCloud Token Plan credit pools. The console's usage RPC reports only
+# percentages, so the absolute pool sizes come from its quota-config endpoint:
+# the `pro` subscription is 40,000 credits/week and each purchased add-on
+# bundle (Credit Pack, $15) is 20,000 credits. Override per plan tier with
+# AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS / AI_USAGE_TOKEN_PLAN_ADDON_CREDITS.
+def _token_plan_pool(env_name: str, default: int) -> int:
+    raw = os.environ.get(env_name)
+    if raw:
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return default
+
+
+def _token_plan_weekly_credits() -> int:
+    return _token_plan_pool("AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS", 40000)
+
+
+def _token_plan_addon_credits() -> int:
+    return _token_plan_pool("AI_USAGE_TOKEN_PLAN_ADDON_CREDITS", 20000)
+
+
+def _credits_label(value) -> str:
+    """Compact credit readout: 19999.62 -> 20.0k, 140000 -> 140k, 950 -> 950."""
+    number = _token_plan_number(value)
+    if number is None:
+        return "—"
+    amount = float(number)
+    if amount >= 10000:
+        return f"{amount / 1000:.1f}k"
+    if amount >= 1000:
+        return f"{amount / 1000:.2f}k"
+    return f"{amount:.0f}"
+
+
 def _token_plan_number(value) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -690,13 +730,6 @@ def _token_plan_number(value) -> int | float | None:
     if number != number or number in (float("inf"), float("-inf")) or number < 0:
         return None
     return int(number) if number.is_integer() else number
-
-
-def _token_plan_count(value) -> int | None:
-    number = _token_plan_number(value)
-    if number is None or float(number) != int(number):
-        return None
-    return int(number)
 
 
 def _token_plan_timestamp(value) -> str | None:
@@ -723,11 +756,11 @@ def _empty_token_plan(reason: str) -> dict:
             "status": "unknown",
             "reason": reason,
             "windows": [
-                window("weekly", "Account average", None),
+                window("weekly", "Account credits", None),
                 window("special", "Hottest account", None),
             ],
             "account_usage": [],
-            "capacity": {},
+            "credits": {},
             "snapshot": {
                 "reports": 0,
                 "accounts_without_usage": 0,
@@ -738,6 +771,14 @@ def _empty_token_plan(reason: str) -> dict:
 
 
 def _token_plan_report_usage(report: dict) -> dict:
+    """Per-account usage in credits.
+
+    The plan window and the purchased add-on pool are separate meters, so
+    utilization is computed over their combined credits: an account whose plan
+    reads 100% while an active Credit Pack still holds credits is mostly idle,
+    not exhausted. `credits:addon` is absent for accounts that never bought a
+    bundle, which then fall back to the weekly pool alone.
+    """
     usage: dict = {}
     fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
     if fetched_at:
@@ -745,51 +786,63 @@ def _token_plan_report_usage(report: dict) -> dict:
     limits = report.get("limits")
     if not isinstance(limits, list):
         return usage
+    plan_fraction = None
+    addon_fraction = None
+    resets_at = None
     for limit in limits:
         if not isinstance(limit, dict):
             continue
         win = limit.get("window")
         window_id = win.get("id") if isinstance(win, dict) else None
-        if limit.get("id") != "credits:7d" or window_id != "7d":
-            continue
-        if limit.get("status") not in (None, "ok"):
-            return usage
         amount = limit.get("amount")
         fraction = _token_plan_number(amount.get("usedFraction")) if isinstance(amount, dict) else None
-        used_pct = as_pct(float(fraction) * 100.0) if fraction is not None and fraction <= 1 else None
-        if used_pct is not None:
-            usage["used_pct"] = used_pct
-        resets_at = _token_plan_timestamp(
-            limit.get("resetsAt") or (win.get("resetsAt") if isinstance(win, dict) else None)
-        )
-        if resets_at:
-            usage["resets_at"] = resets_at
+        if fraction is not None and float(fraction) > 1:
+            fraction = None
+        if limit.get("id") == "credits:7d" and window_id == "7d":
+            if fraction is not None:
+                plan_fraction = float(fraction)
+            resets_at = _token_plan_timestamp(
+                limit.get("resetsAt") or (win.get("resetsAt") if isinstance(win, dict) else None)
+            )
+        elif limit.get("id") == "credits:addon" and fraction is not None:
+            addon_fraction = float(fraction)
+    if plan_fraction is None:
         return usage
+    weekly = _token_plan_weekly_credits()
+    total = weekly + (_token_plan_addon_credits() if addon_fraction is not None else 0)
+    used = weekly * plan_fraction
+    if addon_fraction is not None:
+        used += _token_plan_addon_credits() * addon_fraction
+    if total > 0:
+        usage["used_pct"] = as_pct(100.0 * used / total)
+    usage["credits_total"] = total
+    usage["credits_used"] = round(used, 2)
+    usage["credits_remaining"] = round(total - used, 2)
+    if resets_at:
+        usage["resets_at"] = resets_at
     return usage
 
 
-def _token_plan_capacity(payload: dict) -> dict:
+def _token_plan_declared_accounts(payload: dict) -> int | None:
+    """OMP's own account count for the provider.
+
+    Used only to detect under-reporting: OMP's `capacity` block counts the plan
+    window alone, so it is not a credit source, but a report count below the
+    declared account count still means the snapshot is incomplete.
+    """
     capacity_root = payload.get("capacity")
     if not isinstance(capacity_root, dict):
-        return {}
+        return None
     rows = capacity_root.get("alibaba-token-plan")
     if not isinstance(rows, list):
-        return {}
+        return None
     for row in rows:
         if not isinstance(row, dict) or row.get("window") != "7d":
             continue
-        capacity: dict = {}
-        accounts = _token_plan_count(row.get("accounts"))
-        used_accounts = _token_plan_number(row.get("usedAccounts"))
-        remaining_accounts = _token_plan_number(row.get("remainingAccounts"))
-        if accounts is not None:
-            capacity["accounts"] = accounts
-        if used_accounts is not None:
-            capacity["used_accounts"] = used_accounts
-        if remaining_accounts is not None:
-            capacity["remaining_accounts"] = remaining_accounts
-        return capacity
-    return {}
+        accounts = _token_plan_number(row.get("accounts"))
+        if accounts is not None and float(accounts) == int(accounts) and accounts > 0:
+            return int(accounts)
+    return None
 
 
 def probe_token_plan() -> dict:
@@ -817,8 +870,6 @@ def probe_token_plan() -> dict:
         return _empty_token_plan("no_json")
     if not isinstance(payload, dict) or not isinstance(payload.get("reports"), list):
         return _empty_token_plan("bad_payload")
-    if "capacity" in payload and not isinstance(payload.get("capacity"), dict):
-        return _empty_token_plan("bad_payload")
 
     raw_reports = payload["reports"]
     account_usage = [
@@ -826,8 +877,6 @@ def probe_token_plan() -> dict:
         for report in raw_reports
         if isinstance(report, dict) and report.get("provider") == "alibaba-token-plan"
     ]
-    capacity = _token_plan_capacity(payload)
-    capacity_declared = bool(payload.get("capacity"))
     accounts_without_usage = payload.get("accountsWithoutUsage")
     disabled_credentials = payload.get("disabledCredentials")
     usage_lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
@@ -839,18 +888,30 @@ def probe_token_plan() -> dict:
         "disabled_credentials": disabled_count,
     }
 
-    accounts = capacity.get("accounts")
-    used_accounts = capacity.get("used_accounts")
-    remaining_accounts = capacity.get("remaining_accounts")
-    consistent_capacity = (
-        isinstance(accounts, int)
-        and accounts > 0
-        and used_accounts is not None
-        and remaining_accounts is not None
-        and abs(float(used_accounts) + float(remaining_accounts) - accounts)
-        <= max(1e-6, accounts * 1e-6)
+    # Credits, not account-equivalents: OMP's own capacity block counts only the
+    # plan window, so a funded add-on would still read as "0 remaining".
+    credits_total = 0.0
+    credits_used = 0.0
+    credits_complete = bool(account_usage)
+    for item in account_usage:
+        row_total = _token_plan_number(item.get("credits_total"))
+        row_used = _token_plan_number(item.get("credits_used"))
+        if row_total is None or row_used is None:
+            credits_complete = False
+            continue
+        credits_total += float(row_total)
+        credits_used += float(row_used)
+    credits = (
+        {
+            "total": round(credits_total, 2),
+            "used": round(credits_used, 2),
+            "remaining": round(credits_total - credits_used, 2),
+        }
+        if credits_complete and credits_total > 0
+        else {}
     )
     report_pcts = [as_pct(item.get("used_pct")) for item in account_usage]
+    known_pcts = [pct for pct in report_pcts if pct is not None]
     complete_reports = (
         bool(account_usage)
         and len(raw_reports) == len(account_usage)
@@ -858,16 +919,20 @@ def probe_token_plan() -> dict:
         and missing_count == 0
         and all(pct is not None for pct in report_pcts)
     )
-    if consistent_capacity:
-        average = ratio(used_accounts, accounts)
-        complete_coverage = complete_reports and len(account_usage) == accounts
-        average_accounts = accounts
+    declared_accounts = _token_plan_declared_accounts(payload)
+    under_reported = declared_accounts is not None and len(account_usage) != declared_accounts
+    if credits:
+        average = ratio(credits["used"], credits["total"])
+        average_accounts = len(account_usage)
+    elif known_pcts:
+        average = as_pct(sum(known_pcts) / len(known_pcts))
+        average_accounts = len(known_pcts)
     else:
-        average = as_pct(sum(report_pcts) / len(report_pcts)) if complete_reports else None
-        complete_coverage = complete_reports
-        average_accounts = len(account_usage) if complete_reports else None
+        average = None
+        average_accounts = None
+    complete_coverage = complete_reports and bool(credits) and not under_reported
     hottest = max(report_pcts) if complete_coverage else None
-    average_label = f"{average_accounts}-account average" if average_accounts else "Account average"
+    average_label = f"{average_accounts}-account credits" if average_accounts else "Account credits"
     windows = [
         window("weekly", average_label, average),
         window("special", "Hottest account", hottest),
@@ -880,14 +945,14 @@ def probe_token_plan() -> dict:
         "status": status,
         "windows": windows,
         "account_usage": account_usage,
-        "capacity": capacity,
+        "credits": credits,
         "snapshot": snapshot,
     }
     timestamps = [item.get("fetched_at") for item in account_usage]
     timestamps_complete = (
         bool(timestamps)
         and len(raw_reports) == len(account_usage)
-        and (not consistent_capacity or len(account_usage) == accounts)
+        and not under_reported
         and all(isinstance(stamp, str) for stamp in timestamps)
     )
     if timestamps_complete:
@@ -897,7 +962,7 @@ def probe_token_plan() -> dict:
         or disabled_count > 0
         or not usage_lists_valid
         or not timestamps_complete
-        or (capacity_declared and not consistent_capacity)
+        or not credits
     )
     if status != "ok":
         rec["reason"] = "no_used_pct"
@@ -2793,8 +2858,13 @@ def _timestamp_age_sec(stamp) -> float | None:
 def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
     weekly = window_by_kind(rec, "weekly") or {}
     hottest = window_by_kind(rec, "special") or {}
+    credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
+    credits_remaining = _token_plan_number(credits.get("remaining"))
+    credits_total = _token_plan_number(credits.get("total"))
     mark = f"{logo} @{ident_id}" if ident_id else logo
     text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {meter(hottest.get('used_pct'))}"
+    if credits_remaining is not None and credits_total is not None:
+        text += f" {pango_escape(f'{_credits_label(credits_remaining)}/{_credits_label(credits_total)}')}"
     classes = [str(rec.get("status") or "unknown")]
     account_usage = rec.get("account_usage")
     account_usage = account_usage if isinstance(account_usage, list) else []
@@ -2818,7 +2888,13 @@ def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
         lines.append(str(rec["reason"]))
     if rec.get("last_error"):
         lines.append("last error: " + str(rec["last_error"]))
-    lines.append(f"{weekly.get('label') or 'Account average'}: {_pct_label(weekly.get('used_pct'))}")
+    lines.append(f"{weekly.get('label') or 'Account credits'}: {_pct_label(weekly.get('used_pct'))}")
+    if credits_remaining is not None and credits_total is not None:
+        lines.append(
+            "credits: "
+            f"{_credits_label(credits_remaining)} remaining of {_credits_label(credits_total)}"
+            f" · {_credits_label(credits.get('used'))} used"
+        )
 
     hottest_index = None
     if hottest_pct is not None:
@@ -2840,6 +2916,10 @@ def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
         if fetched_age is not None:
             fetched_text += f" ({int(fetched_age)}s ago)"
         bit = f"snapshot {index}: {_pct_label(item.get('used_pct'))} · fetched: {fetched_text}"
+        row_remaining = _token_plan_number(item.get("credits_remaining"))
+        row_total = _token_plan_number(item.get("credits_total"))
+        if row_remaining is not None and row_total is not None:
+            bit += f" · {_credits_label(row_remaining)}/{_credits_label(row_total)} credits"
         if item.get("resets_at"):
             bit += f" · reset {item['resets_at']}"
         lines.append(bit)
@@ -2851,14 +2931,6 @@ def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
             f"{snapshot.get('reports', 0)} reports · "
             f"{snapshot.get('accounts_without_usage', 0)} without usage · "
             f"{snapshot.get('disabled_credentials', 0)} disabled"
-        )
-    capacity = rec.get("capacity")
-    if isinstance(capacity, dict) and capacity:
-        lines.append(
-            "capacity: "
-            f"{capacity.get('used_accounts', '—')} / {capacity.get('accounts', '—')} "
-            "account-equivalents used · "
-            f"{capacity.get('remaining_accounts', '—')} remaining"
         )
     return {
         "text": text,
