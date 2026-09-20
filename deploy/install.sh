@@ -25,26 +25,35 @@ fi
 cp -a "$CFG" "$CFG.bak.$STAMP"
 [[ -f "$CSS" ]] && cp -a "$CSS" "$CSS.bak.$STAMP"
 
-python3 "$ROOT/deploy/merge_waybar.py" "$CFG" "$CSS" "$ROOT/deploy/waybar-ai-usage.css" "$BIN"
-
+# The chip points at the installed symlink, not at this checkout: Waybar runs
+# module commands through sh, so the module keeps working if the repo moves.
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$BIN" "$HOME/.local/bin/ai-usage"
 ln -sfn "$ROOT/bin/cursor-oauth-swap" "$HOME/.local/bin/cursor-oauth-swap"
 
+python3 "$ROOT/deploy/merge_waybar.py" \
+  "$CFG" "$CSS" "$ROOT/deploy/waybar-ai-usage.css" "~/.local/bin/ai-usage"
+
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 mkdir -p "$UNIT_DIR"
-cat >"$UNIT_DIR/ai-usage.service" <<EOF
-[Unit]
-Description=Probe AI CLI usage limits into cache
-
-[Service]
-Type=oneshot
-TimeoutStartSec=180
-Nice=10
-Environment=PATH=%h/.local/bin:%h/.grok/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
-ExecStart=%h/.local/bin/ai-usage refresh
-EOF
+install -m 644 "$ROOT/systemd/ai-usage.service" "$UNIT_DIR/ai-usage.service"
 install -m 644 "$ROOT/systemd/ai-usage.timer" "$UNIT_DIR/ai-usage.timer"
+
+# Machine-local knobs (AI_USAGE_OMP_BIN, pool sizes, …) live outside the unit
+# so re-running this installer never clobbers them. systemd expands neither
+# variables nor %h inside the file, so the template carries literal paths.
+ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ai-usage/env"
+mkdir -p "$(dirname "$ENV_FILE")"
+if [[ ! -f "$ENV_FILE" ]]; then
+  cat >"$ENV_FILE" <<EOF
+# Local environment for ai-usage.service (optional; the unit tolerates it
+# being absent). Values are literal: no shell expansion happens here.
+#AI_USAGE_OMP_BIN=$HOME/.local/bin/omp
+#AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS=40000
+#AI_USAGE_TOKEN_PLAN_ADDON_CREDITS=20000
+EOF
+  chmod 600 "$ENV_FILE"
+fi
 systemctl --user daemon-reload
 systemctl --user enable --now ai-usage.timer
 

@@ -5,5 +5,6 @@ Description=Probe AI CLI usage limits into cache
 Type=oneshot
 TimeoutStartSec=180
 Nice=10
-Environment=PATH=%h/.local/bin:%h/.grok/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.grok/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin
+EnvironmentFile=-%h/.config/ai-usage/env
 ExecStart=%h/.local/bin/ai-usage refresh

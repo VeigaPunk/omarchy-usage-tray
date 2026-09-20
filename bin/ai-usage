@@ -10,6 +10,7 @@ import json
 import os
 import re
 import select
+import signal
 import stat
 import subprocess
 import sys
@@ -47,6 +48,7 @@ PROVIDERS = (
     ("kimi", "Kimi", "K"),
     ("cursor", "Cursor", "R"),
     ("devin", "Devin", "D"),
+    ("opencode-go", "OpenCode Go", "O"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -85,13 +87,57 @@ def quattro_state_dir() -> Path:
     return Path(state) / "omarchy" / "agents" / "usage"
 
 
-def poke_waybar() -> None:
-    subprocess.run(
-        ["pkill", "-x", "-RTMIN+11", "waybar"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+def waybar_signal() -> int:
+    """Realtime-signal offset custom/ai-usage listens on.
+
+    Waybar measures the module's `signal` from SIGRTMIN, and the installer
+    picks that slot, so the CLI reads it back instead of assuming a number.
+    """
+    fallback = 11
+    path = Path(
+        os.environ.get("AI_USAGE_WAYBAR_CONFIG", Path.home() / ".config" / "waybar" / "config.jsonc")
     )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+    match = re.search(r'"custom/ai-usage"\s*:\s*\{.*?"signal"\s*:\s*(\d+)', text, re.S)
+    if not match:
+        return fallback
+    try:
+        sig = int(match.group(1))
+    except ValueError:
+        return fallback
+    return sig if 11 <= sig < 31 else fallback
+
+
+def poke_waybar() -> None:
+    """Refresh the chip now that the selected provider changed.
+
+    `pkill -RTMIN+N` is not a signal procps-ng accepts (it parses `-R` and
+    bails), so SIGRTMIN is resolved here and the pid is signalled directly —
+    the offset is what the module actually listens on.
+    """
+    offset = waybar_signal()
+    base = getattr(signal, "SIGRTMIN", None)
+    if not isinstance(base, int):
+        return
+    try:
+        listed = subprocess.run(
+            ["pgrep", "-x", "waybar"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return
+    for token in listed.stdout.split():
+        if not token.isdigit():
+            continue
+        try:
+            os.kill(int(token), base + offset)
+        except OSError:
+            continue
 
 
 def iso_now() -> str:
@@ -685,10 +731,13 @@ def attach_token_plan_identity(rec: dict) -> dict:
     return rec
 
 
-# QwenCloud Token Plan credit pools. The console's usage RPC reports only
-# percentages, so the absolute pool sizes come from its quota-config endpoint:
-# the `pro` subscription is 40,000 credits/week and each purchased add-on
-# bundle (Credit Pack, $15) is 20,000 credits. Override per plan tier with
+# QwenCloud Token Plan credit pools, declared here because nothing reachable
+# reports absolutes: the console usage RPC answers with `per1WeekPercentage`
+# alone (verified 2026-09-20 on every stored credential) and OMP only forwards
+# that one window. `pro` grants 40,000 credits/week per account, and a
+# purchased add-on bundle (Credit Pack, $15) adds 20,000 to the account that
+# owns it — both are per-account figures, so the chip sums rows instead of
+# scaling a fleet-wide number. Override per plan tier with
 # AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS / AI_USAGE_TOKEN_PLAN_ADDON_CREDITS.
 def _token_plan_pool(env_name: str, default: int) -> int:
     raw = os.environ.get(env_name)
@@ -823,53 +872,10 @@ def _token_plan_report_usage(report: dict) -> dict:
     return usage
 
 
-def _token_plan_declared_accounts(payload: dict) -> int | None:
-    """OMP's own account count for the provider.
-
-    Used only to detect under-reporting: OMP's `capacity` block counts the plan
-    window alone, so it is not a credit source, but a report count below the
-    declared account count still means the snapshot is incomplete.
-    """
-    capacity_root = payload.get("capacity")
-    if not isinstance(capacity_root, dict):
-        return None
-    rows = capacity_root.get("alibaba-token-plan")
-    if not isinstance(rows, list):
-        return None
-    for row in rows:
-        if not isinstance(row, dict) or row.get("window") != "7d":
-            continue
-        accounts = _token_plan_number(row.get("accounts"))
-        if accounts is not None and float(accounts) == int(accounts) and accounts > 0:
-            return int(accounts)
-    return None
-
-
 def probe_token_plan() -> dict:
-    omp = os.environ.get("AI_USAGE_OMP_BIN") or which("omp")
-    if not omp:
-        return _empty_token_plan("no_cli")
-    try:
-        proc = subprocess.run(
-            [omp, "usage", "--provider", "alibaba-token-plan", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-            env=child_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return _empty_token_plan("timeout")
-    except OSError:
-        return _empty_token_plan("no_cli")
-    if proc.returncode:
-        return _empty_token_plan(f"exit_{proc.returncode}")
-    try:
-        payload = json.loads(proc.stdout) if proc.stdout and proc.stdout.strip() else None
-    except json.JSONDecodeError:
-        return _empty_token_plan("no_json")
-    if not isinstance(payload, dict) or not isinstance(payload.get("reports"), list):
-        return _empty_token_plan("bad_payload")
+    payload, failure = omp_usage_payload("alibaba-token-plan")
+    if payload is None:
+        return _empty_token_plan(failure or "bad_payload")
 
     raw_reports = payload["reports"]
     account_usage = [
@@ -919,7 +925,7 @@ def probe_token_plan() -> dict:
         and missing_count == 0
         and all(pct is not None for pct in report_pcts)
     )
-    declared_accounts = _token_plan_declared_accounts(payload)
+    declared_accounts = _omp_declared_accounts(payload, "alibaba-token-plan", "7d")
     under_reported = declared_accounts is not None and len(account_usage) != declared_accounts
     if credits:
         average = ratio(credits["used"], credits["total"])
@@ -969,6 +975,252 @@ def probe_token_plan() -> dict:
     elif partial:
         rec["reason"] = "partial_usage"
     return attach_token_plan_identity(rec)
+
+
+def omp_usage_payload(provider: str) -> tuple[dict | None, str | None]:
+    """`omp usage --provider <provider> --json`, or (None, bounded reason).
+
+    Every OMP-metered provider reads the same report shape, so the invocation,
+    timeout, and error vocabulary live here: no_cli, timeout, exit_<code>,
+    no_json, bad_payload. Reasons stay short and secret-free because they land
+    in the cache and the chip tooltip.
+    """
+    omp = os.environ.get("AI_USAGE_OMP_BIN") or which("omp")
+    if not omp:
+        return None, "no_cli"
+    try:
+        proc = subprocess.run(
+            [omp, "usage", "--provider", provider, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+            env=child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except OSError:
+        return None, "no_cli"
+    if proc.returncode:
+        return None, f"exit_{proc.returncode}"
+    try:
+        payload = json.loads(proc.stdout) if proc.stdout and proc.stdout.strip() else None
+    except json.JSONDecodeError:
+        return None, "no_json"
+    if not isinstance(payload, dict) or not isinstance(payload.get("reports"), list):
+        return None, "bad_payload"
+    return payload, None
+
+
+def _omp_declared_accounts(payload: dict, provider: str, window_id: str | None = None) -> int | None:
+    """OMP's own account count for the provider.
+
+    Used only to detect under-reporting: a report count below the declared
+    account count means the snapshot is incomplete. `window_id` narrows the
+    lookup for providers whose capacity block lists several windows.
+    """
+    capacity_root = payload.get("capacity")
+    if not isinstance(capacity_root, dict):
+        return None
+    rows = capacity_root.get(provider)
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if window_id is not None and row.get("window") != window_id:
+            continue
+        accounts = _token_plan_number(row.get("accounts"))
+        if accounts is not None and float(accounts) == int(accounts) and accounts > 0:
+            return int(accounts)
+    return None
+
+
+# --- OpenCode Go -------------------------------------------------------------
+
+# OMP window id -> (kind, short label, long label). Monthly anchors on the
+# subscription anniversary instead of a rolling 30 days, so a key can sit at
+# its monthly cap while the weekly window still reads empty; the chip's special
+# slot tracks whichever window is hottest so that key never hides behind an
+# averaged bar.
+OPENCODE_GO_WINDOWS = (
+    ("rolling-5h", "session", "5h", "5 Hour limit"),
+    ("weekly", "weekly", "7d", "Weekly limit"),
+    ("monthly", "monthly", "monthly", "Monthly limit"),
+)
+OPENCODE_GO_KINDS = {wid: (kind, short, label) for wid, kind, short, label in OPENCODE_GO_WINDOWS}
+
+
+def _opencode_go_fraction(value) -> float | None:
+    """OMP reports `usedFraction` in 0..1; a percent-shaped payload is tolerated."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        frac = float(value)
+    except (TypeError, ValueError):
+        return None
+    if frac != frac or frac in (float("inf"), float("-inf")):
+        return None
+    if frac > 1:
+        frac = frac / 100.0
+    return max(0.0, min(1.0, frac))
+
+
+def _opencode_go_report(report: dict) -> dict:
+    """One credential snapshot, in percent.
+
+    OMP exposes no stable account identity here, so a row carries only what was
+    measured: the binding window (closest to its cap), every window the server
+    answered, the fetch stamp, and the binding reset. Windows the server left
+    out are omitted rather than zeroed — an unread window is not an unused one.
+    """
+    row: dict = {}
+    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
+    if fetched_at:
+        row["fetched_at"] = fetched_at
+    found: dict[str, tuple[float, str | None]] = {}
+    limits = report.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict):
+            continue
+        if limit.get("id") not in OPENCODE_GO_KINDS:
+            continue
+        amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
+        frac = _opencode_go_fraction(amount.get("usedFraction"))
+        if frac is None:
+            continue
+        win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+        found[str(limit["id"])] = (frac, iso_from_unix(win.get("resetsAt") or limit.get("resetsAt")))
+    measured: dict[str, dict] = {}
+    for wid, kind, short, label in OPENCODE_GO_WINDOWS:
+        if wid not in found:
+            continue
+        frac, resets_at = found[wid]
+        entry: dict = {"label": short, "kind_label": label, "used_pct": as_pct(frac * 100.0)}
+        if resets_at:
+            entry["resets_at"] = resets_at
+        measured[kind] = entry
+    if not measured:
+        return row
+    binding = max(measured.items(), key=lambda item: item[1].get("used_pct") or 0.0)[1]
+    row["windows"] = measured
+    row["label"] = binding["kind_label"]
+    row["used_pct"] = binding["used_pct"]
+    if binding.get("resets_at"):
+        row["resets_at"] = binding["resets_at"]
+    return row
+
+
+def _empty_opencode_go(reason: str) -> dict:
+    rec = empty_provider("opencode-go", "unknown", reason)
+    rec["windows"] = [
+        window("weekly", "Weekly", None),
+        window("session", "5 Hour", None),
+        window("monthly", "Monthly", None),
+        window("special", "Hottest account", None),
+    ]
+    rec["account_usage"] = []
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
+
+
+def probe_opencode_go() -> dict:
+    payload, failure = omp_usage_payload("opencode-go")
+    if payload is None:
+        return _empty_opencode_go(failure or "bad_payload")
+
+    raw_reports = payload["reports"]
+    reports = [
+        report
+        for report in raw_reports
+        if isinstance(report, dict) and report.get("provider") == "opencode-go"
+    ]
+    rows = [_opencode_go_report(report) for report in reports]
+    accounts_without_usage = payload.get("accountsWithoutUsage")
+    disabled_credentials = payload.get("disabledCredentials")
+    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
+    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
+    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
+
+    def averaged(kind: str) -> tuple[float | None, int, str | None]:
+        """Mean utilization of one window across the accounts that reported it."""
+        entries = [
+            row["windows"][kind]
+            for row in rows
+            if isinstance(row.get("windows"), dict) and kind in row["windows"]
+        ]
+        pcts = [entry.get("used_pct") for entry in entries if entry.get("used_pct") is not None]
+        if not pcts:
+            return None, 0, None
+        resets = sorted(entry["resets_at"] for entry in entries if entry.get("resets_at"))
+        return as_pct(sum(pcts) / len(pcts)), len(pcts), (resets[0] if resets else None)
+
+    weekly, weekly_accounts, weekly_reset = averaged("weekly")
+    session, session_accounts, session_reset = averaged("session")
+    monthly, monthly_accounts, monthly_reset = averaged("monthly")
+
+    row_pcts = [row.get("used_pct") for row in rows]
+    complete_reports = (
+        bool(rows)
+        and len(raw_reports) == len(rows)
+        and isinstance(accounts_without_usage, list)
+        and missing_count == 0
+        and all(pct is not None for pct in row_pcts)
+        and all(isinstance(row.get("fetched_at"), str) for row in rows)
+    )
+    declared_accounts = _omp_declared_accounts(payload, "opencode-go")
+    under_reported = declared_accounts is not None and len(rows) != declared_accounts
+    complete_coverage = complete_reports and not under_reported
+    hottest = max(row_pcts) if complete_coverage and row_pcts else None
+    hottest_reset = None
+    if hottest is not None:
+        hottest_reset = next(
+            (row.get("resets_at") for row in rows if row.get("used_pct") == hottest and row.get("resets_at")),
+            None,
+        )
+    status = "ok" if weekly is not None else "unknown"
+    windows = [
+        window(
+            "weekly",
+            f"{weekly_accounts}-account weekly" if weekly_accounts else "Weekly",
+            weekly,
+            weekly_reset,
+        ),
+        window(
+            "session",
+            f"{session_accounts}-account 5 Hour" if session_accounts else "5 Hour",
+            session,
+            session_reset,
+        ),
+        window(
+            "monthly",
+            f"{monthly_accounts}-account monthly" if monthly_accounts else "Monthly",
+            monthly,
+            monthly_reset,
+        ),
+        window("special", "Hottest account", hottest, hottest_reset),
+    ]
+    rec = {
+        "id": "opencode-go",
+        "name": "OpenCode Go",
+        "logo": "O",
+        "status": status,
+        "windows": windows,
+        "account_usage": rows,
+        "snapshot": {
+            "reports": len(rows),
+            "accounts_without_usage": missing_count,
+            "disabled_credentials": disabled_count,
+        },
+    }
+    timestamps = [row.get("fetched_at") for row in rows]
+    if complete_reports and all(isinstance(stamp, str) for stamp in timestamps):
+        rec["measured_at"] = min(timestamps)
+    if status != "ok":
+        rec["reason"] = "no_used_pct"
+    elif not complete_coverage or disabled_count > 0 or not lists_valid:
+        rec["reason"] = "partial_usage"
+    return rec
 
 
 # --- Grok --------------------------------------------------------------------
@@ -2665,7 +2917,7 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None, pri
         lines.append(f"API would have cost {format_usd(amount)}")
     lines.append("OAuth incremental $0")
     lines.append("")
-    lines.append("h/l or 1-6 switch · r refresh · q quit")
+    lines.append("h/l or 1-7 switch · r refresh · q quit")
     return "\n".join(lines) + "\n"
 
 
@@ -2725,7 +2977,7 @@ def _tui_loop(stdscr) -> int:
             cmd_cycle("prev")
             poke_waybar()
             continue
-        if isinstance(ch, str) and ch in "123456":
+        if isinstance(ch, str) and ch in "1234567":
             cmd_select(ids[int(ch) - 1])
             continue
         if ch == curses.KEY_RESIZE:
@@ -2753,6 +3005,7 @@ PROBERS = {
     "kimi": probe_kimi,
     "cursor": probe_cursor,
     "devin": probe_devin,
+    "opencode-go": probe_opencode_go,
 }
 
 
@@ -2855,6 +3108,46 @@ def _timestamp_age_sec(stamp) -> float | None:
     return max(0.0, time.time() - parsed.timestamp())
 
 
+def usage_row_line(index: int, row: dict) -> str:
+    """One stored-snapshot line for the chip tooltip.
+
+    Providers that can name a row (OpenCode Go's binding window) add that name
+    and every window the row measured; providers that cannot (Token Plan's
+    anonymous credit reports) render exactly as before.
+    """
+    bit = f"snapshot {index}: {_pct_label(row.get('used_pct'))}"
+    label = str(row.get("label") or "").strip()
+    if label:
+        bit += f" · {label}"
+    measured = row.get("windows") if isinstance(row.get("windows"), dict) else {}
+    for entry in measured.values():
+        if isinstance(entry, dict):
+            bit += f" · {entry.get('label') or entry.get('kind_label') or '?'} {_pct_label(entry.get('used_pct'))}"
+    fetched_at = row.get("fetched_at")
+    fetched_age = _timestamp_age_sec(fetched_at)
+    fetched_text = str(fetched_at) if fetched_age is not None else "unknown"
+    if fetched_age is not None:
+        fetched_text += f" ({int(fetched_age)}s ago)"
+    bit += f" · fetched: {fetched_text}"
+    remaining = _token_plan_number(row.get("credits_remaining"))
+    total = _token_plan_number(row.get("credits_total"))
+    if remaining is not None and total is not None:
+        bit += f" · {_credits_label(remaining)}/{_credits_label(total)} credits"
+    if row.get("resets_at"):
+        bit += f" · reset {row['resets_at']}"
+    return bit
+
+
+def coverage_line(snapshot: dict) -> str:
+    """Report coverage, so a partial snapshot never reads as a full fleet."""
+    return (
+        "snapshot coverage: "
+        f"{snapshot.get('reports', 0)} reports · "
+        f"{snapshot.get('accounts_without_usage', 0)} without usage · "
+        f"{snapshot.get('disabled_credentials', 0)} disabled"
+    )
+
+
 def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
     weekly = window_by_kind(rec, "weekly") or {}
     hottest = window_by_kind(rec, "special") or {}
@@ -2908,30 +3201,12 @@ def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
     lines.append(hottest_line)
 
     for index, item in enumerate(account_usage, 1):
-        if not isinstance(item, dict):
-            continue
-        fetched_at = item.get("fetched_at")
-        fetched_age = _timestamp_age_sec(fetched_at)
-        fetched_text = str(fetched_at) if fetched_age is not None else "unknown"
-        if fetched_age is not None:
-            fetched_text += f" ({int(fetched_age)}s ago)"
-        bit = f"snapshot {index}: {_pct_label(item.get('used_pct'))} · fetched: {fetched_text}"
-        row_remaining = _token_plan_number(item.get("credits_remaining"))
-        row_total = _token_plan_number(item.get("credits_total"))
-        if row_remaining is not None and row_total is not None:
-            bit += f" · {_credits_label(row_remaining)}/{_credits_label(row_total)} credits"
-        if item.get("resets_at"):
-            bit += f" · reset {item['resets_at']}"
-        lines.append(bit)
+        if isinstance(item, dict):
+            lines.append(usage_row_line(index, item))
 
     snapshot = rec.get("snapshot")
     if isinstance(snapshot, dict):
-        lines.append(
-            "snapshot coverage: "
-            f"{snapshot.get('reports', 0)} reports · "
-            f"{snapshot.get('accounts_without_usage', 0)} without usage · "
-            f"{snapshot.get('disabled_credentials', 0)} disabled"
-        )
+        lines.append(coverage_line(snapshot))
     return {
         "text": text,
         "tooltip": pango_escape("\n".join(lines)),
@@ -3007,6 +3282,12 @@ def cmd_waybar() -> int:
         if burst.get("resets_at"):
             bit += f"  reset {burst['resets_at']}"
         lines.append(bit)
+    for index, item in enumerate(rec.get("account_usage") or [], 1):
+        if isinstance(item, dict):
+            lines.append(usage_row_line(index, item))
+    snapshot = rec.get("snapshot")
+    if isinstance(snapshot, dict):
+        lines.append(coverage_line(snapshot))
     if age is not None:
         lines.append(f"cache {int(age)}s ago")
     payload = {
@@ -3038,6 +3319,7 @@ def cmd_cycle(direction: str) -> int:
     path = cache_path()
     if path.exists():
         atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+    poke_waybar()
     print(nxt)
     return 0
 
@@ -3107,6 +3389,7 @@ def cmd_identity(direction: str) -> int:
         path = cache_path()
         if path.exists():
             atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+        poke_waybar()
         print((rec.get("identity") or {}).get("id") or "?")
         return 0
     if selected == "cursor":
@@ -3140,6 +3423,7 @@ def cmd_identity(direction: str) -> int:
         path = cache_path()
         if path.exists():
             atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+        poke_waybar()
         print((rec.get("identity") or {}).get("id") or "?")
         return 0
     print(f"{selected}: no identity cycle configured")

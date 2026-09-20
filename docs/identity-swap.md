@@ -52,6 +52,19 @@ JWT in memory until they restart.
 
 Never put tokens in this repo or in Waybar JSON. Never `op` on click.
 
+## OpenCode Go (no cycle — by design)
+
+OpenCode Go has no live auth file to flip: the keys live only in OMP's auth
+store and OMP rotates them per request. All accounts are already metered on
+every probe, so the chip needs no `active` pointer and right-click prints
+`opencode-go: no identity cycle configured`.
+
+Quota metering reads `omp usage --provider opencode-go --json` and reports each
+stored key's rolling 5-hour, weekly, and monthly windows: an `N-account`
+average per window plus the single hottest account. Monthly windows reset on
+each subscription's anniversary, so they do not line up across accounts — that
+is why the hottest-account slot exists instead of trusting the average.
+
 ## OAuth / extra API keys (outline only)
 
 Codex / Grok / Kimi still have one OAuth each on this host, so identity
@@ -80,6 +93,7 @@ the Token Plan / Cursor shape. Do not invent a plugin framework.
 | Kimi | `~/.kimi-code/credentials/*.json` (one file) | no (`moonshotai` in config.toml is API, not a second OAuth) |
 | Cursor | `~/.config/cursor/auth.json` | **yes** — `cursor-oauth-swap` parks copies under `~/.config/cursor-oauth/identities/` |
 | Token Plan | `keys/$active` + `~/.bailian/config.json` | **yes** — `team` / `gmail` / `infnet` |
+| OpenCode Go | OMP auth store only (keys rotate per request) | no — one store, many accounts, nothing for the chip to flip |
 
 Never `op` on right-click. Never print tokens. Never rewrite
 `~/.local/share/omarchy/`.

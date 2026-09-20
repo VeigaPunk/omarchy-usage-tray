@@ -1,4 +1,5 @@
-// Snippet only — deploy/install.sh writes absolute paths for your prefix.
+// Snippet only — deploy/install.sh writes the installed symlink path
+// (~/.local/bin/ai-usage) for every command below.
 "custom/ai-usage": {
     "exec": "ai-usage waybar",
     "return-type": "json",
@@ -8,8 +9,8 @@
     "escape": false,
     "exec-on-event": false,
     "format": "{}",
-    "on-scroll-up": "ai-usage cycle next; pkill -x -RTMIN+11 waybar",
-    "on-scroll-down": "ai-usage cycle prev; pkill -x -RTMIN+11 waybar",
-    "on-click": "ai-usage cycle next; pkill -x -RTMIN+11 waybar",
-    "on-click-right": "ai-usage identity next; pkill -x -RTMIN+11 waybar"
+    "on-scroll-up": "ai-usage cycle next",
+    "on-scroll-down": "ai-usage cycle prev",
+    "on-click": "ai-usage cycle next",
+    "on-click-right": "ai-usage identity next"
 }

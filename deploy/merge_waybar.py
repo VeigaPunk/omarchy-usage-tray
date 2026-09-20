@@ -61,7 +61,17 @@ def load_jsonc(path: Path) -> dict:
     return data
 
 
-def pick_signal(raw: str) -> int:
+def pick_signal(data: dict, raw: str) -> int:
+    """Signal for custom/ai-usage.
+
+    Reuse the module's current slot so re-installs do not churn the number the
+    CLI pokes; otherwise take the first free one from 11.
+    """
+    current = data.get("custom/ai-usage")
+    if isinstance(current, dict):
+        sig = current.get("signal")
+        if isinstance(sig, int) and not isinstance(sig, bool) and 11 <= sig < 31:
+            return sig
     taken = {int(x) for x in re.findall(r'"signal"\s*:\s*(\d+)', raw)}
     sig = 11
     while sig in taken and sig < 31:
@@ -86,7 +96,7 @@ def main() -> int:
             mods.insert(mods.index("group/tray-expander") + 1, "custom/ai-usage")
         else:
             mods.append("custom/ai-usage")
-    sig = pick_signal(raw)
+    sig = pick_signal(data, raw)
     data["custom/ai-usage"] = {
         "exec": f"{bin_path} waybar",
         "return-type": "json",
@@ -96,10 +106,12 @@ def main() -> int:
         "escape": False,
         "exec-on-event": False,
         "format": "{}",
-        "on-scroll-up": f"{bin_path} cycle next; pkill -x -RTMIN+{sig} waybar",
-        "on-scroll-down": f"{bin_path} cycle prev; pkill -x -RTMIN+{sig} waybar",
-        "on-click": f"{bin_path} cycle next; pkill -x -RTMIN+{sig} waybar",
-        "on-click-right": f"{bin_path} identity next; pkill -x -RTMIN+{sig} waybar",
+        # cycle/identity poke Waybar themselves: `pkill -RTMIN+N` is not a
+        # signal procps-ng accepts, so the shell form never refreshed the chip.
+        "on-scroll-up": f"{bin_path} cycle next",
+        "on-scroll-down": f"{bin_path} cycle prev",
+        "on-click": f"{bin_path} cycle next",
+        "on-click-right": f"{bin_path} identity next",
     }
     cfg_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     snippet = css_src.read_text(encoding="utf-8").strip()
