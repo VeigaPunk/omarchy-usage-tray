@@ -27,6 +27,9 @@ import tomllib
 # Cache schema. 2 replaced the Token Plan `capacity` block with credit totals
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
+# User-facing release. Adding a provider record (OpenCode Go) leaves existing
+# cache rows valid, so the schema stays put and only this number moves.
+TOOL_VERSION = "1.0.0"
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
@@ -3483,6 +3486,7 @@ def cmd_validate() -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ai-usage", description="AI CLI usage chip for Waybar")
+    p.add_argument("--version", action="version", version=f"ai-usage {TOOL_VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
     probe = sub.add_parser("probe", help="fetch provider windows into cache")
     probe.add_argument("id", nargs="?", help="provider id (default: all)")

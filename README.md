@@ -1,8 +1,43 @@
 # omarchy-usage-tray
 
-Waybar chip for Omarchy: Codex, Grok, Kimi, Cursor, Devin, OpenCode Go, and
-Alibaba Token Plan usage. Left-click or scroll to cycle providers; right-click
-cycles identities for the selected provider when supported.
+Waybar chip for Omarchy: Codex, Token Plan, Grok, Kimi, Cursor, Devin, and
+OpenCode Go usage. Left-click or scroll to cycle providers; right-click cycles
+identities for the selected provider when supported.
+
+Current release: **1.0.0** (`ai-usage --version`).
+
+## Providers
+
+Every provider below is metered on every probe, from the source listed, and the
+chip renders whichever one is selected.
+
+| Logo | Provider | Windows the chip shows | Source |
+|---|---|---|---|
+| `C` | Codex | Weekly, plus Spark when the account reports it | `codex` app-server JSON-RPC |
+| `T` | Token Plan | Per-account credits across the fleet, hottest account, add-on packs | `omp usage --provider alibaba-token-plan --json` |
+| `G` | Grok | Weekly | `grok` CLI billing RPC |
+| `K` | Kimi | Weekly, 5-hour | Kimi `/usages` |
+| `R` | Cursor | Weekly, Auto, on-demand balance when reported | `cursor.com` usage + parked OAuth sessions |
+| `D` | Devin | Weekly quota, plan cycle | CLI `GetUserStatus` session |
+| `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
+
+Missing data is never invented: a window the provider did not answer renders as
+`—`, and a provider that cannot be reached keeps its last good meters and shows
+the bounded reason instead.
+
+### Token Plan add-on credits
+
+Token Plan meters the weekly plan window and purchased add-on bundles (Credit
+Pack, $15) as separate pools. The chip supports both: when a report carries a
+`credits:addon` window, that account's row is `weekly + packs`, the tooltip
+prints `x/y credits` per snapshot, and an account whose plan reads 100% while a
+pack still holds credits shows its real headroom instead of a false zero.
+
+Pool sizes are declared rather than scraped — the console usage RPC answers
+percentages only (verified 2026-09-20 on every stored credential) — so override
+them per tier with `AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS` and
+`AI_USAGE_TOKEN_PLAN_ADDON_CREDITS` (both **per account**). OMP emits only the
+7-day window today, so the add-on path stays dormant until it reports one.
 
 ## Install
 
@@ -19,10 +54,7 @@ Re-run the same line to update.
   (not at the checkout), so the chip survives moving the repo
 - Enables a user systemd timer (5 minutes); machine-local probe knobs live in
   `~/.config/ai-usage/env`, which the installer never overwrites
-- Reads Alibaba Token Plan quota through `omp usage --provider alibaba-token-plan --json`
-- Reads OpenCode Go usage through `omp usage --provider opencode-go --json`
-  (rolling 5-hour, weekly, and monthly windows across every stored key)
-- Reads Devin quota through the CLI's own `GetUserStatus` session (`~/.local/share/devin/credentials.toml`)
+- Reads each provider from the source listed under [Providers](#providers)
 - Floats the TUI on Hyprland like other Omarchy TUIs
 
 ## Clicks
@@ -52,16 +84,8 @@ rotates those keys per request.
 Token Plan's compact bars show the average utilization across OMP-metered
 credentials and the hottest reported snapshot, followed by remaining/total
 credits. `T @<slot>` is the active execution route, not the owner of either
-meter.
-
-Token Plan is metered in credits, not percentages: the `pro` subscription is
-40,000 credits/week **per account** and each purchased add-on bundle (Credit
-Pack, $15) is 20,000 for the account that owns it. OMP reports the plan window
-and the add-on pool separately, and the chip sums the rows, so an account whose
-plan reads 100% while a Credit Pack still holds credits shows its real headroom
-instead of a false zero. Override the pool sizes for another tier with
-`AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS` and `AI_USAGE_TOKEN_PLAN_ADDON_CREDITS`
-(per account).
+meter. See [Token Plan add-on credits](#token-plan-add-on-credits) for the
+credit model.
 
 Token Plan right-click runs `token-plan-swap toggle`. That helper cycles the
 slots in `~/.config/alibaba-token-plan/slots` and rewrites
