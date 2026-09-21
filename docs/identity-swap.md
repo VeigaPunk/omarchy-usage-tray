@@ -65,6 +65,13 @@ average per window plus the single hottest account. Monthly windows reset on
 each subscription's anniversary, so they do not line up across accounts — that
 is why the hottest-account slot exists instead of trusting the average.
 
+## Charm Hyper (no cycle — by design)
+
+Charm Hyper's credential lives in OMP's auth store (`CHARM_HYPER_API_KEY`), and
+the credits endpoint answers per credential with no local file behind it, so
+right-click prints `charm-hyper: no identity cycle configured`. Every stored
+credential is metered on every probe and the chip sums their balances.
+
 ## OAuth / extra API keys (outline only)
 
 Codex / Grok / Kimi still have one OAuth each on this host, so identity
@@ -94,6 +101,7 @@ the Token Plan / Cursor shape. Do not invent a plugin framework.
 | Cursor | `~/.config/cursor/auth.json` | **yes** — `cursor-oauth-swap` parks copies under `~/.config/cursor-oauth/identities/` |
 | Token Plan | `keys/$active` + `~/.bailian/config.json` | **yes** — `team` / `gmail` / `infnet` |
 | OpenCode Go | OMP auth store only (keys rotate per request) | no — one store, many accounts, nothing for the chip to flip |
+| Charm Hyper | OMP auth store only (`CHARM_HYPER_API_KEY`) | no — no local file for the chip to flip |
 
 Never `op` on right-click. Never print tokens. Never rewrite
 `~/.local/share/omarchy/`.

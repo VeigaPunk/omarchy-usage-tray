@@ -27,9 +27,10 @@ import tomllib
 # Cache schema. 2 replaced the Token Plan `capacity` block with credit totals
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
-# User-facing release. Adding a provider record (OpenCode Go) leaves existing
-# cache rows valid, so the schema stays put and only this number moves.
-TOOL_VERSION = "1.0.0"
+# User-facing release. Adding a provider record (OpenCode Go, Charm Hyper)
+# leaves existing cache rows valid, so the schema stays put and only this
+# number moves.
+TOOL_VERSION = "1.1.0"
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
@@ -52,6 +53,7 @@ PROVIDERS = (
     ("cursor", "Cursor", "R"),
     ("devin", "Devin", "D"),
     ("opencode-go", "OpenCode Go", "O"),
+    ("charm-hyper", "Charm Hyper", "H"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -357,6 +359,18 @@ def grok_bin() -> str | None:
     return which("grok")
 
 
+def _has_meter(rec: dict) -> bool:
+    """Is this record worth retaining across a failed probe?
+
+    Percent windows are the common case; Charm Hyper's prepaid balance has no
+    ceiling to meter, so an observed credit count is a meter too.
+    """
+    if any("used_pct" in w for w in rec.get("windows") or [] if isinstance(w, dict)):
+        return True
+    credits = rec.get("credits")
+    return isinstance(credits, dict) and credits.get("remaining") is not None
+
+
 def keep_last_good(old: dict | None, new: dict) -> dict:
     if new.get("status") == "ok":
         return new
@@ -364,7 +378,7 @@ def keep_last_good(old: dict | None, new: dict) -> dict:
         return new
     if not old or old.get("status") != "ok":
         return new
-    if not any("used_pct" in w for w in old.get("windows") or [] if isinstance(w, dict)):
+    if not _has_meter(old):
         return new
     kept = dict(old)
     if new.get("reason"):
@@ -1222,6 +1236,117 @@ def probe_opencode_go() -> dict:
     if status != "ok":
         rec["reason"] = "no_used_pct"
     elif not complete_coverage or disabled_count > 0 or not lists_valid:
+        rec["reason"] = "partial_usage"
+    return rec
+
+
+# --- Charm Hyper -------------------------------------------------------------
+
+# Charm Hyper prepays credits: OMP's credits endpoint answers a balance, not a
+# usage window, so the record carries credits and no percentage — there is no
+# ceiling to meter against. A partially answered fleet is withheld instead of
+# summed, because an understated balance would raise a false low-credit alarm.
+CHARM_HYPER_LIMIT_ID = "charm-hyper:credits"
+
+
+def _charm_hyper_report(report: dict) -> dict:
+    """One credential's balance, as answered. No account identity is exposed."""
+    row: dict = {}
+    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
+    if fetched_at:
+        row["fetched_at"] = fetched_at
+    limits = report.get("limits")
+    if not isinstance(limits, list):
+        return row
+    for limit in limits:
+        if not isinstance(limit, dict) or limit.get("id") != CHARM_HYPER_LIMIT_ID:
+            continue
+        amount = limit.get("amount")
+        remaining = _token_plan_number(amount.get("remaining")) if isinstance(amount, dict) else None
+        if remaining is not None:
+            row["remaining_credits"] = remaining
+    return row
+
+
+def _charm_hyper_low_credits() -> float | None:
+    """Optional warn floor. Unset means only an exhausted balance turns red."""
+    raw = os.environ.get("AI_USAGE_CHARM_HYPER_LOW_CREDITS")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        return None
+    return value
+
+
+def _empty_charm_hyper(reason: str) -> dict:
+    rec = empty_provider("charm-hyper", "unknown", reason)
+    rec["windows"] = [window("credits", "Credit balance", None)]
+    rec["account_usage"] = []
+    rec["credits"] = {}
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
+
+
+def probe_charm_hyper() -> dict:
+    payload, failure = omp_usage_payload("charm-hyper")
+    if payload is None:
+        return _empty_charm_hyper(failure or "bad_payload")
+
+    raw_reports = payload["reports"]
+    reports = [
+        report
+        for report in raw_reports
+        if isinstance(report, dict) and report.get("provider") == "charm-hyper"
+    ]
+    rows = [_charm_hyper_report(report) for report in reports]
+    accounts_without_usage = payload.get("accountsWithoutUsage")
+    disabled_credentials = payload.get("disabledCredentials")
+    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
+    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
+    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
+
+    balances = [row.get("remaining_credits") for row in rows]
+    answered = [balance for balance in balances if balance is not None]
+    complete = bool(rows) and len(answered) == len(rows)
+    declared_accounts = _omp_declared_accounts(payload, "charm-hyper")
+    under_reported = declared_accounts is not None and len(rows) != declared_accounts
+    credits: dict = {}
+    if complete:
+        remaining = sum(float(balance) for balance in answered)
+        credits["remaining"] = int(remaining) if remaining.is_integer() else round(remaining, 2)
+    timestamps = [row.get("fetched_at") for row in rows]
+    timestamps_complete = bool(timestamps) and all(isinstance(stamp, str) for stamp in timestamps)
+    status = "ok" if credits else "unknown"
+    rec = {
+        "id": "charm-hyper",
+        "name": "Charm Hyper",
+        "logo": "H",
+        "status": status,
+        "windows": [
+            window(
+                "credits",
+                "Credit balance",
+                None,
+                extra={"remaining_credits": credits["remaining"]} if credits else None,
+            )
+        ],
+        "account_usage": rows,
+        "credits": credits,
+        "snapshot": {
+            "reports": len(rows),
+            "accounts_without_usage": missing_count,
+            "disabled_credentials": disabled_count,
+        },
+    }
+    if complete and timestamps_complete and not under_reported:
+        rec["measured_at"] = min(timestamps)
+    if status != "ok":
+        rec["reason"] = "partial_balance" if answered else "no_balance"
+    elif not lists_valid or disabled_count > 0 or not timestamps_complete or under_reported:
         rec["reason"] = "partial_usage"
     return rec
 
@@ -2856,6 +2981,14 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None, pri
         for w in limit_rows:
             label = str(w.get("label") or w.get("kind") or "Limit")
             pct = w.get("used_pct") if "used_pct" in w else None
+            extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
+            balance = _token_plan_number(extra_bits.get("remaining_credits")) if pct is None else None
+            if balance is not None:
+                # A prepaid balance has no ceiling, so the number is the meter.
+                lines.append(f"{label:<28} {_credits_label(balance):>4} cr")
+                lines.append("prepaid credits · no reset window")
+                lines.append("")
+                continue
             lines.append(f"{label:<28} {_pct_label(pct):>4}")
             lines.append(tui_meter(pct))
             reset = format_reset_in(w.get("resets_at"))
@@ -2920,7 +3053,7 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None, pri
         lines.append(f"API would have cost {format_usd(amount)}")
     lines.append("OAuth incremental $0")
     lines.append("")
-    lines.append("h/l or 1-7 switch · r refresh · q quit")
+    lines.append("h/l or 1-8 switch · r refresh · q quit")
     return "\n".join(lines) + "\n"
 
 
@@ -2980,7 +3113,7 @@ def _tui_loop(stdscr) -> int:
             cmd_cycle("prev")
             poke_waybar()
             continue
-        if isinstance(ch, str) and ch in "1234567":
+        if isinstance(ch, str) and ch in "12345678":
             cmd_select(ids[int(ch) - 1])
             continue
         if ch == curses.KEY_RESIZE:
@@ -3009,6 +3142,7 @@ PROBERS = {
     "cursor": probe_cursor,
     "devin": probe_devin,
     "opencode-go": probe_opencode_go,
+    "charm-hyper": probe_charm_hyper,
 }
 
 
@@ -3030,6 +3164,10 @@ def summarize(rec: dict) -> str:
     for w in rec.get("windows") or []:
         if isinstance(w, dict) and "used_pct" in w:
             bits.append(f"{w.get('kind')}={w['used_pct']}")
+    credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
+    remaining = _token_plan_number(credits.get("remaining"))
+    if remaining is not None:
+        bits.append(f"credits={_credits_label(remaining)}")
     return " ".join(bits)
 
 
@@ -3218,6 +3356,62 @@ def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
     }
 
 
+def _charm_hyper_waybar_payload(rec: dict, logo: str) -> dict:
+    """Counter, not a meter: a prepaid balance has no ceiling to fill."""
+    credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
+    remaining = _token_plan_number(credits.get("remaining"))
+    counter = f"{_credits_label(remaining)}cr" if remaining is not None else "—"
+    text = f"{pango_escape(logo)} {pango_escape(counter)}"
+    measured_at = rec.get("measured_at")
+    measured_age = _timestamp_age_sec(measured_at)
+    classes = [str(rec.get("status") or "unknown")]
+    if measured_age is not None and measured_age > STALE_AFTER_SEC:
+        classes.append("stale")
+    floor = _charm_hyper_low_credits()
+    if remaining is not None and remaining <= 0:
+        classes.append("critical")
+    elif remaining is not None and floor is not None and remaining <= floor:
+        classes.append("warn")
+
+    lines = [str(rec.get("name") or "Charm Hyper")]
+    if rec.get("reason"):
+        lines.append(str(rec["reason"]))
+    if rec.get("last_error"):
+        lines.append("last error: " + str(rec["last_error"]))
+    if remaining is None:
+        lines.append("credits: —")
+    else:
+        kept = " (last good)" if rec.get("last_error") and rec.get("status") == "ok" else ""
+        lines.append(f"credits: {_credits_label(remaining)} left{kept}")
+    if isinstance(measured_at, str) and measured_at:
+        stamp = measured_at
+        if measured_age is not None:
+            stamp += f" ({int(measured_age)}s ago)"
+        lines.append(f"measured: {stamp}")
+    if floor is not None:
+        lines.append(f"warn below {_credits_label(floor)} credits")
+    for index, row in enumerate(rec.get("account_usage") or [], 1):
+        if not isinstance(row, dict):
+            continue
+        bit = f"snapshot {index}: {_credits_label(row.get('remaining_credits'))} credits"
+        fetched_at = row.get("fetched_at")
+        fetched_age = _timestamp_age_sec(fetched_at)
+        fetched_text = str(fetched_at) if fetched_age is not None else "unknown"
+        if fetched_age is not None:
+            fetched_text += f" ({int(fetched_age)}s ago)"
+        bit += f" · fetched: {fetched_text}"
+        lines.append(bit)
+    snapshot = rec.get("snapshot")
+    if isinstance(snapshot, dict):
+        lines.append(coverage_line(snapshot))
+    return {
+        "text": text,
+        "tooltip": pango_escape("\n".join(lines)),
+        "class": " ".join(classes),
+        "alt": "charm-hyper",
+    }
+
+
 def cmd_waybar() -> int:
     cache = load_cache()
     pid = pick_selected(cache)
@@ -3234,6 +3428,10 @@ def cmd_waybar() -> int:
     ident_id = str(ident.get("id") or ident.get("label") or "").strip()
     if pid == "token-plan":
         payload = _token_plan_waybar_payload(rec, logo, ident_id)
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        return 0
+    if pid == "charm-hyper":
+        payload = _charm_hyper_waybar_payload(rec, logo)
         sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
         return 0
     mark = f"{logo} {ident_id}" if ident_id else logo
@@ -3478,6 +3676,10 @@ def cmd_validate() -> int:
         for w in rec.get("windows") or []:
             if isinstance(w, dict) and "used_pct" in w:
                 line += f" {w.get('kind')}={w['used_pct']}"
+        credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
+        remaining = _token_plan_number(credits.get("remaining"))
+        if remaining is not None:
+            line += f" credits={_credits_label(remaining)}"
         notes.append(line)
     print("\n".join(notes))
     print("VALID" if ok else "INVALID")

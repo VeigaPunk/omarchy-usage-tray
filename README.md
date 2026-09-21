@@ -1,10 +1,10 @@
 # omarchy-usage-tray
 
-Waybar chip for Omarchy: Codex, Token Plan, Grok, Kimi, Cursor, Devin, and
-OpenCode Go usage. Left-click or scroll to cycle providers; right-click cycles
-identities for the selected provider when supported.
+Waybar chip for Omarchy: Codex, Token Plan, Charm Hyper, Grok, Kimi, Cursor,
+Devin, and OpenCode Go usage. Left-click or scroll to cycle providers;
+right-click cycles identities for the selected provider when supported.
 
-Current release: **1.0.0** (`ai-usage --version`).
+Current release: **1.1.0** (`ai-usage --version`).
 
 ## Providers
 
@@ -20,6 +20,7 @@ chip renders whichever one is selected.
 | `R` | Cursor | Weekly, Auto, on-demand balance when reported | `cursor.com` usage + parked OAuth sessions |
 | `D` | Devin | Weekly quota, plan cycle | CLI `GetUserStatus` session |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
+| `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
 
 Missing data is never invented: a window the provider did not answer renders as
 `—`, and a provider that cannot be reached keeps its last good meters and shows
@@ -38,6 +39,20 @@ percentages only (verified 2026-09-20 on every stored credential) — so overrid
 them per tier with `AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS` and
 `AI_USAGE_TOKEN_PLAN_ADDON_CREDITS` (both **per account**). OMP emits only the
 7-day window today, so the add-on path stays dormant until it reports one.
+
+### Charm Hyper credits
+
+Charm Hyper is prepaid, and OMP answers with a balance rather than a
+percentage: the endpoint reports how many credits are left and there is no
+window to fill. The chip therefore renders a counter (`H 238cr`) and no bar.
+Balances from every stored credential are added up; if one credential answers
+nothing, the total is withheld instead of understated, and the chip keeps the
+last good count alongside the bounded reason. A retained count is labelled
+`last good` in the tooltip.
+
+`AI_USAGE_CHARM_HYPER_LOW_CREDITS` (in credits, compared against the reported
+total) turns the chip red below a floor; zero credits is always critical. Left
+unset, only an exhausted balance alarms.
 
 ## Install
 
@@ -94,8 +109,9 @@ slots in `~/.config/alibaba-token-plan/slots` and rewrites
 meters; 1Password is only used by `token-plan-swap pull`.
 
 Cursor dual-OAuth uses `cursor-oauth-swap` (same Token Plan shape). Codex /
-Grok / Kimi / OpenCode Go stay no-ops until a second store exists — OpenCode Go
-keys rotate inside OMP, so there is no live file for the chip to flip. See
+Grok / Kimi / OpenCode Go / Charm Hyper stay no-ops until a second store exists
+— OpenCode Go keys rotate inside OMP, and Charm Hyper's credential lives in
+OMP's auth store, so neither has a live file for the chip to flip. See
 [`docs/identity-swap.md`](docs/identity-swap.md).
 
 ## Configuration
@@ -107,6 +123,7 @@ service environment for the 5-minute probe:
 #AI_USAGE_OMP_BIN=/home/you/.local/bin/omp
 #AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS=40000
 #AI_USAGE_TOKEN_PLAN_ADDON_CREDITS=20000
+#AI_USAGE_CHARM_HYPER_LOW_CREDITS=25
 ```
 
 Values are literal — systemd expands nothing inside the file. The same
