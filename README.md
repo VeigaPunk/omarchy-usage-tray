@@ -1,10 +1,10 @@
 # omarchy-usage-tray
 
 Waybar chip for Omarchy: Codex, Token Plan, Charm Hyper, Grok, Kimi, Cursor,
-Devin, and OpenCode Go usage. Left-click or scroll to cycle providers;
+Devin, OpenCode Go, and Z.ai usage. Left-click or scroll to cycle providers;
 right-click cycles identities for the selected provider when supported.
 
-Current release: **1.1.0** (`ai-usage --version`).
+Current release: **1.2.0** (`ai-usage --version`).
 
 ## Providers
 
@@ -21,6 +21,7 @@ chip renders whichever one is selected.
 | `D` | Devin | Weekly quota, plan cycle | CLI `GetUserStatus` session |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
 | `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
+| `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
 
 Missing data is never invented: a window the provider did not answer renders as
 `—`, and a provider that cannot be reached keeps its last good meters and shows
@@ -109,9 +110,9 @@ slots in `~/.config/alibaba-token-plan/slots` and rewrites
 meters; 1Password is only used by `token-plan-swap pull`.
 
 Cursor dual-OAuth uses `cursor-oauth-swap` (same Token Plan shape). Codex /
-Grok / Kimi / OpenCode Go / Charm Hyper stay no-ops until a second store exists
-— OpenCode Go keys rotate inside OMP, and Charm Hyper's credential lives in
-OMP's auth store, so neither has a live file for the chip to flip. See
+Grok / Kimi / OpenCode Go / Charm Hyper / Z.ai stay no-ops until a second store
+exists — OpenCode Go keys rotate inside OMP, and Charm Hyper's credential lives
+in OMP's auth store, so neither has a live file for the chip to flip. See
 [`docs/identity-swap.md`](docs/identity-swap.md).
 
 ## Configuration

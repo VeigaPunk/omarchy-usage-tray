@@ -30,7 +30,7 @@ VERSION = 2
 # User-facing release. Adding a provider record (OpenCode Go, Charm Hyper)
 # leaves existing cache rows valid, so the schema stays put and only this
 # number moves.
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
@@ -54,6 +54,7 @@ PROVIDERS = (
     ("devin", "Devin", "D"),
     ("opencode-go", "OpenCode Go", "O"),
     ("charm-hyper", "Charm Hyper", "H"),
+    ("zai", "Z.ai", "Z"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -1053,6 +1054,20 @@ def _omp_declared_accounts(payload: dict, provider: str, window_id: str | None =
     return None
 
 
+def _omp_window_average(rows: list[dict], kind: str) -> tuple[float | None, int, str | None]:
+    """Mean utilization of one window across the accounts that reported it."""
+    entries = [
+        row["windows"][kind]
+        for row in rows
+        if isinstance(row.get("windows"), dict) and kind in row["windows"]
+    ]
+    pcts = [entry.get("used_pct") for entry in entries if entry.get("used_pct") is not None]
+    if not pcts:
+        return None, 0, None
+    resets = sorted(entry["resets_at"] for entry in entries if entry.get("resets_at"))
+    return as_pct(sum(pcts) / len(pcts)), len(pcts), (resets[0] if resets else None)
+
+
 # --- OpenCode Go -------------------------------------------------------------
 
 # OMP window id -> (kind, short label, long label). Monthly anchors on the
@@ -1159,22 +1174,9 @@ def probe_opencode_go() -> dict:
     missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
     disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
 
-    def averaged(kind: str) -> tuple[float | None, int, str | None]:
-        """Mean utilization of one window across the accounts that reported it."""
-        entries = [
-            row["windows"][kind]
-            for row in rows
-            if isinstance(row.get("windows"), dict) and kind in row["windows"]
-        ]
-        pcts = [entry.get("used_pct") for entry in entries if entry.get("used_pct") is not None]
-        if not pcts:
-            return None, 0, None
-        resets = sorted(entry["resets_at"] for entry in entries if entry.get("resets_at"))
-        return as_pct(sum(pcts) / len(pcts)), len(pcts), (resets[0] if resets else None)
-
-    weekly, weekly_accounts, weekly_reset = averaged("weekly")
-    session, session_accounts, session_reset = averaged("session")
-    monthly, monthly_accounts, monthly_reset = averaged("monthly")
+    weekly, weekly_accounts, weekly_reset = _omp_window_average(rows, "weekly")
+    session, session_accounts, session_reset = _omp_window_average(rows, "session")
+    monthly, monthly_accounts, monthly_reset = _omp_window_average(rows, "monthly")
 
     row_pcts = [row.get("used_pct") for row in rows]
     complete_reports = (
@@ -1347,6 +1349,149 @@ def probe_charm_hyper() -> dict:
     if status != "ok":
         rec["reason"] = "partial_balance" if answered else "no_balance"
     elif not lists_valid or disabled_count > 0 or not timestamps_complete or under_reported:
+        rec["reason"] = "partial_usage"
+    return rec
+
+
+# --- Z.ai ---------------------------------------------------------------------
+
+# Z.ai coding plan: OMP meters two credit pools per credential — a rolling 5
+# hour quota and the weekly quota — each answered as usedFraction plus an
+# absolute credit amount. Only the fraction is kept: the two pools are separate
+# ceilings, so a single credit counter on the chip would be ambiguous.
+ZAI_WINDOWS = (
+    ("zai:credits:5h", "session", "5h", "5 Hour limit"),
+    ("zai:credits:1w", "weekly", "7d", "Weekly limit"),
+)
+ZAI_KINDS = {wid: (kind, short, label) for wid, kind, short, label in ZAI_WINDOWS}
+
+
+def _zai_report(report: dict) -> dict:
+    """One credential snapshot, in percent, shaped like the OpenCode Go row."""
+    row: dict = {}
+    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
+    if fetched_at:
+        row["fetched_at"] = fetched_at
+    found: dict[str, tuple[float, str | None]] = {}
+    limits = report.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict):
+            continue
+        if limit.get("id") not in ZAI_KINDS:
+            continue
+        amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
+        frac = _opencode_go_fraction(amount.get("usedFraction"))
+        if frac is None:
+            continue
+        win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+        found[str(limit["id"])] = (frac, iso_from_unix(win.get("resetsAt") or limit.get("resetsAt")))
+    measured: dict[str, dict] = {}
+    for wid, kind, short, label in ZAI_WINDOWS:
+        if wid not in found:
+            continue
+        frac, resets_at = found[wid]
+        entry: dict = {"label": short, "kind_label": label, "used_pct": as_pct(frac * 100.0)}
+        if resets_at:
+            entry["resets_at"] = resets_at
+        measured[kind] = entry
+    if not measured:
+        return row
+    binding = max(measured.items(), key=lambda item: item[1].get("used_pct") or 0.0)[1]
+    row["windows"] = measured
+    row["label"] = binding["kind_label"]
+    row["used_pct"] = binding["used_pct"]
+    if binding.get("resets_at"):
+        row["resets_at"] = binding["resets_at"]
+    return row
+
+
+def _empty_zai(reason: str) -> dict:
+    rec = empty_provider("zai", "unknown", reason)
+    rec["windows"] = [
+        window("weekly", "Weekly", None),
+        window("session", "5 Hour", None),
+        window("special", "Hottest account", None),
+    ]
+    rec["account_usage"] = []
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
+
+
+def probe_zai() -> dict:
+    payload, failure = omp_usage_payload("zai")
+    if payload is None:
+        return _empty_zai(failure or "bad_payload")
+
+    raw_reports = payload["reports"]
+    reports = [
+        report
+        for report in raw_reports
+        if isinstance(report, dict) and report.get("provider") == "zai"
+    ]
+    rows = [_zai_report(report) for report in reports]
+    accounts_without_usage = payload.get("accountsWithoutUsage")
+    disabled_credentials = payload.get("disabledCredentials")
+    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
+    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
+    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
+
+    weekly, weekly_accounts, weekly_reset = _omp_window_average(rows, "weekly")
+    session, session_accounts, session_reset = _omp_window_average(rows, "session")
+
+    row_pcts = [row.get("used_pct") for row in rows]
+    complete_reports = (
+        bool(rows)
+        and len(raw_reports) == len(rows)
+        and isinstance(accounts_without_usage, list)
+        and missing_count == 0
+        and all(pct is not None for pct in row_pcts)
+        and all(isinstance(row.get("fetched_at"), str) for row in rows)
+    )
+    declared_accounts = _omp_declared_accounts(payload, "zai")
+    under_reported = declared_accounts is not None and len(rows) != declared_accounts
+    complete_coverage = complete_reports and not under_reported
+    hottest = max(row_pcts) if complete_coverage and row_pcts else None
+    hottest_reset = None
+    if hottest is not None:
+        hottest_reset = next(
+            (row.get("resets_at") for row in rows if row.get("used_pct") == hottest and row.get("resets_at")),
+            None,
+        )
+    status = "ok" if weekly is not None else "unknown"
+    windows = [
+        window(
+            "weekly",
+            f"{weekly_accounts}-account weekly" if weekly_accounts else "Weekly",
+            weekly,
+            weekly_reset,
+        ),
+        window(
+            "session",
+            f"{session_accounts}-account 5 Hour" if session_accounts else "5 Hour",
+            session,
+            session_reset,
+        ),
+        window("special", "Hottest account", hottest, hottest_reset),
+    ]
+    rec = {
+        "id": "zai",
+        "name": "Z.ai",
+        "logo": "Z",
+        "status": status,
+        "windows": windows,
+        "account_usage": rows,
+        "snapshot": {
+            "reports": len(rows),
+            "accounts_without_usage": missing_count,
+            "disabled_credentials": disabled_count,
+        },
+    }
+    timestamps = [row.get("fetched_at") for row in rows]
+    if complete_reports and all(isinstance(stamp, str) for stamp in timestamps):
+        rec["measured_at"] = min(timestamps)
+    if status != "ok":
+        rec["reason"] = "no_used_pct"
+    elif not complete_coverage or disabled_count > 0 or not lists_valid:
         rec["reason"] = "partial_usage"
     return rec
 
@@ -3053,7 +3198,7 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None, pri
         lines.append(f"API would have cost {format_usd(amount)}")
     lines.append("OAuth incremental $0")
     lines.append("")
-    lines.append("h/l or 1-8 switch · r refresh · q quit")
+    lines.append("h/l or 1-9 switch · r refresh · q quit")
     return "\n".join(lines) + "\n"
 
 
@@ -3113,7 +3258,7 @@ def _tui_loop(stdscr) -> int:
             cmd_cycle("prev")
             poke_waybar()
             continue
-        if isinstance(ch, str) and ch in "12345678":
+        if isinstance(ch, str) and ch in "123456789":
             cmd_select(ids[int(ch) - 1])
             continue
         if ch == curses.KEY_RESIZE:
@@ -3143,6 +3288,7 @@ PROBERS = {
     "devin": probe_devin,
     "opencode-go": probe_opencode_go,
     "charm-hyper": probe_charm_hyper,
+    "zai": probe_zai,
 }
 
 
