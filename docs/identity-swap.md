@@ -102,6 +102,7 @@ the Token Plan / Cursor shape. Do not invent a plugin framework.
 | Token Plan | `keys/$active` + `~/.bailian/config.json` | **yes** — `team` / `gmail` / `infnet` |
 | OpenCode Go | OMP auth store only (keys rotate per request) | no — one store, many accounts, nothing for the chip to flip |
 | Charm Hyper | OMP auth store only (`CHARM_HYPER_API_KEY`) | no — no local file for the chip to flip |
+| Google | OMP auth store only (Antigravity OAuth) | no — no local file for the chip to flip |
 
 Never `op` on right-click. Never print tokens. Never rewrite
 `~/.local/share/omarchy/`.

@@ -30,7 +30,7 @@ VERSION = 2
 # User-facing release. Adding a provider record (OpenCode Go, Charm Hyper)
 # leaves existing cache rows valid, so the schema stays put and only this
 # number moves.
-TOOL_VERSION = "1.2.0"
+TOOL_VERSION = "1.3.0"
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
@@ -55,6 +55,7 @@ PROVIDERS = (
     ("opencode-go", "OpenCode Go", "O"),
     ("charm-hyper", "Charm Hyper", "H"),
     ("zai", "Z.ai", "Z"),
+    ("google", "Google", "g"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -1477,6 +1478,181 @@ def probe_zai() -> dict:
         "id": "zai",
         "name": "Z.ai",
         "logo": "Z",
+        "status": status,
+        "windows": windows,
+        "account_usage": rows,
+        "snapshot": {
+            "reports": len(rows),
+            "accounts_without_usage": missing_count,
+            "disabled_credentials": disabled_count,
+        },
+    }
+    timestamps = [row.get("fetched_at") for row in rows]
+    if complete_reports and all(isinstance(stamp, str) for stamp in timestamps):
+        rec["measured_at"] = min(timestamps)
+    if status != "ok":
+        rec["reason"] = "no_used_pct"
+    elif not complete_coverage or disabled_count > 0 or not lists_valid:
+        rec["reason"] = "partial_usage"
+    return rec
+
+# --- Google -------------------------------------------------------------------
+
+# OMP meters the Google Antigravity account as `google-antigravity`: one report
+# per credential with four quota pools — Gemini weekly, Gemini rolling 5-hour,
+# and the shared third-party pools (Claude & GPT) on the same two windows.
+# Shared pools appear once per backing model with the same `sharedGroup`; they
+# are one quota, so the row dedupes them and keeps the highest reading instead
+# of counting the pool twice.
+GOOGLE_WINDOWS = (
+    ("weekly", "weekly", "7d", "Gemini weekly"),
+    ("5h", "session", "5h", "Gemini 5 Hour"),
+    ("shared-weekly", "shared-weekly", "3p 7d", "Claude & GPT weekly"),
+    ("shared-5h", "shared-session", "3p 5h", "Claude & GPT 5 Hour"),
+)
+GOOGLE_KINDS = {pool: (kind, short, label) for pool, kind, short, label in GOOGLE_WINDOWS}
+
+
+def _google_report(report: dict) -> dict:
+    """One credential snapshot, in percent, shaped like the Z.ai row."""
+    row: dict = {}
+    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
+    if fetched_at:
+        row["fetched_at"] = fetched_at
+    found: dict[str, tuple[float, str | None]] = {}
+    limits = report.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict):
+            continue
+        scope = limit.get("scope") if isinstance(limit.get("scope"), dict) else {}
+        win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+        win_id = str(win.get("id") or "")
+        if win_id not in ("weekly", "5h"):
+            continue
+        pool = f"shared-{win_id}" if scope.get("shared") else win_id
+        if pool not in GOOGLE_KINDS:
+            continue
+        amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
+        frac = _opencode_go_fraction(amount.get("usedFraction"))
+        if frac is None:
+            continue
+        resets_at = iso_from_unix(win.get("resetsAt") or limit.get("resetsAt"))
+        prev = found.get(pool)
+        if prev is None or frac > prev[0]:
+            found[pool] = (frac, resets_at)
+    measured: dict[str, dict] = {}
+    for pool, kind, short, label in GOOGLE_WINDOWS:
+        if pool not in found:
+            continue
+        frac, resets_at = found[pool]
+        entry: dict = {"label": short, "kind_label": label, "used_pct": as_pct(frac * 100.0)}
+        if resets_at:
+            entry["resets_at"] = resets_at
+        measured[kind] = entry
+    if not measured:
+        return row
+    binding = max(measured.items(), key=lambda item: item[1].get("used_pct") or 0.0)[1]
+    row["windows"] = measured
+    row["label"] = binding["kind_label"]
+    row["used_pct"] = binding["used_pct"]
+    if binding.get("resets_at"):
+        row["resets_at"] = binding["resets_at"]
+    return row
+
+
+def _empty_google(reason: str) -> dict:
+    rec = empty_provider("google", "unknown", reason)
+    rec["windows"] = [
+        window("weekly", "Weekly", None),
+        window("session", "5 Hour", None),
+        window("shared-weekly", "Claude & GPT weekly", None),
+        window("shared-session", "Claude & GPT 5 Hour", None),
+        window("special", "Hottest account", None),
+    ]
+    rec["account_usage"] = []
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
+
+
+def probe_google() -> dict:
+    payload, failure = omp_usage_payload("google-antigravity")
+    if payload is None:
+        return _empty_google(failure or "bad_payload")
+
+    raw_reports = payload["reports"]
+    reports = [
+        report
+        for report in raw_reports
+        if isinstance(report, dict) and report.get("provider") == "google-antigravity"
+    ]
+    rows = [_google_report(report) for report in reports]
+    accounts_without_usage = payload.get("accountsWithoutUsage")
+    disabled_credentials = payload.get("disabledCredentials")
+    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
+    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
+    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
+
+    weekly, weekly_accounts, weekly_reset = _omp_window_average(rows, "weekly")
+    session, session_accounts, session_reset = _omp_window_average(rows, "session")
+    shared_weekly, shared_weekly_accounts, shared_weekly_reset = _omp_window_average(rows, "shared-weekly")
+    shared_session, shared_session_accounts, shared_session_reset = _omp_window_average(rows, "shared-session")
+
+    row_pcts = [row.get("used_pct") for row in rows]
+    complete_reports = (
+        bool(rows)
+        and len(raw_reports) == len(rows)
+        and isinstance(accounts_without_usage, list)
+        and missing_count == 0
+        and all(pct is not None for pct in row_pcts)
+        and all(isinstance(row.get("fetched_at"), str) for row in rows)
+    )
+    declared_accounts = _omp_declared_accounts(payload, "google-antigravity")
+    under_reported = declared_accounts is not None and len(rows) != declared_accounts
+    complete_coverage = complete_reports and not under_reported
+    hottest = max(row_pcts) if complete_coverage and row_pcts else None
+    hottest_reset = None
+    if hottest is not None:
+        hottest_reset = next(
+            (row.get("resets_at") for row in rows if row.get("used_pct") == hottest and row.get("resets_at")),
+            None,
+        )
+    averages = (weekly, session, shared_weekly, shared_session)
+    status = "ok" if any(pct is not None for pct in averages) else "unknown"
+    windows = [
+        window(
+            "weekly",
+            f"{weekly_accounts}-account weekly" if weekly_accounts else "Weekly",
+            weekly,
+            weekly_reset,
+        ),
+        window(
+            "session",
+            f"{session_accounts}-account 5 Hour" if session_accounts else "5 Hour",
+            session,
+            session_reset,
+        ),
+        window(
+            "shared-weekly",
+            f"{shared_weekly_accounts}-account Claude & GPT weekly"
+            if shared_weekly_accounts
+            else "Claude & GPT weekly",
+            shared_weekly,
+            shared_weekly_reset,
+        ),
+        window(
+            "shared-session",
+            f"{shared_session_accounts}-account Claude & GPT 5 Hour"
+            if shared_session_accounts
+            else "Claude & GPT 5 Hour",
+            shared_session,
+            shared_session_reset,
+        ),
+        window("special", "Hottest account", hottest, hottest_reset),
+    ]
+    rec = {
+        "id": "google",
+        "name": "Google",
+        "logo": "g",
         "status": status,
         "windows": windows,
         "account_usage": rows,
@@ -3289,6 +3465,7 @@ PROBERS = {
     "opencode-go": probe_opencode_go,
     "charm-hyper": probe_charm_hyper,
     "zai": probe_zai,
+    "google": probe_google,
 }
 
 

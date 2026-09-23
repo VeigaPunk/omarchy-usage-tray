@@ -1,10 +1,11 @@
 # omarchy-usage-tray
 
 Waybar chip for Omarchy: Codex, Token Plan, Charm Hyper, Grok, Kimi, Cursor,
-Devin, OpenCode Go, and Z.ai usage. Left-click or scroll to cycle providers;
-right-click cycles identities for the selected provider when supported.
+Devin, OpenCode Go, Z.ai, and Google usage. Left-click or scroll to cycle
+providers; right-click cycles identities for the selected provider when
+supported.
 
-Current release: **1.2.0** (`ai-usage --version`).
+Current release: **1.3.0** (`ai-usage --version`).
 
 ## Providers
 
@@ -22,6 +23,7 @@ chip renders whichever one is selected.
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
 | `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
 | `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
+| `g` | Google | Gemini weekly + 5-hour, shared Claude & GPT pools, hottest account | `omp usage --provider google-antigravity --json` |
 
 Missing data is never invented: a window the provider did not answer renders as
 `—`, and a provider that cannot be reached keeps its last good meters and shows
@@ -54,6 +56,15 @@ last good count alongside the bounded reason. A retained count is labelled
 `AI_USAGE_CHARM_HYPER_LOW_CREDITS` (in credits, compared against the reported
 total) turns the chip red below a floor; zero credits is always critical. Left
 unset, only an exhausted balance alarms.
+
+### Google shared pools
+
+The Google Antigravity account carries four quota pools: Gemini weekly, Gemini
+rolling 5-hour, and the shared third-party pools (Claude & GPT) on the same two
+windows. OMP reports each shared pool once per backing model, so the chip
+dedupes them and keeps the highest reading — one quota, not a sum. The compact
+bars show the Gemini weekly average and the hottest account; the tooltip lists
+all four pools per snapshot.
 
 ## Install
 
@@ -110,10 +121,10 @@ slots in `~/.config/alibaba-token-plan/slots` and rewrites
 meters; 1Password is only used by `token-plan-swap pull`.
 
 Cursor dual-OAuth uses `cursor-oauth-swap` (same Token Plan shape). Codex /
-Grok / Kimi / OpenCode Go / Charm Hyper / Z.ai stay no-ops until a second store
-exists — OpenCode Go keys rotate inside OMP, and Charm Hyper's credential lives
-in OMP's auth store, so neither has a live file for the chip to flip. See
-[`docs/identity-swap.md`](docs/identity-swap.md).
+Grok / Kimi / OpenCode Go / Charm Hyper / Z.ai / Google stay no-ops until a
+second store exists — OpenCode Go keys rotate inside OMP, and Charm Hyper's
+and Google's credentials live in OMP's auth store, so none has a live file for
+the chip to flip. See [`docs/identity-swap.md`](docs/identity-swap.md).
 
 ## Configuration
 
