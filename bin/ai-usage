@@ -30,7 +30,7 @@ VERSION = 2
 # User-facing release. Adding a provider record (OpenCode Go, Charm Hyper)
 # leaves existing cache rows valid, so the schema stays put and only this
 # number moves.
-TOOL_VERSION = "1.3.1"
+TOOL_VERSION = "1.4.0"
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
@@ -1674,14 +1674,9 @@ def probe_google() -> dict:
 
 # --- Grok --------------------------------------------------------------------
 
-KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
-KIMI_DEFAULT_BASE = "https://api.kimi.ai/coding/v1"
-KIMI_DEFAULT_OAUTH = "https://auth.kimi.ai"
-KIMI_USER_AGENT = "kimi-code/0.38.0"
-
-
 class _KimiUnauth(Exception):
     pass
+
 
 
 def _rpc_error_text(err) -> str:
@@ -1947,459 +1942,160 @@ def probe_grok() -> dict:
 
 # --- Kimi --------------------------------------------------------------------
 
-
-def _toml_section(text: str, header: str) -> str:
-    m = re.search(rf"^\[{re.escape(header)}\]\s*$", text, re.M)
-    if not m:
-        return ""
-    rest = text[m.end() :]
-    nxt = re.search(r"^\[", rest, re.M)
-    return rest[: nxt.start()] if nxt else rest
-
-
-def _toml_str(section: str, key: str) -> str | None:
-    m = re.search(rf"^{re.escape(key)}\s*=\s*\"([^\"]*)\"", section, re.M)
-    return m.group(1) if m else None
+# OMP window id -> (kind, short label, long label). Kimi Code reports a rolling
+# 5-hour window plus two monthly meters (total + code-only) per OAuth account;
+# the auth-gateway balances requests across every stored account, so the chip
+# meters the fleet: per-window account averages plus the single hottest row.
+KIMI_WINDOWS = (
+    ("5h", "session", "5h", "5 Hour limit"),
+    ("limit_month_total", "weekly", "monthly", "Monthly total"),
+    ("limit_month_code", "monthly", "code", "Monthly code"),
+)
+KIMI_KINDS = {wid: (kind, short, label) for wid, kind, short, label in KIMI_WINDOWS}
 
 
-def _kimi_config() -> tuple[str, str, str]:
-    base = os.environ.get("KIMI_CODE_BASE_URL") or ""
-    oauth_host = os.environ.get("KIMI_CODE_OAUTH_HOST") or ""
-    key = os.environ.get("KIMI_CODE_OAUTH_KEY") or ""
-    cfg = Path.home() / ".kimi-code" / "config.toml"
-    try:
-        text = cfg.read_text(encoding="utf-8")
-    except OSError:
-        text = ""
-    if text:
-        prov = _toml_section(text, 'providers."managed:kimi-code"')
-        oauth = _toml_section(text, 'providers."managed:kimi-code".oauth')
-        if not base:
-            base = _toml_str(prov, "base_url") or ""
-        if not oauth_host:
-            oauth_host = _toml_str(oauth, "oauth_host") or ""
-        if not key:
-            key = _toml_str(oauth, "key") or ""
-    base = (base or KIMI_DEFAULT_BASE).rstrip("/")
-    oauth_host = (oauth_host or KIMI_DEFAULT_OAUTH).rstrip("/")
-    slot = key[6:] if key.startswith("oauth/") else key
-    return base, oauth_host, slot
-
-
-def _kimi_cred_paths(slot: str) -> tuple[Path | None, Path | None]:
-    cred_dir = Path.home() / ".kimi-code" / "credentials"
-    lock_dir = Path.home() / ".kimi-code" / "oauth"
-    if slot:
-        return cred_dir / f"{slot}.json", lock_dir / slot
-    if not cred_dir.is_dir():
-        return None, None
-    files = sorted(
-        (p for p in cred_dir.glob("*.json") if p.stat().st_size > 0),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not files:
-        return None, None
-    path = files[0]
-    return path, lock_dir / path.stem
-
-
-def _kimi_read_creds(path: Path) -> dict | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _kimi_is_tombstone(data: dict) -> bool:
-    access = data.get("access_token")
-    refresh = data.get("refresh_token")
-    if not access and not refresh:
-        return True
-    try:
-        if data.get("expires_at") is not None and float(data.get("expires_at")) == 0 and not access:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return False
-
-
-def _kimi_needs_refresh(data: dict) -> bool:
-    if not data.get("access_token"):
-        return True
-    ea = data.get("expires_at")
-    if ea is None or ea == "":
-        return True
-    try:
-        n = float(ea)
-    except (TypeError, ValueError):
-        return True
-    if n >= 1e12:
-        n = n / 1000.0
-    return n - time.time() < 300
-
-
-def _kimi_write_creds(path: Path, data: dict) -> None:
-    ensure_dir(path.parent, 0o700)
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(path.parent), text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _kimi_flock(lock_path: Path) -> int:
-    ensure_dir(lock_path.parent, 0o700)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-    except OSError:
-        pass
-    deadline = time.time() + 10
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except BlockingIOError:
-            if time.time() >= deadline:
-                os.close(fd)
-                raise TimeoutError("kimi_oauth_lock")
-            time.sleep(0.05)
-
-
-def _kimi_unflock(fd: int) -> None:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-        pass
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-
-
-def _kimi_http(url: str, method: str, headers: dict, data: bytes | None = None, timeout: float = 10):
-    hdrs = dict(headers)
-    hdrs.setdefault("User-Agent", KIMI_USER_AGENT)
-    hdrs.setdefault("Accept", "application/json")
-    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return getattr(resp, "status", 200), resp.read()
-    except urllib.error.HTTPError as exc:
-        body = b""
-        try:
-            body = exc.read()
-        except Exception:
-            pass
-        return exc.code, body
-
-
-def _kimi_decode(body: bytes | None):
-    if not body:
-        return None
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _kimi_cloudflare(payload) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("cloudflare_error"):
-        return True
-    name = str(payload.get("error_name") or "").lower()
-    cat = str(payload.get("error_category") or "").lower()
-    return "cloudflare" in name or "cloudflare" in cat or name == "browser_signature_banned"
-
-
-def _kimi_refresh(oauth_host: str, refresh_token: str) -> dict:
-    url = oauth_host.rstrip("/") + "/api/oauth/token"
-    form = urlencode(
-        {
-            "client_id": KIMI_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }
-    ).encode("ascii")
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-    }
-    last_err = "refresh_failed"
-    for attempt in range(3):
-        code, body = _kimi_http(url, "POST", headers, form, timeout=30)
-        if code in (429, 500, 502, 503, 504):
-            time.sleep(2**attempt)
-            last_err = f"http_{code}"
+def _kimi_report(report: dict) -> dict:
+    """One OAuth account's usage snapshot, in percent."""
+    row: dict = {}
+    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
+    if fetched_at:
+        row["fetched_at"] = fetched_at
+    meta = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
+    account = str(meta.get("accountId") or "")
+    if account:
+        row["account"] = account
+    found: dict[str, tuple[float, str | None]] = {}
+    limits = report.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict):
             continue
-        payload = _kimi_decode(body)
-        if _kimi_cloudflare(payload):
-            raise RuntimeError(f"http_{code}")
-        err = None
-        if isinstance(payload, dict):
-            raw_err = payload.get("error")
-            if isinstance(raw_err, str):
-                err = raw_err
-            elif isinstance(raw_err, dict):
-                err = str(raw_err.get("code") or raw_err.get("error") or "")
-            else:
-                err = str(payload.get("code") or "") or None
-        if code in (401, 403) or err in ("invalid_grant", "unauthenticated"):
-            if err == "invalid_grant" or code == 401 or err == "unauthenticated":
-                raise _KimiUnauth("need_login")
-            raise RuntimeError(f"http_{code}")
-        if isinstance(payload, dict):
-            if code >= 400:
-                raise RuntimeError(f"http_{code}")
-            access = payload.get("access_token")
-            rotated = payload.get("refresh_token")
-            expires_in = payload.get("expires_in")
-            if not isinstance(access, str) or not access or not isinstance(rotated, str) or not rotated:
-                raise RuntimeError("bad_refresh")
-            try:
-                exp = int(expires_in)
-            except (TypeError, ValueError):
-                raise RuntimeError("bad_refresh")
-            if exp <= 0:
-                raise RuntimeError("bad_refresh")
-            out = {
-                "access_token": access,
-                "refresh_token": rotated,
-                "expires_in": exp,
-                "token_type": payload.get("token_type") or "Bearer",
-                "expires_at": int(time.time()) + exp,
-            }
-            if payload.get("scope"):
-                out["scope"] = payload.get("scope")
-            return out
-        last_err = f"http_{code}" if code >= 400 else "bad_refresh"
-        break
-    raise RuntimeError(last_err)
-
-
-def _kimi_usages(base: str, access: str) -> tuple[int, dict | None]:
-    url = base.rstrip("/") + "/usages"
-    headers = {"Authorization": "Bearer " + access, "Accept": "application/json"}
-    code, body = _kimi_http(url, "GET", headers, None, timeout=10)
-    return code, _kimi_decode(body)
-
-
-def _kimi_window_is_5h(item: dict) -> bool:
-    win = item.get("window")
-    unit = ""
-    dur_f = None
-    if isinstance(win, dict):
-        unit = str(win.get("timeUnit") or win.get("unit") or "").lower()
-        try:
-            dur_f = float(win.get("duration"))
-        except (TypeError, ValueError):
-            dur_f = None
-    elif win is not None:
-        s = str(win).lower()
-        return s in ("5h", "5hr", "300m", "300 minutes")
-    else:
-        unit = str(item.get("timeUnit") or item.get("unit") or "").lower()
-        try:
-            dur_f = float(item.get("duration"))
-        except (TypeError, ValueError):
-            dur_f = None
-    if dur_f is None:
-        return False
-    if "minute" in unit and dur_f == 300:
-        return True
-    if "hour" in unit and dur_f == 5:
-        return True
-    if "minute" in unit and dur_f >= 60 and dur_f % 60 == 0 and dur_f / 60 == 5:
-        return True
-    return False
-
-
-def _kimi_detail_reset(detail: dict):
-    reset = detail.get("resetTime") or detail.get("resetsAt")
-    if isinstance(reset, (int, float)):
-        return iso_from_unix(reset)
-    if reset is not None:
-        return str(reset)
-    return None
-
-
-def _kimi_pct(detail: dict) -> float | None:
-    if not isinstance(detail, dict):
-        return None
-    pct = ratio(detail.get("used"), detail.get("limit"))
-    if pct is not None:
-        return pct
-    if detail.get("remaining") is None or detail.get("limit") is None:
-        return None
-    try:
-        rem = float(detail.get("remaining"))
-        lim = float(detail.get("limit"))
-    except (TypeError, ValueError):
-        return None
-    if lim <= 0:
-        return None
-    return as_pct(100.0 * (lim - rem) / lim)
-
-
-def _kimi_windows(payload: dict) -> list[dict]:
-    windows: list[dict] = []
-    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
-    if usage:
-        pct = _kimi_pct(usage)
-        reset = usage.get("resetTime") or usage.get("resetsAt") or usage.get("reset_at")
-        if isinstance(reset, (int, float)):
-            reset = iso_from_unix(reset)
-        elif reset is not None:
-            reset = str(reset)
-        if pct is not None:
-            windows.append(window("weekly", "Weekly", pct, reset))
-    limits = payload.get("limits") if isinstance(payload.get("limits"), list) else []
-    for item in limits:
-        if not isinstance(item, dict) or not _kimi_window_is_5h(item):
+        scope = limit.get("scope") if isinstance(limit.get("scope"), dict) else {}
+        win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+        wid = str(scope.get("windowId") or win.get("id") or "")
+        if wid not in KIMI_KINDS:
             continue
-        detail = item.get("detail") if isinstance(item.get("detail"), dict) else item
-        if not isinstance(detail, dict):
+        if account:
+            scope_account = str(scope.get("accountId") or "")
+            if scope_account and scope_account != account:
+                continue
+        amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
+        frac = _opencode_go_fraction(amount.get("usedFraction"))
+        if frac is None:
             continue
-        pct = _kimi_pct(detail)
-        if pct is None:
+        found[wid] = (frac, iso_from_unix(win.get("resetsAt") or limit.get("resetsAt")))
+    measured: dict[str, dict] = {}
+    for wid, kind, short, label in KIMI_WINDOWS:
+        if wid not in found:
             continue
-        windows.append(window("session", "5h", pct, _kimi_detail_reset(detail), extra={"window_mins": 300}))
-        break
-    if not any(w.get("kind") == "weekly" for w in windows):
-        windows.insert(0, {"kind": "weekly", "label": "Weekly"})
-    return windows
+        frac, resets_at = found[wid]
+        entry: dict = {"label": short, "kind_label": label, "used_pct": as_pct(frac * 100.0)}
+        if resets_at:
+            entry["resets_at"] = resets_at
+        measured[kind] = entry
+    if not measured:
+        return row
+    binding = max(measured.items(), key=lambda item: item[1].get("used_pct") or 0.0)[1]
+    row["windows"] = measured
+    row["label"] = binding["kind_label"]
+    row["used_pct"] = binding["used_pct"]
+    if binding.get("resets_at"):
+        row["resets_at"] = binding["resets_at"]
+    return row
+
+
+def _empty_kimi(reason: str) -> dict:
+    rec = empty_provider("kimi", "unknown", reason)
+    rec["windows"] = [
+        window("weekly", "Monthly total", None),
+        window("session", "5 Hour", None),
+        window("monthly", "Monthly code", None),
+        window("special", "Hottest account", None),
+    ]
+    rec["account_usage"] = []
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
 
 
 def probe_kimi() -> dict:
-    base, oauth_host, slot = _kimi_config()
-    cred_path, lock_path = _kimi_cred_paths(slot)
-    if cred_path is None or lock_path is None or not cred_path.is_file():
-        return empty_provider("kimi", "unauth", "need_login")
+    payload, failure = omp_usage_payload("kimi-code")
+    if payload is None:
+        return _empty_kimi(failure or "bad_payload")
 
-    def load() -> dict | None:
-        return _kimi_read_creds(cred_path)
+    raw_reports = payload["reports"]
+    reports = [
+        report
+        for report in raw_reports
+        if isinstance(report, dict) and report.get("provider") == "kimi-code"
+    ]
+    rows = [_kimi_report(report) for report in reports]
+    accounts_without_usage = payload.get("accountsWithoutUsage")
+    disabled_credentials = payload.get("disabledCredentials")
+    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
+    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
+    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
 
-    def refresh_locked(old: dict) -> dict:
-        rt = old.get("refresh_token")
-        if not isinstance(rt, str) or not rt:
-            raise _KimiUnauth("need_login")
-        new = _kimi_refresh(oauth_host, rt)
-        merged = dict(old)
-        merged.update(new)
-        _kimi_write_creds(cred_path, merged)
-        return merged
+    weekly, weekly_accounts, weekly_reset = _omp_window_average(rows, "weekly")
+    session, session_accounts, session_reset = _omp_window_average(rows, "session")
+    monthly, monthly_accounts, monthly_reset = _omp_window_average(rows, "monthly")
 
-    creds: dict | None
-    try:
-        fd = _kimi_flock(lock_path)
-        try:
-            creds = load()
-            if not creds or _kimi_is_tombstone(creds):
-                return empty_provider("kimi", "unauth", "need_login")
-            if _kimi_needs_refresh(creds):
-                creds = refresh_locked(creds)
-        finally:
-            _kimi_unflock(fd)
-    except _KimiUnauth:
-        return empty_provider("kimi", "unauth", "need_login")
-    except TimeoutError:
-        return empty_provider("kimi", "unknown", "lock_timeout")
-    except Exception as exc:
-        msg = redact(str(exc))[:200]
-        low = msg.lower()
-        if "invalid_grant" in low or "401" in msg or "unauth" in low:
-            return empty_provider("kimi", "unauth", "need_login")
-        return empty_provider("kimi", "unknown", msg or "refresh_failed")
-
-    access = creds.get("access_token") if isinstance(creds, dict) else None
-    if not isinstance(access, str) or not access:
-        return empty_provider("kimi", "unauth", "need_login")
-
-    def usages_unauth(code, payload) -> bool:
-        if _kimi_cloudflare(payload):
-            return False
-        if code == 401:
-            return True
-        if not isinstance(payload, dict):
-            return False
-        code_s = str(payload.get("code") or payload.get("error") or "").lower()
-        if code_s in ("unauthenticated", "invalid_grant", "unauthorized"):
-            return True
-        details = payload.get("details")
-        if isinstance(details, list):
-            for item in details:
-                if not isinstance(item, dict):
-                    continue
-                dbg = item.get("debug") if isinstance(item.get("debug"), dict) else {}
-                if "INVALID_AUTH" in str(dbg.get("reason") or ""):
-                    return True
-        return False
-
-    try:
-        code, payload = _kimi_usages(base, access)
-    except Exception as exc:
-        return empty_provider("kimi", "unknown", redact(str(exc))[:200])
-
-    if usages_unauth(code, payload):
-        try:
-            fd = _kimi_flock(lock_path)
-            try:
-                creds = load()
-                if not creds or _kimi_is_tombstone(creds):
-                    return empty_provider("kimi", "unauth", "need_login")
-                creds = refresh_locked(creds)
-            finally:
-                _kimi_unflock(fd)
-        except _KimiUnauth:
-            return empty_provider("kimi", "unauth", "need_login")
-        except Exception as exc:
-            msg = redact(str(exc))[:200]
-            if "invalid_grant" in msg.lower():
-                return empty_provider("kimi", "unauth", "need_login")
-            return empty_provider("kimi", "unknown", msg)
-        access = creds.get("access_token") if isinstance(creds, dict) else None
-        if not isinstance(access, str) or not access:
-            return empty_provider("kimi", "unauth", "need_login")
-        try:
-            code, payload = _kimi_usages(base, access)
-        except Exception as exc:
-            return empty_provider("kimi", "unknown", redact(str(exc))[:200])
-        if usages_unauth(code, payload):
-            return empty_provider("kimi", "unauth", "need_login")
-
-    if code != 200 or not isinstance(payload, dict):
-        if usages_unauth(code, payload):
-            return empty_provider("kimi", "unauth", "need_login")
-        return empty_provider("kimi", "unknown", f"http_{code}" if code else "bad_payload")
-
+    row_pcts = [row.get("used_pct") for row in rows]
+    complete_reports = (
+        bool(rows)
+        and len(raw_reports) == len(rows)
+        and isinstance(accounts_without_usage, list)
+        and missing_count == 0
+        and all(pct is not None for pct in row_pcts)
+        and all(isinstance(row.get("fetched_at"), str) for row in rows)
+    )
+    declared_accounts = _omp_declared_accounts(payload, "kimi-code")
+    under_reported = declared_accounts is not None and len(rows) != declared_accounts
+    complete_coverage = complete_reports and not under_reported
+    hottest = max(row_pcts) if complete_coverage and row_pcts else None
+    hottest_reset = None
+    if hottest is not None:
+        hottest_reset = next(
+            (row.get("resets_at") for row in rows if row.get("used_pct") == hottest and row.get("resets_at")),
+            None,
+        )
+    status = "ok" if weekly is not None or session is not None else "unknown"
+    windows = [
+        window(
+            "weekly",
+            f"{weekly_accounts}-account monthly" if weekly_accounts else "Monthly total",
+            weekly,
+            weekly_reset,
+        ),
+        window(
+            "session",
+            f"{session_accounts}-account 5h" if session_accounts else "5 Hour",
+            session,
+            session_reset,
+        ),
+        window(
+            "monthly",
+            f"{monthly_accounts}-account code" if monthly_accounts else "Monthly code",
+            monthly,
+            monthly_reset,
+        ),
+        window("special", "Hottest account", hottest, hottest_reset),
+    ]
     rec = {
         "id": "kimi",
         "name": "Kimi",
         "logo": "K",
-        "status": "ok",
-        "windows": _kimi_windows(payload),
+        "status": status,
+        "windows": windows,
+        "account_usage": rows,
+        "snapshot": {
+            "reports": len(rows),
+            "accounts_without_usage": missing_count,
+            "disabled_credentials": disabled_count,
+        },
     }
-    if not any("used_pct" in w for w in rec["windows"]):
-        rec["status"] = "unknown"
-        rec["reason"] = "no_used_pct"
+    if not lists_valid:
+        rec["reason"] = "partial_usage"
+    elif missing_count or disabled_count or under_reported:
+        rec["reason"] = "partial_usage"
     return rec
 
 
@@ -3533,6 +3229,22 @@ def meter(pct) -> str:
     return f"<span bgcolor='{METER_TRACK}'>{inner}</span>"
 
 
+def format_reset_in(ts) -> str:
+    """Compact countdown: `2d:05h (CEST)` — day:hour plus the local tz label."""
+    dt = parse_reset(ts)
+    if dt is None:
+        return ""
+    remaining = dt - datetime.now(timezone.utc)
+    seconds = remaining.total_seconds()
+    if not (seconds > 0):
+        return "now"
+    hours = int(seconds // 3600)
+    days = hours // 24
+    tz = dt.astimezone().strftime("%Z")
+    suffix = f" ({tz})" if tz else ""
+    return f"{days}d:{hours % 24:02d}h{suffix}"
+
+
 def window_by_kind(rec: dict, kind: str) -> dict | None:
     for w in rec.get("windows") or []:
         if isinstance(w, dict) and w.get("kind") == kind:
@@ -3580,6 +3292,9 @@ def usage_row_line(index: int, row: dict) -> str:
     anonymous credit reports) render exactly as before.
     """
     bit = f"snapshot {index}: {_pct_label(row.get('used_pct'))}"
+    account = str(row.get("account") or "").strip()
+    if account:
+        bit += f" · {account[:8]}"
     label = str(row.get("label") or "").strip()
     if label:
         bit += f" · {label}"
@@ -3598,7 +3313,8 @@ def usage_row_line(index: int, row: dict) -> str:
     if remaining is not None and total is not None:
         bit += f" · {_credits_label(remaining)}/{_credits_label(total)} credits"
     if row.get("resets_at"):
-        bit += f" · reset {row['resets_at']}"
+        reset = format_reset_in(row["resets_at"])
+        bit += f" · reset {reset or row['resets_at']}"
     return bit
 
 
@@ -3798,13 +3514,15 @@ def cmd_waybar() -> int:
         if extra_bits.get("remaining_usd") is not None:
             bit += f"  ${float(extra_bits['remaining_usd']):.2f} left"
         if w.get("resets_at"):
-            bit += f"  reset {w['resets_at']}"
+            reset = format_reset_in(w["resets_at"])
+            bit += f"  reset {reset or w['resets_at']}"
         lines.append(bit)
     burst = rec.get("burst")
     if isinstance(burst, dict) and "used_pct" in burst:
         bit = f"{burst.get('label') or 'burst'}: {burst['used_pct']}%"
         if burst.get("resets_at"):
-            bit += f"  reset {burst['resets_at']}"
+            reset = format_reset_in(burst["resets_at"])
+            bit += f"  reset {reset or burst['resets_at']}"
         lines.append(bit)
     for index, item in enumerate(rec.get("account_usage") or [], 1):
         if isinstance(item, dict):
@@ -3949,6 +3667,12 @@ def cmd_identity(direction: str) -> int:
             atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
         poke_waybar()
         print((rec.get("identity") or {}).get("id") or "?")
+        return 0
+    if selected == "kimi":
+        rec = cache.get("providers", {}).get("kimi")
+        rows = rec.get("account_usage") if isinstance(rec, dict) else None
+        n = len(rows) if isinstance(rows, list) else 0
+        print(f"kimi: {n or '?'} accounts balanced by omp auth-gateway (no manual cycle)")
         return 0
     print(f"{selected}: no identity cycle configured")
     return 0

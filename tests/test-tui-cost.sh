@@ -86,22 +86,23 @@ codex = {
 }
 
 kimi_payload = json.loads(kimi_path.read_text())
-kimi_windows = mod._kimi_windows(kimi_payload)
-weekly = next(w for w in kimi_windows if w.get("kind") == "weekly")
-session = next(w for w in kimi_windows if w.get("kind") == "session")
+kimi_row = mod._kimi_report(kimi_payload)
+kimi_windows_map = kimi_row.get("windows") or {}
+weekly = kimi_windows_map.get("weekly") or {}
+session = kimi_windows_map.get("session") or {}
 if weekly.get("used_pct") != 0:
     raise SystemExit(f"FAIL: kimi remaining-only weekly used_pct={weekly.get('used_pct')!r} want 0")
 if session.get("used_pct") != 0:
     raise SystemExit(f"FAIL: kimi remaining-only session used_pct={session.get('used_pct')!r} want 0")
-if "used" in (kimi_payload.get("usage") or {}):
-    raise SystemExit("FAIL: kimi fixture must not include used (remaining+limit only)")
+if kimi_row.get("account") != "kimitestacct":
+    raise SystemExit(f"FAIL: kimi account label missing: {kimi_row!r}")
 
 kimi = {
     "id": "kimi",
     "name": "Kimi",
     "logo": "K",
     "status": "ok",
-    "windows": kimi_windows,
+    "windows": [dict(entry, kind=kind) for kind, entry in kimi_windows_map.items()],
 }
 
 cache = {

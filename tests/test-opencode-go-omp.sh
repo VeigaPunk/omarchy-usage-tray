@@ -218,7 +218,7 @@ for expected in (
     "snapshot 1: 99% · Monthly limit · 5h 1% · 7d 0% · monthly 99% · fetched: 2100-01-01T00:00:00Z",
     "snapshot 2: 2% · Weekly limit · 5h 0% · 7d 2% · monthly 0%",
     "snapshot 3: 25% · Monthly limit · 5h 10% · 7d 4% · monthly 25%",
-    "reset 2100-01-01T00:01:00Z",
+    "reset 26761d:",
     "snapshot coverage: 3 reports · 0 without usage · 0 disabled",
 ):
     assert expected in tooltip, (expected, tooltip)

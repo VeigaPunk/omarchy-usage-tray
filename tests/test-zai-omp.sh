@@ -191,7 +191,7 @@ for expected in (
     "Hottest account: 90%",
     "snapshot 1: 50% · 5 Hour limit · 5h 50% · 7d 10% · fetched: 2100-01-01T00:00:00Z",
     "snapshot 2: 90% · 5 Hour limit · 5h 90% · 7d 20% · fetched: 2100-01-01T00:01:00Z",
-    "reset 2100-01-01T02:00:00Z",
+    "reset 26761d:",
     "snapshot coverage: 2 reports · 0 without usage · 0 disabled",
 ):
     assert expected in tooltip, (expected, tooltip)

@@ -17,7 +17,7 @@ chip renders whichever one is selected.
 | `C` | Codex | Weekly, plus Spark when the account reports it | `codex` app-server JSON-RPC |
 | `T` | Token Plan | Per-account credits across the fleet, hottest account, add-on packs | `omp usage --provider alibaba-token-plan --json` |
 | `G` | Grok | Weekly | `grok` CLI billing RPC |
-| `K` | Kimi | Weekly, 5-hour | Kimi `/usages` |
+| `K` | Kimi | Monthly total, 5-hour, monthly code — per OAuth account, averaged + hottest | `omp usage --provider kimi-code --json` |
 | `R` | Cursor | Weekly, Auto, on-demand balance when reported | `cursor.com` usage + parked OAuth sessions |
 | `D` | Devin | Weekly quota, plan cycle | CLI `GetUserStatus` session |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
@@ -122,11 +122,15 @@ slots in `~/.config/alibaba-token-plan/slots` and rewrites
 `token-plan-key` follow that route. The route change preserves OMP's fleet
 meters; 1Password is only used by `token-plan-swap pull`.
 
-Cursor dual-OAuth uses `cursor-oauth-swap` (same Token Plan shape). Codex /
-Grok / Kimi / OpenCode Go / Charm Hyper / Z.ai / Google stay no-ops until a
-second store exists — OpenCode Go keys rotate inside OMP, and Charm Hyper's
-and Google's credentials live in OMP's auth store, so none has a live file for
-the chip to flip. See [`docs/identity-swap.md`](docs/identity-swap.md).
+Cursor dual-OAuth uses `cursor-oauth-swap` (same Token Plan shape). Kimi runs
+both OAuth accounts through `omp auth-gateway` (127.0.0.1:8791): the gateway
+round-robins new sessions across the stored `kimi-code` credentials and retries
+on the other account after a usage-limit block, so the chip meters the fleet
+and right-click just reports the balanced state. Codex / Grok / OpenCode Go /
+Charm Hyper / Z.ai / Google stay no-ops until a second store exists — OpenCode
+Go keys rotate inside OMP, and Charm Hyper's and Google's credentials live in
+OMP's auth store, so none has a live file for the chip to flip. See
+[`docs/identity-swap.md`](docs/identity-swap.md).
 
 ## Configuration
 

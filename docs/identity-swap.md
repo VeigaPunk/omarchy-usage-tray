@@ -74,8 +74,10 @@ credential is metered on every probe and the chip sums their balances.
 
 ## OAuth / extra API keys (outline only)
 
-Codex / Grok / Kimi still have one OAuth each on this host, so identity
-cycle stays a no-op there. Do not build a swapper without a second store.
+Codex / Grok still have one OAuth each on this host, so identity cycle stays a
+no-op there. Kimi has two OAuth accounts but no swapper: both live in OMP's
+auth store and `omp auth-gateway` (127.0.0.1:8791) balances and fails over
+between them, so there is no single live file to flip.
 
 When someone else has two live identities for the **same** provider, copy
 the Token Plan / Cursor shape. Do not invent a plugin framework.
@@ -97,7 +99,7 @@ the Token Plan / Cursor shape. Do not invent a plugin framework.
 |---|---|---|
 | Codex | `~/.codex/auth.json` (`auth_mode=chatgpt`) | no (`OPENAI_API_KEY` unset) |
 | Grok | `~/.grok/auth.json` (OIDC) | no (`XAI_API_KEY` unset in the tray path; management prepaid is a *different* key, not a second OAuth) |
-| Kimi | `~/.kimi-code/credentials/*.json` (one file) | no (`moonshotai` in config.toml is API, not a second OAuth) |
+| Kimi | OMP auth store (`kimi-code`, 2 accounts) | **yes** — balanced by `omp auth-gateway`; no file swap |
 | Cursor | `~/.config/cursor/auth.json` | **yes** — `cursor-oauth-swap` parks copies under `~/.config/cursor-oauth/identities/` |
 | Token Plan | `keys/$active` + `~/.bailian/config.json` | **yes** — `team` / `gmail` / `infnet` |
 | OpenCode Go | OMP auth store only (keys rotate per request) | no — one store, many accounts, nothing for the chip to flip |

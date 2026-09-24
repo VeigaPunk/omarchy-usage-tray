@@ -1,21 +1,23 @@
 {
-  "usage": {
-    "remaining": 100,
-    "limit": 100,
-    "resetTime": "2026-08-27T16:25:35Z"
-  },
+  "provider": "kimi-code",
+  "fetchedAt": 1790233200000,
+  "metadata": {"accountId": "kimitestacct"},
   "limits": [
     {
-      "name": "session",
-      "window": {
-        "duration": 300,
-        "timeUnit": "TIME_UNIT_MINUTE"
-      },
-      "detail": {
-        "remaining": 100,
-        "limit": 100,
-        "resetTime": "2026-08-23T07:25:35Z"
-      }
+      "id": "kimi-code:0",
+      "label": "5h limit",
+      "scope": {"provider": "kimi-code", "accountId": "kimitestacct", "windowId": "5h"},
+      "window": {"id": "5h", "label": "5h limit", "durationMs": 18000000, "resetsAt": 1790244744000},
+      "amount": {"unit": "percent", "limit": 100, "used": 0, "remaining": 100, "usedFraction": 0, "remainingFraction": 1},
+      "status": "ok"
+    },
+    {
+      "id": "kimi-code:1",
+      "label": "Monthly total",
+      "scope": {"provider": "kimi-code", "accountId": "kimitestacct", "windowId": "limit_month_total"},
+      "window": {"id": "limit_month_total", "label": "Monthly total", "resetsAt": 1792627200000},
+      "amount": {"unit": "percent", "limit": 100, "used": 0, "remaining": 100, "usedFraction": 0, "remainingFraction": 1},
+      "status": "ok"
     }
   ]
 }
