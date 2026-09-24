@@ -32,17 +32,18 @@ the bounded reason instead.
 
 ### Token Plan add-on credits
 
-Token Plan meters the weekly plan window and purchased add-on bundles (Credit
+Token Plan meters the monthly plan window and purchased add-on bundles (Credit
 Pack, $15) as separate pools. The chip supports both: when a report carries a
-`credits:addon` window, that account's row is `weekly + packs`, the tooltip
+`credits:addon` window, that account's row is `monthly + packs`, the tooltip
 prints `x/y credits` per snapshot, and an account whose plan reads 100% while a
 pack still holds credits shows its real headroom instead of a false zero.
 
 Pool sizes are declared rather than scraped — the console usage RPC answers
-percentages only (verified 2026-09-20 on every stored credential) — so override
-them per tier with `AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS` and
+percentages only — so override them per tier with
+`AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS` (legacy
+`AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS` still honored) and
 `AI_USAGE_TOKEN_PLAN_ADDON_CREDITS` (both **per account**). OMP emits only the
-7-day window today, so the add-on path stays dormant until it reports one.
+monthly window today, so the add-on path stays dormant until it reports one.
 
 ### Charm Hyper credits
 
@@ -140,7 +141,7 @@ service environment for the 5-minute probe:
 
 ```ini
 #AI_USAGE_OMP_BIN=/home/you/.local/bin/omp
-#AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS=40000
+#AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS=40000
 #AI_USAGE_TOKEN_PLAN_ADDON_CREDITS=20000
 #AI_USAGE_CHARM_HYPER_LOW_CREDITS=25
 ```

@@ -66,8 +66,8 @@ if [[ "${AI_USAGE_OMP_SHORT:-}" == 1 ]]; then
       "fetchedAt": 4102444800000,
       "limits": [
         {
-          "id": "credits:7d",
-          "window": {"id": "7d"},
+          "id": "credits:monthly",
+          "window": {"id": "monthly"},
           "amount": {"usedFraction": 0.1},
           "status": "ok"
         }
@@ -78,8 +78,8 @@ if [[ "${AI_USAGE_OMP_SHORT:-}" == 1 ]]; then
       "fetchedAt": 4102444860000,
       "limits": [
         {
-          "id": "credits:7d",
-          "window": {"id": "7d"},
+          "id": "credits:monthly",
+          "window": {"id": "monthly"},
           "amount": {"usedFraction": 0.2},
           "status": "ok"
         }
@@ -91,7 +91,7 @@ if [[ "${AI_USAGE_OMP_SHORT:-}" == 1 ]]; then
   "capacity": {
     "alibaba-token-plan": [
       {
-        "window": "7d",
+        "window": "monthly",
         "accounts": 3,
         "usedAccounts": 0.3,
         "remainingAccounts": 2.7
@@ -111,8 +111,8 @@ if [[ "${AI_USAGE_OMP_PARTIAL:-}" == 1 ]]; then
       "fetchedAt": 4102444800000,
       "limits": [
         {
-          "id": "credits:7d",
-          "window": {"id": "7d"},
+          "id": "credits:monthly",
+          "window": {"id": "monthly"},
           "amount": {"usedFraction": 0},
           "status": "ok"
         }
@@ -128,8 +128,8 @@ if [[ "${AI_USAGE_OMP_PARTIAL:-}" == 1 ]]; then
       "fetchedAt": 4102444920000,
       "limits": [
         {
-          "id": "credits:7d",
-          "window": {"id": "7d"},
+          "id": "credits:monthly",
+          "window": {"id": "monthly"},
           "amount": {"usedFraction": 0.3},
           "status": "ok"
         }
@@ -141,7 +141,7 @@ if [[ "${AI_USAGE_OMP_PARTIAL:-}" == 1 ]]; then
   "capacity": {
     "alibaba-token-plan": [
       {
-        "window": "7d",
+        "window": "monthly",
         "accounts": 3,
         "usedAccounts": 0.3,
         "remainingAccounts": 2.7
@@ -165,9 +165,9 @@ cat <<'JSON'
       },
       "limits": [
         {
-          "id": "credits:7d",
+          "id": "credits:monthly",
           "label": "7 Day Credits",
-          "window": {"id": "7d", "durationMs": 604800000},
+          "window": {"id": "monthly", "durationMs": 604800000},
           "amount": {"usedFraction": 0},
           "status": "ok"
         }
@@ -182,9 +182,9 @@ cat <<'JSON'
       },
       "limits": [
         {
-          "id": "credits:7d",
+          "id": "credits:monthly",
           "label": "7 Day Credits",
-          "window": {"id": "7d", "durationMs": 604800000},
+          "window": {"id": "monthly", "durationMs": 604800000},
           "amount": {"usedFraction": 0.036270291301974997},
           "status": "ok"
         }
@@ -199,9 +199,9 @@ cat <<'JSON'
       },
       "limits": [
         {
-          "id": "credits:7d",
+          "id": "credits:monthly",
           "label": "7 Day Credits",
-          "window": {"id": "7d", "durationMs": 604800000},
+          "window": {"id": "monthly", "durationMs": 604800000},
           "amount": {"usedFraction": 0},
           "status": "ok"
         },
@@ -220,7 +220,7 @@ cat <<'JSON'
   "capacity": {
     "alibaba-token-plan": [
       {
-        "window": "7d",
+        "window": "monthly",
         "durationMs": 604800000,
         "accounts": 3,
         "usedAccounts": 0.036270291301975,

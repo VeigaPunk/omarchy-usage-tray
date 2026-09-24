@@ -752,13 +752,14 @@ def attach_token_plan_identity(rec: dict) -> dict:
 
 
 # QwenCloud Token Plan credit pools, declared here because nothing reachable
-# reports absolutes: the console usage RPC answers with `per1WeekPercentage`
-# alone (verified 2026-09-20 on every stored credential) and OMP only forwards
-# that one window. `pro` grants 40,000 credits/week per account, and a
-# purchased add-on bundle (Credit Pack, $15) adds 20,000 to the account that
-# owns it — both are per-account figures, so the chip sums rows instead of
-# scaling a fleet-wide number. Override per plan tier with
-# AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS / AI_USAGE_TOKEN_PLAN_ADDON_CREDITS.
+# reports absolutes: OMP forwards a single `credits:monthly` window with only a
+# usedFraction per account (verified 2026-09-24 on every stored credential).
+# `pro` grants 40,000 credits per cycle per account, and a purchased add-on
+# bundle (Credit Pack, $15) adds 20,000 to the account that owns it — both are
+# per-account figures, so the chip sums rows instead of scaling a fleet-wide
+# number. Override per plan tier with AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS
+# (legacy AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS still honored) /
+# AI_USAGE_TOKEN_PLAN_ADDON_CREDITS.
 def _token_plan_pool(env_name: str, default: int) -> int:
     raw = os.environ.get(env_name)
     if raw:
@@ -771,8 +772,11 @@ def _token_plan_pool(env_name: str, default: int) -> int:
     return default
 
 
-def _token_plan_weekly_credits() -> int:
-    return _token_plan_pool("AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS", 40000)
+def _token_plan_monthly_credits() -> int:
+    return _token_plan_pool(
+        "AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS",
+        _token_plan_pool("AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS", 40000),
+    )
 
 
 def _token_plan_addon_credits() -> int:
@@ -867,7 +871,7 @@ def _token_plan_report_usage(report: dict) -> dict:
         fraction = _token_plan_number(amount.get("usedFraction")) if isinstance(amount, dict) else None
         if fraction is not None and float(fraction) > 1:
             fraction = None
-        if limit.get("id") == "credits:7d" and window_id == "7d":
+        if limit.get("id") == "credits:monthly" and window_id == "monthly":
             if fraction is not None:
                 plan_fraction = float(fraction)
             resets_at = _token_plan_timestamp(
@@ -877,9 +881,9 @@ def _token_plan_report_usage(report: dict) -> dict:
             addon_fraction = float(fraction)
     if plan_fraction is None:
         return usage
-    weekly = _token_plan_weekly_credits()
-    total = weekly + (_token_plan_addon_credits() if addon_fraction is not None else 0)
-    used = weekly * plan_fraction
+    monthly = _token_plan_monthly_credits()
+    total = monthly + (_token_plan_addon_credits() if addon_fraction is not None else 0)
+    used = monthly * plan_fraction
     if addon_fraction is not None:
         used += _token_plan_addon_credits() * addon_fraction
     if total > 0:
@@ -945,7 +949,7 @@ def probe_token_plan() -> dict:
         and missing_count == 0
         and all(pct is not None for pct in report_pcts)
     )
-    declared_accounts = _omp_declared_accounts(payload, "alibaba-token-plan", "7d")
+    declared_accounts = _omp_declared_accounts(payload, "alibaba-token-plan", "monthly")
     under_reported = declared_accounts is not None and len(account_usage) != declared_accounts
     if credits:
         average = ratio(credits["used"], credits["total"])
