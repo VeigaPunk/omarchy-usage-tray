@@ -251,19 +251,19 @@ with open(path, encoding="utf-8") as fh:
 rec = cache["providers"]["token-plan"]
 assert rec["status"] == "ok", rec
 assert rec["windows"] == [
-    {"kind": "weekly", "label": "3-account credits", "used_pct": 4.6077},
-    {"kind": "special", "label": "Hottest account", "used_pct": 8.3333},
+    {"kind": "weekly", "label": "3-account credits", "used_pct": 4.2788},
+    {"kind": "special", "label": "Hottest account", "used_pct": 7.6923},
 ], rec["windows"]
-assert rec["credits"] == {"total": 140000.0, "used": 6450.81, "remaining": 133549.19}, rec["credits"]
+assert rec["credits"] == {"total": 155000.0, "used": 6632.16, "remaining": 148367.84}, rec["credits"]
 assert rec["snapshot"] == {
     "reports": 3,
     "accounts_without_usage": 0,
     "disabled_credentials": 0,
 }, rec["snapshot"]
 usage = rec["account_usage"]
-assert [row.get("used_pct") for row in usage] == [0, 3.627, 8.3333], usage
-assert [row.get("credits_total") for row in usage] == [40000, 40000, 60000], usage
-assert [row.get("credits_remaining") for row in usage] == [40000.0, 38549.19, 55000.0], usage
+assert [row.get("used_pct") for row in usage] == [0, 3.627, 7.6923], usage
+assert [row.get("credits_total") for row in usage] == [45000, 45000, 65000], usage
+assert [row.get("credits_remaining") for row in usage] == [45000.0, 43367.84, 60000.0], usage
 assert [row.get("fetched_at") for row in usage] == [
     "2100-01-01T00:00:00Z",
     "2100-01-01T00:01:00Z",
@@ -297,20 +297,20 @@ assert payload["alt"] == "token-plan", payload
 assert "ok" in payload["class"].split(), payload
 assert payload["text"].startswith("T @gmail "), payload["text"]
 assert payload["text"].count("bgcolor=") >= 2, payload["text"]
-assert "133.5k/140.0k" in payload["text"], payload["text"]
+assert "148.4k/155.0k" in payload["text"], payload["text"]
 tooltip = payload["tooltip"]
 for expected in (
     "Token Plan",
     "active route: gmail · routing only; not mapped to a snapshot",
-    "3-account credits: 4.6077%",
-    "credits: 133.5k remaining of 140.0k · 6.45k used",
-    "Hottest account: 8.3333% · snapshot 3",
+    "3-account credits: 4.2788%",
+    "credits: 148.4k remaining of 155.0k · 6.63k used",
+    "Hottest account: 7.6923% · snapshot 3",
     "snapshot 1: 0%",
     "snapshot 2: 3.627%",
-    "snapshot 3: 8.3333%",
-    "40.0k/40.0k credits",
-    "38.5k/40.0k credits",
-    "55.0k/60.0k credits",
+    "snapshot 3: 7.6923%",
+    "45.0k/45.0k credits",
+    "43.4k/45.0k credits",
+    "60.0k/65.0k credits",
     "2100-01-01T00:00:00Z",
     "2100-01-01T00:01:00Z",
     "2100-01-01T00:02:00Z",
@@ -347,8 +347,8 @@ assert rec["status"] == "ok", rec
 assert rec["last_error"] == "exit_42", rec
 assert rec["measured_at"] == "2100-01-01T00:00:00Z", rec
 assert rec["windows"] == [
-    {"kind": "weekly", "label": "3-account credits", "used_pct": 4.6077},
-    {"kind": "special", "label": "Hottest account", "used_pct": 8.3333},
+    {"kind": "weekly", "label": "3-account credits", "used_pct": 4.2788},
+    {"kind": "special", "label": "Hottest account", "used_pct": 7.6923},
 ], rec
 with open(sys.argv[2], encoding="utf-8") as fh:
     export = json.load(fh)

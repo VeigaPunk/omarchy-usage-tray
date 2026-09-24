@@ -754,7 +754,7 @@ def attach_token_plan_identity(rec: dict) -> dict:
 # QwenCloud Token Plan credit pools, declared here because nothing reachable
 # reports absolutes: OMP forwards a single `credits:monthly` window with only a
 # usedFraction per account (verified 2026-09-24 on every stored credential).
-# `pro` grants 40,000 credits per cycle per account, and a purchased add-on
+# `pro` grants 45,000 credits per cycle per account, and a purchased add-on
 # bundle (Credit Pack, $15) adds 20,000 to the account that owns it — both are
 # per-account figures, so the chip sums rows instead of scaling a fleet-wide
 # number. Override per plan tier with AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS
@@ -775,7 +775,7 @@ def _token_plan_pool(env_name: str, default: int) -> int:
 def _token_plan_monthly_credits() -> int:
     return _token_plan_pool(
         "AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS",
-        _token_plan_pool("AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS", 40000),
+        _token_plan_pool("AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS", 45000),
     )
 
 
