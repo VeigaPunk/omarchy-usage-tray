@@ -105,6 +105,7 @@ the Token Plan / Cursor shape. Do not invent a plugin framework.
 | OpenCode Go | OMP auth store only (keys rotate per request) | no — one store, many accounts, nothing for the chip to flip |
 | Charm Hyper | OMP auth store only (`CHARM_HYPER_API_KEY`) | no — no local file for the chip to flip |
 | Google | OMP auth store only (Antigravity OAuth) | no — no local file for the chip to flip |
+| StepFun | OMP auth store (`stepfun`, 3 API keys) | no — keys, not OAuth; chip shows live/total health, no cycle |
 
 Never `op` on right-click. Never print tokens. Never rewrite
 `~/.local/share/omarchy/`.

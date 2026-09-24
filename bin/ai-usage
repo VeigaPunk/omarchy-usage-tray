@@ -30,7 +30,7 @@ VERSION = 2
 # User-facing release. Adding a provider record (OpenCode Go, Charm Hyper)
 # leaves existing cache rows valid, so the schema stays put and only this
 # number moves.
-TOOL_VERSION = "1.4.0"
+TOOL_VERSION = "1.5.0"
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
@@ -50,6 +50,7 @@ PROVIDERS = (
     ("token-plan", "Token Plan", "T"),
     ("grok", "Grok", "G"),
     ("kimi", "Kimi", "K"),
+    ("stepfun", "StepFun", "S"),
     ("cursor", "Cursor", "R"),
     ("devin", "Devin", "D"),
     ("opencode-go", "OpenCode Go", "O"),
@@ -2098,6 +2099,144 @@ def probe_kimi() -> dict:
         rec["reason"] = "partial_usage"
     return rec
 
+# --- StepFun -----------------------------------------------------------------
+
+# StepFun exposes no usage or balance endpoint (verified 2026-09-24: every
+# /v1/*billing*, *balance*, *usage*, *quota* route 404s). What the chip can
+# honestly report is key health: the OMP auth-broker holds the API keys, and
+# each is exercised against GET /v1/models. The chip is a live/total counter,
+# not a meter.
+STEPFUN_BASE = "https://api.stepfun.ai"
+
+
+def _omp_broker_config() -> tuple[str, str | None]:
+    url = os.environ.get("AI_USAGE_OMP_BROKER_URL") or os.environ.get("OMP_AUTH_BROKER_URL") or ""
+    token = os.environ.get("AI_USAGE_OMP_BROKER_TOKEN") or os.environ.get("OMP_AUTH_BROKER_TOKEN") or ""
+    if not url or not token:
+        cfg = Path.home() / ".omp" / "agent" / "config.yml"
+        try:
+            text = cfg.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if text:
+            block = re.search(r"(?ms)^\s*broker:\s*\n((?:\s{4,}.*\n?)*)", text)
+            section = block.group(1) if block else ""
+            if not url:
+                m = re.search(r"^\s*url:\s*(\S+)", section, re.M)
+                url = m.group(1) if m else ""
+            if not token:
+                m = re.search(r"^\s*token:\s*(\S+)", section, re.M)
+                token = m.group(1) if m else ""
+    if not token:
+        try:
+            token = (Path.home() / ".omp" / "auth-broker.token").read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+    return (url or "http://127.0.0.1:8790").rstrip("/"), (token or None)
+
+
+def _broker_snapshot(url: str, token: str) -> dict | None:
+    req = urllib.request.Request(
+        url + "/v1/snapshot",
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"http_{exc.code}") from exc
+    except Exception as exc:
+        raise RuntimeError(redact(str(exc))[:80]) from exc
+    return payload if isinstance(payload, dict) else None
+
+
+def _broker_api_keys(snapshot: dict, provider: str) -> list[str]:
+    keys: list[str] = []
+    for cred in snapshot.get("credentials") or []:
+        if not isinstance(cred, dict) or cred.get("provider") != provider:
+            continue
+        blob = cred.get("credential")
+        if not isinstance(blob, dict):
+            continue
+        key = blob.get("key")
+        if isinstance(key, str) and key.strip():
+            keys.append(key.strip())
+    return keys
+
+
+def _stepfun_key_ok(key: str) -> tuple[bool, str]:
+    req = urllib.request.Request(
+        STEPFUN_BASE + "/v1/models",
+        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = getattr(resp, "status", 200)
+            return (200 <= status < 300), f"http_{status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"http_{exc.code}"
+    except Exception as exc:
+        return False, redact(str(exc))[:60]
+
+
+def _empty_stepfun(reason: str) -> dict:
+    rec = empty_provider("stepfun", "unknown", reason)
+    rec["windows"] = [
+        window("weekly", "Live keys", None),
+        window("special", "Keys", None),
+    ]
+    rec["account_usage"] = []
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
+
+
+def probe_stepfun() -> dict:
+    url, token = _omp_broker_config()
+    if not token:
+        return _empty_stepfun("no_broker_token")
+    try:
+        snapshot = _broker_snapshot(url, token)
+    except Exception as exc:
+        return _empty_stepfun(redact(str(exc))[:80] or "broker_unreachable")
+    if not isinstance(snapshot, dict):
+        return _empty_stepfun("bad_payload")
+    keys = _broker_api_keys(snapshot, "stepfun")
+    if not keys:
+        return _empty_stepfun("no_keys")
+
+    rows: list[dict] = []
+    live = 0
+    for index, key in enumerate(keys, 1):
+        ok, reason = _stepfun_key_ok(key)
+        live += 1 if ok else 0
+        rows.append(
+            {
+                "label": f"key {index}",
+                "used_pct": 0 if ok else 100,
+                "fetched_at": iso_now(),
+                "extra": {"key_ok": ok, "key_reason": reason, "key_tail": key[-4:]},
+            }
+        )
+    total = len(keys)
+    status = "ok" if live == total else ("unknown" if live == 0 else "ok")
+    rec = {
+        "id": "stepfun",
+        "name": "StepFun",
+        "logo": "S",
+        "status": status,
+        "windows": [
+            window("weekly", "Live keys", as_pct(100.0 * live / total)),
+            window("special", "Keys", None, None, {"live": live, "total": total}),
+        ],
+        "account_usage": rows,
+        "snapshot": {"reports": total, "accounts_without_usage": total - live, "disabled_credentials": 0},
+    }
+    if live < total:
+        rec["reason"] = f"{total - live} key(s) failing"
+    return rec
+
 
 # --- Cursor ------------------------------------------------------------------
 
@@ -3162,6 +3301,7 @@ PROBERS = {
     "charm-hyper": probe_charm_hyper,
     "zai": probe_zai,
     "google": probe_google,
+    "stepfun": probe_stepfun,
 }
 
 
@@ -3291,6 +3431,11 @@ def usage_row_line(index: int, row: dict) -> str:
     and every window the row measured; providers that cannot (Token Plan's
     anonymous credit reports) render exactly as before.
     """
+    extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+    if "key_ok" in extra:
+        tail = str(extra.get("key_tail") or "")
+        state = "ok" if extra.get("key_ok") else str(extra.get("key_reason") or "dead")
+        return f"{row.get('label') or f'key {index}'} (…{tail}): {state}"
     bit = f"snapshot {index}: {_pct_label(row.get('used_pct'))}"
     account = str(row.get("account") or "").strip()
     if account:
@@ -3480,6 +3625,8 @@ def cmd_waybar() -> int:
     if extra.get("kind") == "credits" and extra_bits.get("remaining_usd") is not None:
         usd = float(extra_bits["remaining_usd"])
         extra_txt = f"${usd:.0f}" if usd >= 10 else f"${usd:.2f}"
+    elif extra_bits.get("live") is not None and extra_bits.get("total") is not None:
+        extra_txt = f"{extra_bits['live']}/{extra_bits['total']}"
     else:
         extra_txt = meter(extra.get("used_pct"))
     text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {extra_txt}"
@@ -3490,7 +3637,11 @@ def cmd_waybar() -> int:
         classes.append("stale")
     pcts = [as_pct(weekly.get("used_pct")), as_pct(extra.get("used_pct"))]
     known = [p for p in pcts if p is not None]
-    if known and max(known) >= 95:
+    if pid == "stepfun":
+        # "Live keys" is a health gauge: 100% is the good end, not a cap.
+        if extra_bits.get("live") is not None and extra_bits.get("live") < extra_bits.get("total", 0):
+            classes.append("warn")
+    elif known and max(known) >= 95:
         classes.append("critical")
     elif known and max(known) >= 80:
         classes.append("warn")
@@ -3506,11 +3657,13 @@ def cmd_waybar() -> int:
         if not isinstance(w, dict):
             continue
         label = w.get("label") or w.get("kind")
+        extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
         if "used_pct" in w:
             bit = f"{label}: {w['used_pct']}%"
+        elif extra_bits.get("live") is not None and extra_bits.get("total") is not None:
+            bit = f"{label}: {extra_bits['live']}/{extra_bits['total']} live"
         else:
             bit = f"{label}: —"
-        extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
         if extra_bits.get("remaining_usd") is not None:
             bit += f"  ${float(extra_bits['remaining_usd']):.2f} left"
         if w.get("resets_at"):

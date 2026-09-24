@@ -18,6 +18,7 @@ chip renders whichever one is selected.
 | `T` | Token Plan | Per-account credits across the fleet, hottest account, add-on packs | `omp usage --provider alibaba-token-plan --json` |
 | `G` | Grok | Weekly | `grok` CLI billing RPC |
 | `K` | Kimi | Monthly total, 5-hour, monthly code — per OAuth account, averaged + hottest | `omp usage --provider kimi-code --json` |
+| `S` | StepFun | Live/total API keys (no usage API exists) | `omp auth-broker` snapshot + `GET /v1/models` per key |
 | `R` | Cursor | Weekly, Auto, on-demand balance when reported | `cursor.com` usage + parked OAuth sessions |
 | `D` | Devin | Weekly quota, plan cycle | CLI `GetUserStatus` session |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
