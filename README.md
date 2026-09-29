@@ -1,11 +1,11 @@
 # omarchy-usage-tray
 
-Waybar chip for Omarchy: Codex, Token Plan, Grok, Kimi, Cursor, Devin,
-OpenCode Go, Charm Hyper, Z.ai, and Google usage. Left-click or scroll to
-cycle providers; right-click cycles identities for the selected provider when
-supported.
+Waybar chip for Omarchy: Codex, Token Plan, Grok, Kimi, Cursor, Devin (both
+accounts), OpenCode Go, Charm Hyper, Z.ai, and Google usage. Left-click or
+scroll to cycle providers; right-click cycles identities for the selected
+provider when supported.
 
-Current release: **1.3.1** (`ai-usage --version`).
+Current release: **1.6.0** (`ai-usage --version`).
 
 ## Providers
 
@@ -21,6 +21,7 @@ chip renders whichever one is selected.
 | `S` | StepFun | Live/total API keys (no usage API exists) | `omp auth-broker` snapshot + `GET /v1/models` per key |
 | `R` | Cursor | Weekly, Auto, on-demand balance when reported | `cursor.com` usage + parked OAuth sessions |
 | `D` | Devin | Weekly quota, plan cycle | CLI `GetUserStatus` session |
+| `d` | Devin 2 | Weekly quota, plan cycle | `GetUserStatus` via the second OAuth session in OMP's `agent.db` |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
 | `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
 | `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |

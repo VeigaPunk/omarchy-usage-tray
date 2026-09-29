@@ -30,7 +30,7 @@ VERSION = 2
 # User-facing release. Adding a provider record (OpenCode Go, Charm Hyper)
 # leaves existing cache rows valid, so the schema stays put and only this
 # number moves.
-TOOL_VERSION = "1.5.0"
+TOOL_VERSION = "1.6.0"
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
@@ -53,6 +53,7 @@ PROVIDERS = (
     ("stepfun", "StepFun", "S"),
     ("cursor", "Cursor", "R"),
     ("devin", "Devin", "D"),
+    ("devin2", "Devin 2", "d"),
     ("opencode-go", "OpenCode Go", "O"),
     ("charm-hyper", "Charm Hyper", "H"),
     ("zai", "Z.ai", "Z"),
@@ -2252,6 +2253,13 @@ DEVIN_CREDENTIALS = Path.home() / ".local" / "share" / "devin" / "credentials.to
 DEVIN_USER_STATUS_RPC = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 DEVIN_DEFAULT_API_SERVER = "https://server.codeium.com"
 DEVIN_DEFAULT_WEBAPP = "app.devin.ai"
+DEVIN_SESSION_PREFIX = "devin-session-token$"
+# Second Devin account lives in OMP's auth store (`agent.db`), not the devin
+# CLI's credentials.toml. Override with AI_USAGE_DEVIN2_ACCOUNT (substring match
+# on the session id / email identity) or AI_USAGE_DEVIN2_API_KEY (raw token).
+OMP_AGENT_DB = Path.home() / ".omp" / "agent" / "agent.db"
+AI_USAGE_DEVIN2_ACCOUNT = "AI_USAGE_DEVIN2_ACCOUNT"
+AI_USAGE_DEVIN2_API_KEY = "AI_USAGE_DEVIN2_API_KEY"
 
 
 class _CursorRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -2491,14 +2499,12 @@ def _devin_credentials() -> dict | None:
     return data if data.get("windsurf_api_key") else None
 
 
-def _devin_user_status() -> dict | None:
-    creds = _devin_credentials()
-    if not creds:
+def _devin_user_status(api_key: str | None, server: str | None = None) -> dict | None:
+    if not api_key:
         return None
-    key = creds.get("windsurf_api_key")
-    if not isinstance(key, str) or not key:
-        return None
-    server = creds.get("api_server_url")
+    key = api_key
+    if not key.startswith(DEVIN_SESSION_PREFIX):
+        key = DEVIN_SESSION_PREFIX + key
     if not isinstance(server, str) or not server.startswith("https://"):
         server = DEVIN_DEFAULT_API_SERVER
     metadata = {
@@ -2542,6 +2548,68 @@ def _devin_user_status() -> dict | None:
     return payload
 
 
+def _devin_session_id(jwt: str) -> str | None:
+    try:
+        part = jwt.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part))
+    except Exception:
+        return None
+    sid = payload.get("session_id")
+    return sid if isinstance(sid, str) else None
+
+
+def _devin2_candidates() -> list[tuple[str, str]]:
+    """(account tag, raw session JWT) for devin OAuth rows in OMP's auth store.
+
+    Rows are newest-first so a re-login wins over a stale duplicate session.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        import sqlite3
+
+        db = sqlite3.connect(f"file:{OMP_AGENT_DB}?mode=ro", uri=True)
+        try:
+            rows = db.execute(
+                "SELECT id, json_extract(data, '$.access') FROM auth_credentials "
+                "WHERE provider = 'devin' AND credential_type = 'oauth' ORDER BY id DESC"
+            ).fetchall()
+        finally:
+            db.close()
+    except Exception:
+        return out
+    for cid, access in rows:
+        if isinstance(access, str) and access:
+            sid = _devin_session_id(access) or f"cred-{cid}"
+            out.append((f"{sid[-6:]}#{cid}", access))
+    return out
+
+
+def _devin2_api_key() -> tuple[str, str] | tuple[None, None]:
+    """(tag, token) for the secondary Devin account.
+
+    Picks the OMP credential that is not the session active in the devin CLI's
+    credentials.toml (the primary row on the chip). AI_USAGE_DEVIN2_ACCOUNT pins
+    a substring of the session id when several spares exist.
+    """
+    explicit = os.environ.get(AI_USAGE_DEVIN2_API_KEY)
+    if explicit:
+        return ("env", explicit)
+    primary = _devin_credentials()
+    primary_key = primary.get("windsurf_api_key") if isinstance(primary, dict) else None
+    primary_sid = _devin_session_id(str(primary_key or "").removeprefix(DEVIN_SESSION_PREFIX))
+    account_filter = os.environ.get(AI_USAGE_DEVIN2_ACCOUNT) or ""
+    for tag, token in _devin2_candidates():
+        if primary_sid and _devin_session_id(token) == primary_sid:
+            continue
+        if account_filter and account_filter not in tag:
+            continue
+        return (tag, token)
+    return (None, None)
+
+
+
+
 def _devin_quota_pct(remaining) -> float | None:
     """planStatus reports *remaining* percent; the chip meters used."""
     rem = as_pct(remaining)
@@ -2549,8 +2617,8 @@ def _devin_quota_pct(remaining) -> float | None:
         return None
     return as_pct(100.0 - rem)
 
-def _empty_devin(status: str, reason: str) -> dict:
-    rec = empty_provider("devin", status, reason)
+def _empty_devin(status: str, reason: str, pid: str = "devin") -> dict:
+    rec = empty_provider(pid, status, reason)
     rec["windows"] = [
         {"kind": "weekly", "label": "Weekly quota"},
         {"kind": "special", "label": "Plan cycle"},
@@ -2558,17 +2626,25 @@ def _empty_devin(status: str, reason: str) -> dict:
     return rec
 
 
-def normalize_devin(raw: dict) -> dict:
+def normalize_devin(raw: dict, pid: str = "devin") -> dict:
+    name, logo = PROVIDER_INDEX[pid]
     rec = {
-        "id": "devin",
-        "name": "Devin",
-        "logo": "D",
+        "id": pid,
+        "name": name,
+        "logo": logo,
         "status": "unknown",
         "windows": [],
     }
     status = raw.get("userStatus") if isinstance(raw.get("userStatus"), dict) else {}
     plan_status = status.get("planStatus") if isinstance(status.get("planStatus"), dict) else {}
     plan_info = plan_status.get("planInfo") if isinstance(plan_status.get("planInfo"), dict) else {}
+    if not plan_info:
+        top_plan = raw.get("planInfo")
+        if isinstance(top_plan, dict):
+            plan_info = top_plan
+    email = status.get("email")
+    if isinstance(email, str) and email:
+        rec["identity"] = {"id": email, "label": email, "title": email}
     plan_name = plan_info.get("planName") or plan_info.get("teamsTier")
     if isinstance(plan_name, str) and plan_name:
         rec["plan"] = plan_name.removeprefix("TEAMS_TIER_DEVIN_").removeprefix("TEAMS_TIER_").title() \
@@ -2605,7 +2681,10 @@ def probe_devin(fixture: str | None = None) -> dict:
             pass
         return _empty_devin("unknown", "bad_payload")
     try:
-        raw = _devin_user_status()
+        creds = _devin_credentials()
+        key = creds.get("windsurf_api_key") if isinstance(creds, dict) else None
+        raw = _devin_user_status(key if isinstance(key, str) else None,
+                                creds.get("api_server_url") if isinstance(creds, dict) else None)
         if raw is None:
             return _empty_devin("unauth", "need_devin_login")
         return normalize_devin(raw)
@@ -2617,6 +2696,41 @@ def probe_devin(fixture: str | None = None) -> dict:
         if "auth" in low or "login" in low or "401" in msg:
             return _empty_devin("unauth", "need_devin_login")
         return _empty_devin("unknown", msg or "probe_failed")
+
+
+def probe_devin2(fixture: str | None = None) -> dict:
+    """Secondary Devin account: the OAuth session OMP keeps in agent.db."""
+    if fixture:
+        try:
+            raw = json.loads(Path(fixture).read_text(encoding="utf-8"))
+            if "providers" in raw and "devin2" in (raw.get("providers") or {}):
+                rec = raw["providers"]["devin2"]
+                rec.setdefault("id", "devin2")
+                return rec
+            if isinstance(raw, dict):
+                return normalize_devin(raw, pid="devin2")
+        except (OSError, json.JSONDecodeError):
+            pass
+        return _empty_devin("unknown", "bad_payload", pid="devin2")
+    tag, token = _devin2_api_key()
+    if not token:
+        return _empty_devin("unauth", "need_omp_devin2", pid="devin2")
+    try:
+        raw = _devin_user_status(token)
+        if raw is None:
+            return _empty_devin("unauth", "need_omp_devin2", pid="devin2")
+        rec = normalize_devin(raw, pid="devin2")
+        if "identity" not in rec:
+            rec["identity"] = {"id": tag, "label": tag, "title": tag}
+        return rec
+    except _KimiUnauth:
+        return _empty_devin("unauth", "need_omp_devin2", pid="devin2")
+    except Exception as exc:
+        msg = redact(str(exc))[:200]
+        low = msg.lower()
+        if "auth" in low or "login" in low or "401" in msg:
+            return _empty_devin("unauth", "need_omp_devin2", pid="devin2")
+        return _empty_devin("unknown", msg or "probe_failed", pid="devin2")
 
 
 
@@ -3301,6 +3415,7 @@ PROBERS = {
     "kimi": probe_kimi,
     "cursor": probe_cursor,
     "devin": probe_devin,
+    "devin2": probe_devin2,
     "opencode-go": probe_opencode_go,
     "charm-hyper": probe_charm_hyper,
     "zai": probe_zai,
@@ -3338,7 +3453,7 @@ def cmd_probe(ids: list[str], fixture: str | None) -> int:
     cache = load_cache()
     targets = ids or [pid for pid, _, _ in PROVIDERS]
     for pid in targets:
-        rec = probe_one(pid, fixture if pid in ("codex", "cursor", "devin") else None)
+        rec = probe_one(pid, fixture if pid in ("codex", "cursor", "devin", "devin2") else None)
         upsert(cache, rec)
         print(summarize(rec))
     cache["selected"] = pick_selected(cache)
