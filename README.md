@@ -5,23 +5,29 @@ accounts), OpenCode Go, Charm Hyper, Z.ai, and Google usage. Left-click or
 scroll to cycle providers; right-click cycles identities for the selected
 provider when supported.
 
-Current release: **1.6.0** (`ai-usage --version`).
+Current release: **1.7.0** (`ai-usage --version`).
+
+Every usage meter comes from `omp usage --provider <id> --json` — the native
+CLIs (codex, grok, cursor-agent, devin) are not required, because OMP meters
+those same subscriptions from its auth store. The chip only scopes to authed,
+metered providers (status ok, a numeric window, or a credit balance — see
+`_provider_usable`): a provider that cannot show a real number drops out of
+the cycle instead of rendering an invented zero.
 
 ## Providers
 
-Every provider below is metered on every probe, from the source listed, and the
-chip renders whichever one is selected.
+Every provider below is metered on every probe, from `omp usage --json`, and
+the chip renders whichever one is selected.
 
 | Logo | Provider | Windows the chip shows | Source |
 |---|---|---|---|
-| `C` | Codex | Weekly, plus Spark when the account reports it | `codex` app-server JSON-RPC |
+| `C` | Codex | Weekly 7-day, hottest account | `omp usage --provider openai-codex --json` |
 | `T` | Token Plan | Per-account credits across the fleet, hottest account, add-on packs | `omp usage --provider alibaba-token-plan --json` |
-| `G` | Grok | Weekly | `grok` CLI billing RPC |
+| `G` | Grok | Weekly credits, hottest account | `omp usage --provider xai-oauth --json` |
 | `K` | Kimi | Monthly total, 5-hour, monthly code — per OAuth account, averaged + hottest | `omp usage --provider kimi-code --json` |
-| `S` | StepFun | Live/total API keys (no usage API exists) | `omp auth-broker` snapshot + `GET /v1/models` per key |
-| `R` | Cursor | Weekly, Auto, on-demand balance when reported | `cursor.com` usage + parked OAuth sessions |
-| `D` | Devin | Weekly quota, plan cycle | CLI `GetUserStatus` session |
-| `d` | Devin 2 | Weekly quota, plan cycle | `GetUserStatus` via the second OAuth session in OMP's `agent.db` |
+| `R` | Cursor | Monthly models + other models, hottest | `omp usage --provider cursor --json` |
+| `D` | Devin | Weekly quota, hottest account | `omp usage --provider devin --json` |
+| `d` | Devin 2 | Weekly quota, second account | `omp usage --provider devin --json` (second report row) |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
 | `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
 | `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
@@ -94,7 +100,7 @@ Re-run the same line to update.
 | Gesture | Action |
 |---|---|
 | Left-click | Next provider |
-| Right-click | Next identity / active route (Token Plan slots; Cursor parked OAuth) |
+| Right-click | Next identity / active route (Token Plan slots) |
 | Scroll | Cycle providers |
 
 Click and scroll change the chip immediately: `cycle` / `identity` signal
@@ -125,15 +131,13 @@ slots in `~/.config/alibaba-token-plan/slots` and rewrites
 `token-plan-key` follow that route. The route change preserves OMP's fleet
 meters; 1Password is only used by `token-plan-swap pull`.
 
-Cursor dual-OAuth uses `cursor-oauth-swap` (same Token Plan shape). Kimi runs
-both OAuth accounts through `omp auth-gateway` (127.0.0.1:8791): the gateway
-round-robins new sessions across the stored `kimi-code` credentials and retries
-on the other account after a usage-limit block, so the chip meters the fleet
-and right-click just reports the balanced state. Codex / Grok / OpenCode Go /
-Charm Hyper / Z.ai / Google stay no-ops until a second store exists — OpenCode
-Go keys rotate inside OMP, and Charm Hyper's and Google's credentials live in
-OMP's auth store, so none has a live file for the chip to flip. See
-[`docs/identity-swap.md`](docs/identity-swap.md).
+Kimi runs both OAuth accounts through `omp auth-gateway` (127.0.0.1:8791): the
+gateway round-robins new sessions across the stored `kimi-code` credentials and
+retries on the other account after a usage-limit block, so the chip meters the
+fleet and right-click just reports the balanced state. Cursor / Codex / Grok /
+OpenCode Go / Charm Hyper / Z.ai / Google stay no-ops — OpenCode Go keys rotate
+inside OMP, and Charm Hyper's, Cursor's, and Google's credentials live in OMP's
+auth store, so none has a live file for the chip to flip.
 
 ## Configuration
 

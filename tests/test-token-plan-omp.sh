@@ -337,7 +337,7 @@ failure_output="$("$BIN" probe token-plan 2>&1)"
 
 retained_waybar="$("$BIN" waybar 2>&1)"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 2 ]] || fail "Waybar invoked OMP after a retained error"
-python3 - "$AI_USAGE_CACHE" "$XDG_STATE_HOME/omarchy/agents/usage/token-plan.json" "$retained_waybar" <<'PY'
+python3 - "$AI_USAGE_CACHE" "$retained_waybar" <<'PY'
 import json
 import sys
 
@@ -350,14 +350,9 @@ assert rec["windows"] == [
     {"kind": "weekly", "label": "3-account credits", "used_pct": 4.2788},
     {"kind": "special", "label": "Hottest account", "used_pct": 7.6923},
 ], rec
-with open(sys.argv[2], encoding="utf-8") as fh:
-    export = json.load(fh)
-assert export["ready"] is False, export
-assert export["updatedAt"] == rec["measured_at"], export
-assert export["usageStatusText"] == "exit_42", export
-waybar = json.loads(sys.argv[3])
+waybar = json.loads(sys.argv[2])
 assert "last error: exit_42" in waybar["tooltip"], waybar
-encoded = json.dumps({"cache": rec, "export": export, "waybar": waybar})
+encoded = json.dumps({"cache": rec, "waybar": waybar})
 assert "synth-failure" not in encoded, encoded
 PY
 
@@ -369,7 +364,7 @@ partial_output="$("$BIN" probe token-plan 2>&1)"
 partial_waybar="$("$BIN" waybar 2>&1)"
 partial_tui="$("$BIN" tui 2>&1)"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 3 ]] || fail "cache consumers invoked OMP for partial data"
-python3 - "$AI_USAGE_CACHE" "$XDG_STATE_HOME/omarchy/agents/usage/token-plan.json" "$partial_waybar" "$partial_tui" <<'PY'
+python3 - "$AI_USAGE_CACHE" "$partial_waybar" "$partial_tui" <<'PY'
 import json
 import sys
 
@@ -383,15 +378,10 @@ assert rec["windows"] == [
     {"kind": "special", "label": "Hottest account"},
 ], rec
 assert [row.get("used_pct") for row in rec["account_usage"]] == [0, None, 30], rec
-with open(sys.argv[2], encoding="utf-8") as fh:
-    export = json.load(fh)
-assert export["ready"] is False, export
-assert export["updatedAt"] == rec["measured_at"], export
-assert export["usageStatusText"] == "partial_usage", export
-waybar = json.loads(sys.argv[3])
+waybar = json.loads(sys.argv[2])
 assert "partial_usage" in waybar["tooltip"], waybar
 assert "Hottest account: —" in waybar["tooltip"], waybar
-assert "ok  partial_usage" in sys.argv[4], sys.argv[4]
+assert "ok  partial_usage" in sys.argv[3], sys.argv[3]
 PY
 
 unset AI_USAGE_OMP_PARTIAL
@@ -399,7 +389,7 @@ export AI_USAGE_OMP_SHORT=1
 short_output="$("$BIN" probe token-plan 2>&1)"
 [[ "$short_output" == *'token-plan ok partial_usage weekly=15'* ]] || fail "short OMP snapshot lost its bounded partial state"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 4 ]] || fail "short probe invoked OMP more than once"
-python3 - "$AI_USAGE_CACHE" "$XDG_STATE_HOME/omarchy/agents/usage/token-plan.json" <<'PY'
+python3 - "$AI_USAGE_CACHE" <<'PY'
 import json
 import sys
 
@@ -407,11 +397,6 @@ with open(sys.argv[1], encoding="utf-8") as fh:
     rec = json.load(fh)["providers"]["token-plan"]
 assert rec["reason"] == "partial_usage", rec
 assert "measured_at" not in rec, rec
-with open(sys.argv[2], encoding="utf-8") as fh:
-    export = json.load(fh)
-assert export["ready"] is False, export
-assert export["updatedAt"] == "", export
-assert export["usageStatusText"] == "partial_usage", export
 PY
 
 echo TOKEN_PLAN_OMP_OK

@@ -4,53 +4,37 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import fcntl
 import json
 import os
 import re
-import select
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlencode
-import tomllib
 
 # Cache schema. 2 replaced the Token Plan `capacity` block with credit totals
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
-# User-facing release. Adding a provider record (OpenCode Go, Charm Hyper)
-# leaves existing cache rows valid, so the schema stays put and only this
-# number moves.
-TOOL_VERSION = "1.6.0"
+# User-facing release. Every usage meter now comes from `omp usage --json`;
+# native CLI probes (codex RPC, grok/cursor/devin HTTP) are gone, so the
+# tool version jumps a minor.
+TOOL_VERSION = "1.7.0"
 METER_WIDTH = 6
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
 NBSP = "\u00a0"
 TUI_METER_WIDTH = 20
 STALE_AFTER_SEC = 20 * 60
-CODEX_CANDIDATES = ("codex-titanium", "codex")
-CODEX_ARGS = ["-s", "read-only", "-a", "never", "app-server"]
-RPC_TIMEOUT_SEC = 20.0
-SCAN_REUSE_SECONDS = 20
-SCAN_LIMITS_REUSE_SECONDS = 900
-USD_CENTS = Decimal("0.01")
-MILLION = Decimal("1000000")
 
 PROVIDERS = (
     ("codex", "Codex", "C"),
     ("token-plan", "Token Plan", "T"),
     ("grok", "Grok", "G"),
     ("kimi", "Kimi", "K"),
-    ("stepfun", "StepFun", "S"),
     ("cursor", "Cursor", "R"),
     ("devin", "Devin", "D"),
     ("devin2", "Devin 2", "d"),
@@ -65,9 +49,6 @@ PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 def ensure_path() -> None:
     extra = [
         str(Path.home() / ".local/bin"),
-        str(Path.home() / ".grok/bin"),
-        str(Path.home() / ".local/share/mise/shims"),
-        str(Path.home() / ".local/share/mise/installs/node/latest/bin"),
         "/usr/local/bin",
         "/usr/bin",
     ]
@@ -81,19 +62,6 @@ def cache_path() -> Path:
 
 def selected_path() -> Path:
     return Path(os.environ.get("AI_USAGE_SELECTED", Path.home() / ".config/ai-usage/selected"))
-
-
-def repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
-
-
-def prices_path() -> Path:
-    return Path(os.environ.get("AI_USAGE_PRICES", repo_root() / "prices.toml"))
-
-
-def quattro_state_dir() -> Path:
-    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
-    return Path(state) / "omarchy" / "agents" / "usage"
 
 
 def waybar_signal() -> int:
@@ -319,48 +287,9 @@ def child_env() -> dict:
         "XAI_API_KEY",
         "GROK_API_KEY",
         "BAILIAN_TOKEN_PLAN_API_KEY",
-        "CURSOR_OAUTH_TOKEN",
-        "CURSOR_AUTH_FILE",
     ):
         env.pop(key, None)
     return env
-
-
-def codex_cmd() -> list[str]:
-    """First codex binary that actually answers --version on this PATH.
-
-    The legacy `codex` wrapper needs mise+node on PATH (dies in the systemd
-    service's minimal env); codex-titanium is a self-contained rust binary.
-    """
-    for cand in CODEX_CANDIDATES:
-        if not which(cand):
-            continue
-        try:
-            probe = subprocess.run(
-                [cand, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                env=child_env(),
-                check=False,
-            )
-            if probe.returncode == 0 and (probe.stdout or "").strip():
-                return [cand, *CODEX_ARGS]
-        except Exception:
-            continue
-    return ["codex", *CODEX_ARGS]
-
-
-def grok_bin() -> str | None:
-    explicit = os.environ.get("GROK_BIN")
-    if explicit:
-        p = Path(explicit)
-        if p.is_file() and os.access(p, os.X_OK):
-            return str(p)
-    home = Path.home() / ".grok" / "bin" / "grok"
-    if home.is_file() and os.access(home, os.X_OK):
-        return str(home)
-    return which("grok")
 
 
 def _has_meter(rec: dict) -> bool:
@@ -398,230 +327,174 @@ def upsert(cache: dict, rec: dict) -> None:
 
 def pick_selected(cache: dict) -> str:
     current = read_selected(cache)
-    present = [pid for pid, _, _ in PROVIDERS if pid in cache.get("providers", {})]
-    if current in present:
+    providers = cache.get("providers", {})
+    usable = [pid for pid, _, _ in PROVIDERS if _provider_usable(providers.get(pid))]
+    if current in usable:
         return current
-    for pid, rec in cache.get("providers", {}).items():
-        if isinstance(rec, dict) and rec.get("status") == "ok":
-            return pid
+    if usable:
+        return usable[0]
+    present = [pid for pid, _, _ in PROVIDERS if pid in providers]
     if present:
         return present[0]
     return "codex"
 
 
-# --- Codex RPC ---------------------------------------------------------------
+# --- OMP-metered providers ---------------------------------------------------
+# Every usage meter comes from `omp usage --provider ... --json`; the native
+# CLIs (codex, grok, cursor-agent, devin) are not required because OMP meters
+# those same subscriptions from its auth store. The roster is scoped to
+# providers OMP actually answers for, so no auth is ever guessed.
+
+# provider id -> (omp provider, ((limit id, kind, short label, long label, primary), ...))
+OMP_FALLBACK_SPECS = {
+    "codex": ("openai-codex", (
+        ("openai-codex:primary", "weekly", "7d", "7 days", True),
+    )),
+    "grok": ("xai-oauth", (
+        ("xai-oauth:credits:1w", "weekly", "credits", "SuperGrok Weekly Credits", True),
+        ("xai-oauth:product:grokbuild:1w", "component", "build", "Grok Build (Weekly)", False),
+        ("xai-oauth:product:grokchat:1w", "component", "chat", "GrokChat (Weekly)", False),
+    )),
+    "cursor": ("cursor", (
+        ("cursor:usd:individual-auto", "monthly", "models", "Cursor Models", True),
+        ("cursor:usd:individual-api", "monthly", "other", "Other Models", True),
+    )),
+    "devin": ("devin", (
+        ("devin:quota:weekly", "weekly", "7d", "Weekly Quota", True),
+    )),
+    # Same OMP provider as devin; probe_devin2 pins the second account row.
+    "devin2": ("devin", (
+        ("devin:quota:weekly", "weekly", "7d", "Weekly Quota", True),
+    )),
+}
 
 
-def _send(proc: subprocess.Popen, obj: dict) -> None:
-    line = json.dumps(obj, separators=(",", ":")) + "\n"
-    proc.stdin.write(line.encode("utf-8"))
-    proc.stdin.flush()
+def _omp_fallback_rec(pid: str, report_index: int | None = None) -> dict | None:
+    """Build a provider record from `omp usage`.
 
+    report_index pins one account out of a multi-account provider (devin2);
+    None folds every report the provider answered into one record.
+    """
+    spec = OMP_FALLBACK_SPECS.get(pid)
+    if spec is None:
+        return None
+    omp_provider, limit_specs = spec
+    payload, _failure = omp_usage_payload(omp_provider)
+    if payload is None:
+        return None
+    reports = [
+        report
+        for report in payload.get("reports") or []
+        if isinstance(report, dict) and report.get("provider") == omp_provider
+    ]
+    if report_index is not None:
+        if len(reports) <= report_index:
+            return None
+        reports = [reports[report_index]]
+    if not reports:
+        return None
 
-def _recv_until(proc: subprocess.Popen, pred, deadline: float, buf: bytearray) -> dict:
-    while time.time() < deadline:
-        if proc.poll() is not None and not buf:
-            raise RuntimeError(f"rpc exited {proc.returncode}")
-        timeout = max(0.05, min(0.5, deadline - time.time()))
-        r, _, _ = select.select([proc.stdout], [], [], timeout)
-        if r:
-            chunk = os.read(proc.stdout.fileno(), 65536)
-            if not chunk:
-                if proc.poll() is not None:
-                    raise RuntimeError(f"rpc exited {proc.returncode}")
+    name, logo = PROVIDER_INDEX[pid]
+    spec_values: dict[str, list[float]] = {}
+    spec_reset: dict[str, str] = {}
+    primary_limits: list[tuple[float, str | None]] = []
+    rows: list[dict] = []
+    timestamps: list[str] = []
+    for report in reports:
+        fetched = _token_plan_timestamp(report.get("fetchedAt"))
+        if fetched:
+            timestamps.append(fetched)
+        meta = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
+        who = str(meta.get("email") or meta.get("accountId") or "").strip()
+        matched: dict[str, tuple[float, str | None]] = {}
+        for limit in report.get("limits") or []:
+            if not isinstance(limit, dict):
                 continue
-            buf.extend(chunk)
-        while True:
-            nl = buf.find(b"\n")
-            if nl < 0:
-                break
-            raw = bytes(buf[:nl])
-            del buf[: nl + 1]
-            raw = raw.strip()
-            if not raw:
+            entry = next((item for item in limit_specs if item[0] == limit.get("id")), None)
+            if entry is None:
                 continue
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
+            lid, kind, _short, long, primary = entry
+            frac = _opencode_go_fraction((limit.get("amount") or {}).get("usedFraction"))
+            if frac is None:
                 continue
-            if not isinstance(msg, dict):
-                continue
-            if pred(msg):
-                return msg
-    raise TimeoutError("rpc timed out")
+            win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+            reset = iso_from_unix(win.get("resetsAt"))
+            matched[long] = (frac * 100.0, reset)
+            spec_values.setdefault(lid, []).append(frac * 100.0)
+            if reset and lid not in spec_reset:
+                spec_reset[lid] = reset
+            if primary:
+                primary_limits.append((frac * 100.0, reset))
+        for long, (pct, reset) in matched.items():
+            row: dict = {"label": long, "used_pct": as_pct(pct)}
+            if who:
+                row["account"] = who
+            if reset:
+                row["resets_at"] = reset
+            if fetched:
+                row["fetched_at"] = fetched
+            rows.append(row)
 
-
-def _id_match(msg: dict, rid) -> bool:
-    return "id" in msg and msg["id"] == rid and ("result" in msg or "error" in msg)
-
-
-def codex_rate_limits() -> dict:
-    """JSON-RPC: initialize → initialized → account/read → account/rateLimits/read."""
-    cmd = codex_cmd()
-    if not which(cmd[0]):
-        raise FileNotFoundError(cmd[0])
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=child_env(),
-        start_new_session=True,
-    )
-    buf = bytearray()
-    deadline = time.time() + RPC_TIMEOUT_SEC
-    try:
-        _send(
-            proc,
-            {
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {
-                        "name": "ai-usage",
-                        "title": "Omarchy usage tray",
-                        "version": "0.1.0",
-                    },
-                    "capabilities": {"experimentalApi": True},
-                },
-            },
-        )
-        init = _recv_until(proc, lambda m: _id_match(m, 1), deadline, buf)
-        if "error" in init:
-            raise RuntimeError(redact(str(init["error"])))
-        _send(proc, {"method": "initialized"})
-        _send(proc, {"id": 2, "method": "account/read", "params": {"refreshToken": False}})
-        acct = _recv_until(proc, lambda m: _id_match(m, 2), deadline, buf)
-        if "error" in acct:
-            raise RuntimeError(redact(str(acct["error"])))
-        _send(proc, {"id": 3, "method": "account/rateLimits/read"})
-        limits = _recv_until(proc, lambda m: _id_match(m, 3), deadline, buf)
-        if "error" in limits:
-            raise RuntimeError(redact(str(limits["error"])))
-        result = limits.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError("rateLimits/read missing result")
-        account = (acct.get("result") or {}).get("account") if isinstance(acct.get("result"), dict) else None
-        if isinstance(account, dict):
-            result = dict(result)
-            result["_planType"] = account.get("planType")
-            result["_accountType"] = account.get("type")
-        return result
-    finally:
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-
-
-def _pick_spark(by_id: dict) -> tuple[dict | None, dict | None]:
-    spark = by_id.get("codex_bengalfox")
-    if not isinstance(spark, dict):
-        return None, None
-    secondary = spark.get("secondary")
-    primary = spark.get("primary")
-    if isinstance(secondary, dict) and "usedPercent" in secondary:
-        return spark, secondary
-    if isinstance(primary, dict) and "usedPercent" in primary:
-        return spark, primary
-    return spark, None
-
-
-def normalize_codex(raw: dict) -> dict:
-    rate = raw.get("rateLimits") if isinstance(raw.get("rateLimits"), dict) else {}
-    by_id = raw.get("rateLimitsByLimitId") if isinstance(raw.get("rateLimitsByLimitId"), dict) else {}
-    plan = rate.get("planType") or raw.get("_planType") or raw.get("planType")
-    primary = rate.get("primary") if isinstance(rate.get("primary"), dict) else None
-    rec = {
-        "id": "codex",
-        "name": "Codex",
-        "logo": "C",
-        "status": "unknown",
-        "windows": [],
-    }
-    if plan:
-        rec["plan"] = str(plan)
+    if not any(spec_values.get(item[0]) for item in limit_specs if item[4]):
+        return None
     windows = []
-    if primary and "usedPercent" in primary:
-        windows.append(
-            window(
-                "weekly",
-                "Weekly",
-                primary.get("usedPercent"),
-                iso_from_unix(primary.get("resetsAt")),
-                extra={"window_mins": primary.get("windowDurationMins")},
-            )
-        )
-    spark, special_win = _pick_spark(by_id)
-    spark_label = "Spark"
-    if isinstance(spark, dict):
-        spark_label = spark.get("limitName") or spark_label
-        burst = spark.get("primary") if isinstance(spark.get("primary"), dict) else None
-        if special_win is burst:
-            burst = None
-        if burst and "usedPercent" in burst:
-            rec["burst"] = window(
-                "burst",
-                "Spark 5h",
-                burst.get("usedPercent"),
-                iso_from_unix(burst.get("resetsAt")),
-                extra={"window_mins": burst.get("windowDurationMins")},
-            )
-    if special_win and "usedPercent" in special_win:
-        windows.append(
-            window(
-                "special",
-                str(spark_label),
-                special_win.get("usedPercent"),
-                iso_from_unix(special_win.get("resetsAt")),
-                extra={"window_mins": special_win.get("windowDurationMins")},
-            )
-        )
-    else:
-        windows.append({"kind": "special", "label": spark_label})
-    rec["windows"] = windows
-    if any("used_pct" in w for w in windows):
-        rec["status"] = "ok"
-    else:
-        rec["status"] = "unknown"
-        rec["reason"] = "no_used_pct"
+    for lid, kind, _short, long, primary in limit_specs:
+        values = spec_values.get(lid)
+        if not values or not primary:
+            continue
+        windows.append(window(kind, long, as_pct(sum(values) / len(values)), spec_reset.get(lid)))
+    hottest = hottest_reset = None
+    if primary_limits:
+        hottest, hottest_reset = max(primary_limits, key=lambda item: item[0])
+    windows.append(window("special", "Hottest", as_pct(hottest), hottest_reset))
+
+    def _list_len(key: str) -> int:
+        value = payload.get(key)
+        return len(value) if isinstance(value, list) else 0
+
+    rec = {
+        "id": pid,
+        "name": name,
+        "logo": logo,
+        "status": "ok",
+        "windows": windows,
+        "account_usage": rows,
+        "snapshot": {
+            "reports": len(reports),
+            "accounts_without_usage": _list_len("accountsWithoutUsage"),
+            "disabled_credentials": _list_len("disabledCredentials"),
+        },
+        "source": "omp",
+    }
+    if timestamps:
+        rec["measured_at"] = min(timestamps)
     return rec
 
 
-def probe_codex(fixture: str | None = None) -> dict:
-    rec: dict
-    try:
-        if fixture:
-            raw = json.loads(Path(fixture).read_text(encoding="utf-8"))
-            if "providers" in raw and "codex" in (raw.get("providers") or {}):
-                rec = raw["providers"]["codex"]
-                rec.setdefault("id", "codex")
-            elif isinstance(raw, dict):
-                rec = normalize_codex(raw)
-            else:
-                rec = empty_provider("codex", "unknown", "bad_payload")
-        else:
-            raw = codex_rate_limits()
-            if not isinstance(raw, dict):
-                rec = empty_provider("codex", "unknown", "bad_payload")
-            else:
-                rec = normalize_codex(raw)
-    except FileNotFoundError:
-        rec = empty_provider("codex", "unknown", "no_cli")
-    except Exception as exc:
-        rec = empty_provider("codex", "unknown", redact(str(exc))[:200])
-    if fixture is None:
-        rec = attach_codex_local_stats(rec)
-    return rec
+def _provider_usable(rec) -> bool:
+    """Authed and metered: the chip only scopes to providers that can show
+    a real number — status ok, a numeric window, or a credit balance."""
+    if not isinstance(rec, dict):
+        return False
+    if rec.get("status") == "ok":
+        return True
+    for w in rec.get("windows") or []:
+        if isinstance(w, dict) and w.get("used_pct") is not None:
+            return True
+    burst = rec.get("burst")
+    if isinstance(burst, dict) and burst.get("used_pct") is not None:
+        return True
+    credits = rec.get("credits")
+    if isinstance(credits, dict) and credits.get("remaining") is not None:
+        return True
+    return False
+
+
+# --- Codex -------------------------------------------------------------------
+
+
+def probe_codex() -> dict:
+    return _omp_fallback_rec("codex") or empty_provider("codex", "unauth", "no_omp_usage")
 
 
 # --- Token Plan --------------------------------------------------------------
@@ -1680,270 +1553,9 @@ def probe_google() -> dict:
 
 # --- Grok --------------------------------------------------------------------
 
-class _KimiUnauth(Exception):
-    pass
-
-
-
-def _rpc_error_text(err) -> str:
-    if isinstance(err, dict):
-        parts = [err.get("message"), err.get("data"), err.get("code")]
-        msg = " ".join(str(p) for p in parts if p is not None)
-        return redact(msg or str(err))
-    return redact(str(err))
-
-
-def grok_billing() -> dict:
-    bin_path = grok_bin()
-    if not bin_path:
-        raise FileNotFoundError("grok")
-    proc = subprocess.Popen(
-        [bin_path, "agent", "--no-leader", "stdio"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=child_env(),
-        start_new_session=True,
-    )
-    buf = bytearray()
-    deadline = time.time() + RPC_TIMEOUT_SEC
-    try:
-        _send(
-            proc,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {"fs": {}, "terminal": False},
-                    "_meta": {
-                        "startupHints": {
-                            "nonInteractive": True,
-                            "skipGitStatus": True,
-                            "skipProjectLayout": True,
-                        },
-                        "clientType": "omarchy-usage-tray",
-                        "clientVersion": "0.2.0",
-                    },
-                },
-            },
-        )
-        init = _recv_until(proc, lambda m: _id_match(m, 1), deadline, buf)
-        if "error" in init:
-            raise RuntimeError(_rpc_error_text(init["error"]))
-        _send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
-        _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "_x.ai/billing", "params": {}})
-        billed = _recv_until(proc, lambda m: _id_match(m, 2), deadline, buf)
-        if "error" in billed:
-            raise RuntimeError(_rpc_error_text(billed["error"]))
-        result = billed.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError("billing missing result")
-        return result
-    finally:
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-
-
-def _cents(value) -> int | None:
-    if isinstance(value, dict) and "val" in value:
-        try:
-            return int(value.get("val") or 0)
-        except (TypeError, ValueError):
-            return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    return None
-
-
-def grok_team_id() -> str | None:
-    path = Path.home() / ".grok" / "auth.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    for entry in data.values():
-        if isinstance(entry, dict) and isinstance(entry.get("team_id"), str) and entry["team_id"]:
-            return entry["team_id"]
-    return None
-
-
-def grok_management_prepaid() -> dict | None:
-    """Business/API prepaid via management API. Needs XAI_MANAGEMENT_KEY or XAI_API_KEY (not OAuth)."""
-    key = os.environ.get("XAI_MANAGEMENT_KEY") or os.environ.get("XAI_API_KEY")
-    if not key:
-        return None
-    team = grok_team_id()
-    if not team:
-        return {"error": "no_team_id"}
-    url = f"https://management-api.x.ai/v1/billing/teams/{team}/prepaid/balance"
-    headers = {"Accept": "application/json", "User-Agent": "omarchy-usage-tray/0.2"}
-    last = None
-    for auth_header in ({"Authorization": "Bearer " + key}, {"X-Api-Key": key}):
-        req = urllib.request.Request(url, headers={**headers, **auth_header}, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            last = f"http_{exc.code}"
-            continue
-        except Exception as exc:
-            last = redact(str(exc))[:80]
-            continue
-        if not isinstance(payload, dict):
-            last = "bad_payload"
-            continue
-        remaining = None
-        limit = None
-        for path in (
-            ("remaining_balance",),
-            ("balance",),
-            ("remaining",),
-            ("amount_remaining",),
-            ("prepaid_balance",),
-            ("credits", "remaining"),
-        ):
-            cur: object = payload
-            ok = True
-            for part in path:
-                if not isinstance(cur, dict) or part not in cur:
-                    ok = False
-                    break
-                cur = cur[part]
-            if ok:
-                try:
-                    remaining = float(cur)
-                    break
-                except (TypeError, ValueError):
-                    pass
-        if remaining is None:
-            # cents-style {val: N}
-            val = payload.get("val") or payload.get("amount")
-            if isinstance(val, dict) and "val" in val:
-                remaining = float(val["val"]) / 100.0
-            elif isinstance(val, (int, float)) and val > 1000:
-                remaining = float(val) / 100.0
-            elif isinstance(val, (int, float)):
-                remaining = float(val)
-        if remaining is None:
-            last = "no_remaining_field"
-            continue
-        if remaining > 10000:
-            remaining = remaining / 100.0  # cents
-        for lim_key in ("limit", "prepaid_limit", "total"):
-            if lim_key in payload:
-                try:
-                    limit = float(payload[lim_key])
-                    if limit > 10000:
-                        limit = limit / 100.0
-                except (TypeError, ValueError):
-                    limit = None
-        return {"remaining_usd": remaining, "limit_usd": limit, "source": "management-api"}
-    return {"error": last or "unauth"}
-
-
-def grok_api_credits_window(config: dict, api_prepaid: dict | None = None) -> dict | None:
-    """Second SuperGrok meter: business API credits (management key), not OAuth prepaid=0."""
-    if isinstance(api_prepaid, dict) and api_prepaid.get("remaining_usd") is not None:
-        rem = float(api_prepaid["remaining_usd"])
-        extra = {"remaining_usd": rem, "source": api_prepaid.get("source") or "management-api"}
-        lim = api_prepaid.get("limit_usd")
-        if isinstance(lim, (int, float)) and lim > 0:
-            extra["limit_usd"] = float(lim)
-            used_pct = as_pct(100.0 * max(0.0, (float(lim) - rem) / float(lim)))
-            return window("credits", "API credits", used_pct, extra=extra)
-        return window("credits", "API credits", None, extra=extra)
-    cap = _cents(config.get("onDemandCap"))
-    used = _cents(config.get("onDemandUsed"))
-    prepaid = _cents(config.get("prepaidBalance"))
-    extra: dict = {}
-    if cap is not None and cap > 0:
-        spent = 0 if used is None else abs(used)
-        pct = as_pct(100.0 * spent / cap)
-        extra["on_demand_cap_cents"] = cap
-        extra["on_demand_used_cents"] = spent
-        extra["remaining_usd"] = max(0, cap - spent) / 100.0
-        return window("credits", "API credits", pct, extra=extra)
-    if prepaid is not None and abs(prepaid) > 0:
-        rem = abs(prepaid) / 100.0
-        extra["remaining_usd"] = rem
-        extra["source"] = "oauth-prepaid"
-        return window("credits", "API credits", None, extra=extra)
-    return None
-
-
-def normalize_grok(raw: dict, api_prepaid: dict | None = None) -> dict:
-    rec = {
-        "id": "grok",
-        "name": "Grok",
-        "logo": "G",
-        "status": "unknown",
-        "windows": [{"kind": "weekly", "label": "Weekly"}],
-    }
-    config = raw.get("config") if isinstance(raw.get("config"), dict) else {}
-    if not config:
-        rec["reason"] = "no_config"
-        return rec
-    tier = raw.get("subscription_tier")
-    if tier:
-        rec["plan"] = str(tier)
-    period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
-    ptype = str(period.get("type") or "")
-    resets = period.get("end") or config.get("billingPeriodEnd")
-    resets_at = resets if isinstance(resets, str) else iso_from_unix(resets)
-    pct = config.get("creditUsagePercent")
-    windows: list[dict] = []
-    if "WEEKLY" in ptype.upper() or not ptype:
-        if pct is None and "WEEKLY" in ptype.upper():
-            pct = 0
-        weekly = window("weekly", "Weekly", as_pct(pct), resets_at)
-        windows.append(weekly)
-    cred = grok_api_credits_window(config, api_prepaid)
-    if cred:
-        windows.append(cred)
-    rec["windows"] = windows or rec["windows"]
-    if any("used_pct" in w or (w.get("extra") or {}).get("remaining_usd") is not None for w in rec["windows"]):
-        rec["status"] = "ok"
-    else:
-        rec["reason"] = "no_used_pct"
-    if isinstance(api_prepaid, dict) and api_prepaid.get("error"):
-        rec.setdefault("reason", api_prepaid["error"])
-    return rec
-
 
 def probe_grok() -> dict:
-    api_prepaid = grok_management_prepaid()
-    try:
-        raw = grok_billing()
-    except FileNotFoundError:
-        return empty_provider("grok", "unknown", "no_cli")
-    except Exception as exc:
-        msg = redact(str(exc))[:200]
-        low = msg.lower()
-        if "auth" in low or "login" in low:
-            return empty_provider("grok", "unauth", "need_grok_login")
-        if "method not found" in low or "-32601" in msg:
-            return empty_provider("grok", "unknown", "acp_method_not_found")
-        return empty_provider("grok", "unknown", msg or "probe_failed")
-    if not isinstance(raw, dict):
-        return empty_provider("grok", "unknown", "bad_payload")
-    return normalize_grok(raw, api_prepaid if isinstance(api_prepaid, dict) and "remaining_usd" in api_prepaid else api_prepaid)
+    return _omp_fallback_rec("grok") or empty_provider("grok", "unauth", "no_omp_usage")
 
 
 # --- Kimi --------------------------------------------------------------------
@@ -2104,1040 +1716,27 @@ def probe_kimi() -> dict:
         rec["reason"] = "partial_usage"
     return rec
 
-# --- StepFun -----------------------------------------------------------------
-
-# StepFun exposes no usage or balance endpoint (verified 2026-09-24: every
-# /v1/*billing*, *balance*, *usage*, *quota* route 404s). What the chip can
-# honestly report is key health: the OMP auth-broker holds the API keys, and
-# each is exercised against GET /v1/models. The chip is a live/total counter,
-# not a meter.
-STEPFUN_BASE = "https://api.stepfun.ai"
-
-
-def _omp_broker_config() -> tuple[str, str | None]:
-    url = os.environ.get("AI_USAGE_OMP_BROKER_URL") or os.environ.get("OMP_AUTH_BROKER_URL") or ""
-    token = os.environ.get("AI_USAGE_OMP_BROKER_TOKEN") or os.environ.get("OMP_AUTH_BROKER_TOKEN") or ""
-    if not url or not token:
-        cfg = Path.home() / ".omp" / "agent" / "config.yml"
-        try:
-            text = cfg.read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        if text:
-            block = re.search(r"(?ms)^\s*broker:\s*\n((?:\s{4,}.*\n?)*)", text)
-            section = block.group(1) if block else ""
-            if not url:
-                m = re.search(r"^\s*url:\s*(\S+)", section, re.M)
-                url = m.group(1) if m else ""
-            if not token:
-                m = re.search(r"^\s*token:\s*(\S+)", section, re.M)
-                token = m.group(1) if m else ""
-    if not token:
-        try:
-            token = (Path.home() / ".omp" / "auth-broker.token").read_text(encoding="utf-8").strip()
-        except OSError:
-            token = ""
-    return (url or "http://127.0.0.1:8790").rstrip("/"), (token or None)
-
-
-def _broker_snapshot(url: str, token: str) -> dict | None:
-    req = urllib.request.Request(
-        url + "/v1/snapshot",
-        headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"http_{exc.code}") from exc
-    except Exception as exc:
-        raise RuntimeError(redact(str(exc))[:80]) from exc
-    return payload if isinstance(payload, dict) else None
-
-
-def _broker_api_keys(snapshot: dict, provider: str) -> list[str]:
-    keys: list[str] = []
-    for cred in snapshot.get("credentials") or []:
-        if not isinstance(cred, dict) or cred.get("provider") != provider:
-            continue
-        blob = cred.get("credential")
-        if not isinstance(blob, dict):
-            continue
-        key = blob.get("key")
-        if isinstance(key, str) and key.strip():
-            keys.append(key.strip())
-    return keys
-
-
-def _stepfun_key_ok(key: str) -> tuple[bool, str]:
-    req = urllib.request.Request(
-        STEPFUN_BASE + "/v1/models",
-        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            status = getattr(resp, "status", 200)
-            return (200 <= status < 300), f"http_{status}"
-    except urllib.error.HTTPError as exc:
-        return False, f"http_{exc.code}"
-    except Exception as exc:
-        return False, redact(str(exc))[:60]
-
-
-def _empty_stepfun(reason: str) -> dict:
-    rec = empty_provider("stepfun", "unknown", reason)
-    rec["windows"] = [
-        window("weekly", "Live keys", None),
-        window("special", "Keys", None),
-    ]
-    rec["account_usage"] = []
-    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
-    return rec
-
-
-def probe_stepfun() -> dict:
-    url, token = _omp_broker_config()
-    if not token:
-        return _empty_stepfun("no_broker_token")
-    try:
-        snapshot = _broker_snapshot(url, token)
-    except Exception as exc:
-        return _empty_stepfun(redact(str(exc))[:80] or "broker_unreachable")
-    if not isinstance(snapshot, dict):
-        return _empty_stepfun("bad_payload")
-    keys = _broker_api_keys(snapshot, "stepfun")
-    if not keys:
-        return _empty_stepfun("no_keys")
-
-    rows: list[dict] = []
-    live = 0
-    for index, key in enumerate(keys, 1):
-        ok, reason = _stepfun_key_ok(key)
-        live += 1 if ok else 0
-        rows.append(
-            {
-                "label": f"key {index}",
-                "used_pct": 0 if ok else 100,
-                "fetched_at": iso_now(),
-                "extra": {"key_ok": ok, "key_reason": reason, "key_tail": key[-4:]},
-            }
-        )
-    total = len(keys)
-    status = "ok" if live == total else ("unknown" if live == 0 else "ok")
-    rec = {
-        "id": "stepfun",
-        "name": "StepFun",
-        "logo": "S",
-        "status": status,
-        "windows": [
-            window("weekly", "Live keys", as_pct(100.0 * live / total)),
-            window("special", "Keys", None, None, {"live": live, "total": total}),
-        ],
-        "account_usage": rows,
-        "snapshot": {"reports": total, "accounts_without_usage": total - live, "disabled_credentials": 0},
-    }
-    if live < total:
-        rec["reason"] = f"{total - live} key(s) failing"
-    return rec
-
-
 # --- Cursor ------------------------------------------------------------------
 
-CURSOR_USAGE_URL = "https://cursor.com/api/usage-summary"
-CURSOR_SESSION_COOKIE = "WorkosCursorSessionToken"
 
-CURSOR_DEFAULT_USER_AGENT = "cursor-agent/0.1.0"
-DEVIN_CREDENTIALS = Path.home() / ".local" / "share" / "devin" / "credentials.toml"
-DEVIN_USER_STATUS_RPC = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
-DEVIN_DEFAULT_API_SERVER = "https://server.codeium.com"
-DEVIN_DEFAULT_WEBAPP = "app.devin.ai"
-DEVIN_SESSION_PREFIX = "devin-session-token$"
-# Second Devin account lives in OMP's auth store (`agent.db`), not the devin
-# CLI's credentials.toml. Override with AI_USAGE_DEVIN2_ACCOUNT (substring match
-# on the session id / email identity) or AI_USAGE_DEVIN2_API_KEY (raw token).
-OMP_AGENT_DB = Path.home() / ".omp" / "agent" / "agent.db"
-AI_USAGE_DEVIN2_ACCOUNT = "AI_USAGE_DEVIN2_ACCOUNT"
-AI_USAGE_DEVIN2_API_KEY = "AI_USAGE_DEVIN2_API_KEY"
-
-
-class _CursorRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Never forward the session cookie to a non-cursor.com redirect target."""
-
-    def redirect_request(self, oldreq, fp, code, msg, headers, newurl):
-        newreq = super().redirect_request(oldreq, fp, code, msg, headers, newurl)
-        if newreq is None:
-            return None
-        old_host = urllib.parse.urlparse(oldreq.full_url).hostname or ""
-        new_host = urllib.parse.urlparse(newurl).hostname or ""
-        if old_host.lower() != new_host.lower():
-            newreq.remove_header("Cookie")
-        return newreq
-
-
-_CURSOR_OPENER = urllib.request.build_opener(_CursorRedirectHandler)
-
-
-def _cursor_agent_version() -> str:
-    explicit = os.environ.get("CURSOR_AGENT_VERSION")
-    if explicit:
-        return explicit
-    bin_path = which("cursor-agent")
-    if not bin_path:
-        return CURSOR_DEFAULT_USER_AGENT
-    try:
-        proc = subprocess.run(
-            [bin_path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-            env=child_env(),
-        )
-        version = (proc.stdout or "").strip().splitlines()[0]
-        if version:
-            return "cursor-agent/" + version.split("-")[0]
-    except Exception:
-        pass
-    return CURSOR_DEFAULT_USER_AGENT
-
-
-def _cursor_user_agent() -> str:
-    return _cursor_agent_version()
-
-
-def _cursor_auth_path() -> Path:
-    return Path(os.environ.get("CURSOR_AUTH_FILE") or (Path.home() / ".config" / "cursor" / "auth.json"))
-
-
-def _cursor_read_token() -> str | None:
-    explicit = os.environ.get("CURSOR_OAUTH_TOKEN")
-    if explicit:
-        return explicit
-    path = _cursor_auth_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    token = data.get("accessToken")
-    return token if isinstance(token, str) and token else None
-
-
-def _cursor_user_id(token: str) -> str | None:
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return None
-        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "==").decode("utf-8"))
-    except Exception:
-        return None
-    sub = payload.get("sub") if isinstance(payload, dict) else None
-    if not isinstance(sub, str):
-        return None
-    if "|" in sub:
-        return sub.split("|")[-1]
-    return sub
-
-
-def _cursor_cookie(token: str) -> str | None:
-    uid = _cursor_user_id(token)
-    if not uid:
-        return None
-    return f"{CURSOR_SESSION_COOKIE}={uid}%3A%3A{token}"
-
-
-def _cursor_http(url: str, cookie: str) -> tuple[int, dict | None]:
-    headers = {
-        "Accept": "application/json",
-        "Cookie": cookie,
-        "User-Agent": _cursor_user_agent(),
-    }
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with _CURSOR_OPENER.open(req, timeout=15) as resp:
-            body = resp.read()
-    except urllib.error.HTTPError as exc:
-        body = b""
-        try:
-            body = exc.read()
-        except Exception:
-            pass
-        return exc.code, _cursor_decode(body)
-    except Exception as exc:
-        raise RuntimeError(redact(str(exc))[:200])
-    return getattr(resp, "status", 200), _cursor_decode(body)
-
-
-def _cursor_decode(body: bytes | None) -> dict | None:
-    if not body:
-        return None
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _cursor_usages() -> dict | None:
-    token = _cursor_read_token()
-    if not token:
-        return None
-    cookie = _cursor_cookie(token)
-    if not cookie:
-        return None
-    code, payload = _cursor_http(CURSOR_USAGE_URL, cookie)
-    if code in (401, 403):
-        raise _KimiUnauth("need_cursor_login")
-    if code != 200 or not isinstance(payload, dict):
-        raise RuntimeError(f"http_{code}" if code else "bad_payload")
-    return payload
-
-
-def normalize_cursor(raw: dict) -> dict:
-    rec = {
-        "id": "cursor",
-        "name": "Cursor",
-        "logo": "R",
-        "status": "unknown",
-        "windows": [],
-    }
-    membership = raw.get("membershipType")
-    if membership:
-        rec["plan"] = str(membership)
-    individual = raw.get("individualUsage") if isinstance(raw.get("individualUsage"), dict) else {}
-    plan = individual.get("plan") if isinstance(individual.get("plan"), dict) else {}
-    billing_end = raw.get("billingCycleEnd")
-    resets_at = str(billing_end) if isinstance(billing_end, str) else None
-    total_pct = as_pct(plan.get("totalPercentUsed"))
-    auto_pct = as_pct(plan.get("autoPercentUsed"))
-    windows: list[dict] = []
-    if total_pct is not None:
-        windows.append(window("weekly", "Weekly", total_pct, resets_at))
-    else:
-        windows.append({"kind": "weekly", "label": "Weekly"})
-    if auto_pct is not None:
-        windows.append(window("special", "Auto", auto_pct, resets_at))
-    else:
-        windows.append({"kind": "special", "label": "Auto"})
-    on_demand = individual.get("onDemand") if isinstance(individual.get("onDemand"), dict) else {}
-    if on_demand.get("enabled"):
-        remaining = on_demand.get("remaining")
-        limit = on_demand.get("limit")
-        used = on_demand.get("used")
-        extra: dict = {}
-        rem_usd = None
-        if isinstance(remaining, (int, float)) and remaining is not None:
-            rem_usd = float(remaining) / 100.0
-        elif isinstance(limit, (int, float)) and isinstance(used, (int, float)) and limit > 0:
-            rem_usd = max(0.0, float(limit) - float(used)) / 100.0
-        if rem_usd is not None:
-            extra["remaining_usd"] = rem_usd
-            windows.append(window("credits", "On-demand", None, extra=extra))
-    rec["windows"] = windows
-    if any("used_pct" in w for w in windows):
-        rec["status"] = "ok"
-    else:
-        rec["reason"] = "no_used_pct"
+def probe_cursor() -> dict:
+    rec = _omp_fallback_rec("cursor") or empty_provider("cursor", "unauth", "no_omp_usage")
     return attach_cursor_identity(rec)
-
-
-def probe_cursor(fixture: str | None = None) -> dict:
-    if fixture:
-        try:
-            raw = json.loads(Path(fixture).read_text(encoding="utf-8"))
-            if "providers" in raw and "cursor" in (raw.get("providers") or {}):
-                rec = raw["providers"]["cursor"]
-                rec.setdefault("id", "cursor")
-                return attach_cursor_identity(rec)
-            if isinstance(raw, dict):
-                return normalize_cursor(raw)
-        except (OSError, json.JSONDecodeError):
-            pass
-        return attach_cursor_identity(empty_provider("cursor", "unknown", "bad_payload"))
-    try:
-        raw = _cursor_usages()
-        if raw is None:
-            return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
-        if not isinstance(raw, dict):
-            return attach_cursor_identity(empty_provider("cursor", "unknown", "bad_payload"))
-        return normalize_cursor(raw)
-    except _KimiUnauth:
-        return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
-    except FileNotFoundError:
-        return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
-    except Exception as exc:
-        msg = redact(str(exc))[:200]
-        low = msg.lower()
-        if "auth" in low or "login" in low or "401" in msg:
-            return attach_cursor_identity(empty_provider("cursor", "unauth", "need_cursor_login"))
-        return attach_cursor_identity(empty_provider("cursor", "unknown", msg or "probe_failed"))
 
 # --- Devin -------------------------------------------------------------------
 
 
-def _devin_credentials_path() -> Path:
-    explicit = os.environ.get("DEVIN_CREDENTIALS_FILE")
-    return Path(explicit) if explicit else DEVIN_CREDENTIALS
+def probe_devin() -> dict:
+    return _omp_fallback_rec("devin") or empty_provider("devin", "unauth", "no_omp_usage")
 
 
-def _devin_credentials() -> dict | None:
-    try:
-        data = tomllib.loads(_devin_credentials_path().read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        data = None
-    if not isinstance(data, dict):
-        data = {}
-    key = os.environ.get("DEVIN_API_KEY")
-    if key:
-        data["windsurf_api_key"] = key
-    server = os.environ.get("DEVIN_API_SERVER")
-    if server:
-        data["api_server_url"] = server
-    return data if data.get("windsurf_api_key") else None
+def probe_devin2() -> dict:
+    """Secondary Devin account: the second report row of OMP's devin provider."""
+    return _omp_fallback_rec("devin2", report_index=1) or empty_provider("devin2", "unauth", "no_omp_usage")
 
-
-def _devin_user_status(api_key: str | None, server: str | None = None) -> dict | None:
-    if not api_key:
-        return None
-    key = api_key
-    if not key.startswith(DEVIN_SESSION_PREFIX):
-        key = DEVIN_SESSION_PREFIX + key
-    if not isinstance(server, str) or not server.startswith("https://"):
-        server = DEVIN_DEFAULT_API_SERVER
-    metadata = {
-        "apiKey": key,
-        "ideName": "devin",
-        "ideVersion": "1.0.0",
-        "extensionVersion": "1.0.0",
-        "sessionId": f"{os.getpid()}-{int(time.time())}",
-        "requestId": str(int(time.time() * 1000) % (2**62)),
-        "locale": "en_US",
-        "os": "linux",
-        "appVersion": "1.0.0",
-    }
-    req = urllib.request.Request(
-        server.rstrip("/") + DEVIN_USER_STATUS_RPC,
-        data=json.dumps({"metadata": metadata}).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Connect-Protocol-Version": "1",
-            "Authorization": f"Bearer {key}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read()
-        code = getattr(resp, "status", 200)
-    except urllib.error.HTTPError as exc:
-        code = exc.code
-        try:
-            body = exc.read()
-        except Exception:
-            body = b""
-    except Exception as exc:
-        raise RuntimeError(redact(str(exc))[:200])
-    if code in (401, 403):
-        raise _KimiUnauth("need_devin_login")
-    payload = _cursor_decode(body)
-    if code != 200 or not isinstance(payload, dict):
-        raise RuntimeError(f"http_{code}" if code else "bad_payload")
-    return payload
-
-
-def _devin_session_id(jwt: str) -> str | None:
-    try:
-        part = jwt.split(".")[1]
-        part += "=" * (-len(part) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(part))
-    except Exception:
-        return None
-    sid = payload.get("session_id")
-    return sid if isinstance(sid, str) else None
-
-
-def _devin2_candidates() -> list[tuple[str, str]]:
-    """(account tag, raw session JWT) for devin OAuth rows in OMP's auth store.
-
-    Rows are newest-first so a re-login wins over a stale duplicate session.
-    """
-    out: list[tuple[str, str]] = []
-    try:
-        import sqlite3
-
-        db = sqlite3.connect(f"file:{OMP_AGENT_DB}?mode=ro", uri=True)
-        try:
-            rows = db.execute(
-                "SELECT id, json_extract(data, '$.access') FROM auth_credentials "
-                "WHERE provider = 'devin' AND credential_type = 'oauth' ORDER BY id DESC"
-            ).fetchall()
-        finally:
-            db.close()
-    except Exception:
-        return out
-    for cid, access in rows:
-        if isinstance(access, str) and access:
-            sid = _devin_session_id(access) or f"cred-{cid}"
-            out.append((f"{sid[-6:]}#{cid}", access))
-    return out
-
-
-def _devin2_api_key() -> tuple[str, str] | tuple[None, None]:
-    """(tag, token) for the secondary Devin account.
-
-    Picks the OMP credential that is not the session active in the devin CLI's
-    credentials.toml (the primary row on the chip). AI_USAGE_DEVIN2_ACCOUNT pins
-    a substring of the session id when several spares exist.
-    """
-    explicit = os.environ.get(AI_USAGE_DEVIN2_API_KEY)
-    if explicit:
-        return ("env", explicit)
-    primary = _devin_credentials()
-    primary_key = primary.get("windsurf_api_key") if isinstance(primary, dict) else None
-    primary_sid = _devin_session_id(str(primary_key or "").removeprefix(DEVIN_SESSION_PREFIX))
-    account_filter = os.environ.get(AI_USAGE_DEVIN2_ACCOUNT) or ""
-    for tag, token in _devin2_candidates():
-        if primary_sid and _devin_session_id(token) == primary_sid:
-            continue
-        if account_filter and account_filter not in tag:
-            continue
-        return (tag, token)
-    return (None, None)
-
-
-
-
-def _devin_quota_pct(remaining) -> float | None:
-    """planStatus reports *remaining* percent; the chip meters used."""
-    rem = as_pct(remaining)
-    if rem is None:
-        return None
-    return as_pct(100.0 - rem)
-
-def _empty_devin(status: str, reason: str, pid: str = "devin") -> dict:
-    rec = empty_provider(pid, status, reason)
-    rec["windows"] = [
-        {"kind": "weekly", "label": "Weekly quota"},
-        {"kind": "special", "label": "Plan cycle"},
-    ]
-    return rec
-
-
-def normalize_devin(raw: dict, pid: str = "devin") -> dict:
-    name, logo = PROVIDER_INDEX[pid]
-    rec = {
-        "id": pid,
-        "name": name,
-        "logo": logo,
-        "status": "unknown",
-        "windows": [],
-    }
-    status = raw.get("userStatus") if isinstance(raw.get("userStatus"), dict) else {}
-    plan_status = status.get("planStatus") if isinstance(status.get("planStatus"), dict) else {}
-    plan_info = plan_status.get("planInfo") if isinstance(plan_status.get("planInfo"), dict) else {}
-    if not plan_info:
-        top_plan = raw.get("planInfo")
-        if isinstance(top_plan, dict):
-            plan_info = top_plan
-    email = status.get("email")
-    if isinstance(email, str) and email:
-        rec["identity"] = {"id": email, "label": email, "title": email}
-    plan_name = plan_info.get("planName") or plan_info.get("teamsTier")
-    if isinstance(plan_name, str) and plan_name:
-        rec["plan"] = plan_name.removeprefix("TEAMS_TIER_DEVIN_").removeprefix("TEAMS_TIER_").title() \
-            if plan_name.startswith("TEAMS_TIER_") else plan_name
-    weekly_pct = _devin_quota_pct(plan_status.get("weeklyQuotaRemainingPercent"))
-    weekly_reset = iso_from_unix(plan_status.get("weeklyQuotaResetAtUnix"))
-    windows: list[dict] = [window("weekly", "Weekly quota", weekly_pct, weekly_reset)]
-    if not plan_info.get("hideDailyQuota"):
-        daily_pct = _devin_quota_pct(plan_status.get("dailyQuotaRemainingPercent"))
-        daily_reset = iso_from_unix(plan_status.get("dailyQuotaResetAtUnix"))
-        windows.append(window("session", "Daily quota", daily_pct, daily_reset))
-    else:
-        # Max hides the daily meter; surface the billing-cycle end instead.
-        windows.append(window("special", "Plan cycle", None, plan_status.get("planEnd")))
-    rec["windows"] = windows
-    if any("used_pct" in w for w in windows):
-        rec["status"] = "ok"
-    else:
-        rec["reason"] = "no_used_pct"
-    return rec
-
-
-def probe_devin(fixture: str | None = None) -> dict:
-    if fixture:
-        try:
-            raw = json.loads(Path(fixture).read_text(encoding="utf-8"))
-            if "providers" in raw and "devin" in (raw.get("providers") or {}):
-                rec = raw["providers"]["devin"]
-                rec.setdefault("id", "devin")
-                return rec
-            if isinstance(raw, dict):
-                return normalize_devin(raw)
-        except (OSError, json.JSONDecodeError):
-            pass
-        return _empty_devin("unknown", "bad_payload")
-    try:
-        creds = _devin_credentials()
-        key = creds.get("windsurf_api_key") if isinstance(creds, dict) else None
-        raw = _devin_user_status(key if isinstance(key, str) else None,
-                                creds.get("api_server_url") if isinstance(creds, dict) else None)
-        if raw is None:
-            return _empty_devin("unauth", "need_devin_login")
-        return normalize_devin(raw)
-    except _KimiUnauth:
-        return _empty_devin("unauth", "need_devin_login")
-    except Exception as exc:
-        msg = redact(str(exc))[:200]
-        low = msg.lower()
-        if "auth" in low or "login" in low or "401" in msg:
-            return _empty_devin("unauth", "need_devin_login")
-        return _empty_devin("unknown", msg or "probe_failed")
-
-
-def probe_devin2(fixture: str | None = None) -> dict:
-    """Secondary Devin account: the OAuth session OMP keeps in agent.db."""
-    if fixture:
-        try:
-            raw = json.loads(Path(fixture).read_text(encoding="utf-8"))
-            if "providers" in raw and "devin2" in (raw.get("providers") or {}):
-                rec = raw["providers"]["devin2"]
-                rec.setdefault("id", "devin2")
-                return rec
-            if isinstance(raw, dict):
-                return normalize_devin(raw, pid="devin2")
-        except (OSError, json.JSONDecodeError):
-            pass
-        return _empty_devin("unknown", "bad_payload", pid="devin2")
-    tag, token = _devin2_api_key()
-    if not token:
-        return _empty_devin("unauth", "need_omp_devin2", pid="devin2")
-    try:
-        raw = _devin_user_status(token)
-        if raw is None:
-            return _empty_devin("unauth", "need_omp_devin2", pid="devin2")
-        rec = normalize_devin(raw, pid="devin2")
-        if "identity" not in rec:
-            rec["identity"] = {"id": tag, "label": tag, "title": tag}
-        return rec
-    except _KimiUnauth:
-        return _empty_devin("unauth", "need_omp_devin2", pid="devin2")
-    except Exception as exc:
-        msg = redact(str(exc))[:200]
-        low = msg.lower()
-        if "auth" in low or "login" in low or "401" in msg:
-            return _empty_devin("unauth", "need_omp_devin2", pid="devin2")
-        return _empty_devin("unknown", msg or "probe_failed", pid="devin2")
-
-
-
-# --- Local Codex tokens (Quattro scan_native_codex_sessions) -----------------
-
-
-def _tok_int(value) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _model_name(raw) -> str:
-    value = str(raw or "codex")
-    return value if value else "codex"
-
-
-def _local_day(value) -> str:
-    if value is None:
-        return datetime.now().strftime("%Y-%m-%d")
-    if isinstance(value, (int, float)):
-        if value > 10_000_000_000:
-            value = value / 1000
-        try:
-            return datetime.fromtimestamp(value).strftime("%Y-%m-%d")
-        except (OSError, OverflowError, ValueError):
-            return datetime.now().strftime("%Y-%m-%d")
-    text = str(value)
-    try:
-        if text.endswith("Z"):
-            dt = datetime.fromisoformat(text[:-1] + "+00:00")
-        else:
-            dt = datetime.fromisoformat(text)
-        if dt.tzinfo is not None:
-            dt = dt.astimezone()
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
-
-
-def _empty_bucket() -> dict:
-    return {
-        "inputTokens": 0,
-        "outputTokens": 0,
-        "cacheReadInputTokens": 0,
-        "cacheCreationInputTokens": 0,
-    }
-
-
-def empty_local_stats() -> dict:
-    now = datetime.now()
-    dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
-    return {
-        "todayPrompts": 0,
-        "todaySessions": 0,
-        "todayTotalTokens": 0,
-        "todayTokensByModel": {},
-        "recentDays": [{"date": day, "messageCount": 0} for day in dates],
-        "totalPrompts": 0,
-        "totalSessions": 0,
-        "activeDays": 0,
-        "activeDates": [],
-        "modelUsage": {},
-        "hasLocalStats": False,
-    }
-
-
-def scan_native_codex_sessions() -> dict:
-    """Quattro algorithm: last_token_usage only, jsonl mtime within 30d.
-
-    Session tokens are never quota percents.
-    """
-    stats = empty_local_stats()
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-    recent_dates = [row["date"] for row in stats["recentDays"]]
-    recent = {day: 0 for day in recent_dates}
-    model_usage: dict[str, dict] = {}
-    today_tokens_by_model: dict[str, int] = {}
-    today_sessions: set[str] = set()
-    total_sessions: set[str] = set()
-    active_days: set[str] = set()
-    today_prompts = 0
-    today_total_tokens = 0
-    total_prompts = 0
-
-    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    roots = [codex_home / "sessions", codex_home / "archived_sessions"]
-    files: list[Path] = []
-    cutoff = time.time() - 30 * 24 * 60 * 60
-    for root in roots:
-        if not root.exists():
-            continue
-        for path in root.rglob("*.jsonl"):
-            try:
-                if path.stat().st_mtime >= cutoff:
-                    files.append(path)
-            except OSError:
-                pass
-
-    saw_any = False
-    for path in files:
-        current_model = "codex"
-        try:
-            with path.open(errors="replace") as handle:
-                for raw in handle:
-                    try:
-                        entry = json.loads(raw)
-                    except Exception:
-                        continue
-                    if entry.get("type") == "turn_context":
-                        payload = entry.get("payload") or {}
-                        current_model = _model_name(
-                            payload.get("model") or payload.get("model_slug") or current_model
-                        )
-                        continue
-                    payload = entry.get("payload") or entry
-                    if entry.get("type") == "response_item" and isinstance(payload, dict):
-                        payload = payload.get("payload") or payload
-                    if not isinstance(payload, dict):
-                        continue
-                    if payload.get("type") != "token_count":
-                        continue
-                    info = payload.get("info") or {}
-                    usage = info.get("last_token_usage") or {}
-                    if not isinstance(usage, dict):
-                        continue
-                    cache_read = _tok_int(usage.get("cached_input_tokens"))
-                    cache_write = _tok_int(usage.get("cache_write_input_tokens"))
-                    input_tokens = max(0, _tok_int(usage.get("input_tokens")) - cache_read - cache_write)
-                    output_tokens = _tok_int(usage.get("output_tokens"))
-                    if not (input_tokens or output_tokens or cache_read or cache_write):
-                        continue
-                    saw_any = True
-                    day = _local_day(entry.get("timestamp") or path.stat().st_mtime)
-                    session_key = str(path)
-                    total = input_tokens + output_tokens + cache_read + cache_write
-                    total_prompts += 1
-                    total_sessions.add(session_key)
-                    active_days.add(day)
-                    bucket = model_usage.setdefault(current_model, _empty_bucket())
-                    bucket["inputTokens"] += input_tokens
-                    bucket["outputTokens"] += output_tokens
-                    bucket["cacheReadInputTokens"] += cache_read
-                    bucket["cacheCreationInputTokens"] += cache_write
-                    if day in recent:
-                        recent[day] += total
-                    if day == today:
-                        today_prompts += 1
-                        today_sessions.add(session_key)
-                        today_total_tokens += total
-                        today_tokens_by_model[current_model] = (
-                            today_tokens_by_model.get(current_model, 0) + total
-                        )
-        except OSError:
-            continue
-
-    stats.update(
-        {
-            "todayPrompts": today_prompts,
-            "todaySessions": len(today_sessions),
-            "todayTotalTokens": today_total_tokens,
-            "todayTokensByModel": today_tokens_by_model,
-            "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent_dates],
-            "totalPrompts": total_prompts,
-            "totalSessions": len(total_sessions),
-            "activeDays": len(active_days),
-            "activeDates": sorted(active_days),
-            "modelUsage": model_usage,
-            "hasLocalStats": saw_any,
-        }
-    )
-    return stats
-
-
-def scan_cache_path() -> Path:
-    return cache_path().parent / "codex-scan.json"
-
-
-def cached_codex_scan(force: bool = False) -> dict:
-    today = datetime.now().strftime("%Y-%m-%d")
-    path = scan_cache_path()
-    max_age = 0 if force else SCAN_LIMITS_REUSE_SECONDS
-    if max_age > 0 and path.is_file():
-        try:
-            age = time.time() - path.stat().st_mtime
-            if 0 <= age <= max_age:
-                cached = json.loads(path.read_text(encoding="utf-8"))
-                if (
-                    isinstance(cached, dict)
-                    and cached.get("schemaVersion") == 1
-                    and cached.get("scanDate") == today
-                    and isinstance(cached.get("stats"), dict)
-                ):
-                    return cached["stats"]
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            pass
-    stats = scan_native_codex_sessions()
-    try:
-        atomic_write(
-            path,
-            json.dumps({"schemaVersion": 1, "scanDate": today, "stats": stats}, ensure_ascii=False) + "\n",
-        )
-    except OSError:
-        pass
-    return stats
-
-
-def attach_codex_local_stats(rec: dict, force: bool = False) -> dict:
-    out = dict(rec)
-    try:
-        stats = cached_codex_scan(force=force)
-    except Exception:
-        return out
-    if not isinstance(stats, dict):
-        return out
-    for key in (
-        "todayPrompts",
-        "todaySessions",
-        "todayTotalTokens",
-        "todayTokensByModel",
-        "recentDays",
-        "totalPrompts",
-        "totalSessions",
-        "activeDays",
-        "activeDates",
-        "modelUsage",
-        "hasLocalStats",
-    ):
-        if key in stats:
-            out[key] = stats[key]
-    return out
-
-
-# --- Prices / API-equivalent cost --------------------------------------------
-
-
-def load_prices() -> dict:
-    path = prices_path()
-    try:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    models = data.get("models")
-    if not isinstance(models, dict):
-        return {}
-    out = {}
-    for name, row in models.items():
-        if not isinstance(row, dict):
-            continue
-        try:
-            inp = Decimal(str(row["input"]))
-            cache = Decimal(str(row["cache"]))
-            output = Decimal(str(row["output"]))
-        except (KeyError, ArithmeticError, ValueError):
-            continue
-        key = str(name).strip().lower()
-        if not key:
-            continue
-        entry = {"input": inp, "cache": cache, "output": output}
-        if "cache_write" in row:
-            try:
-                entry["cache_write"] = Decimal(str(row["cache_write"]))
-            except (ArithmeticError, ValueError):
-                pass
-        out[key] = entry
-    return out
-
-
-def lookup_price(model: str, prices: dict) -> dict | None:
-    if not model or not prices:
-        return None
-    key = str(model).strip().lower()
-    if key.startswith("openai/"):
-        key = key[7:]
-    return prices.get(key)
-
-
-def _usd_tokens(n: int, per_million: Decimal) -> Decimal:
-    if n <= 0:
-        return Decimal("0")
-    return (Decimal(n) * per_million) / MILLION
-
-
-def api_equivalent_cost(model_usage, prices: dict) -> tuple[Decimal | None, list[str]]:
-    """Priced buckets only. Unknown models are skipped, never guessed.
-
-    Returns (amount, skipped_model_ids). None amount means cost unknown.
-    """
-    if not isinstance(model_usage, dict) or not model_usage:
-        return None, []
-    if not prices:
-        return None, list(model_usage)
-    total = Decimal("0")
-    skipped: list[str] = []
-    priced_any = False
-    for model, bucket in model_usage.items():
-        rate = lookup_price(str(model), prices)
-        if rate is None or not isinstance(bucket, dict):
-            skipped.append(str(model))
-            continue
-        priced_any = True
-        inp = _tok_int(bucket.get("inputTokens"))
-        out = _tok_int(bucket.get("outputTokens"))
-        cache_read = _tok_int(bucket.get("cacheReadInputTokens"))
-        cache_write = _tok_int(bucket.get("cacheCreationInputTokens"))
-        total += _usd_tokens(inp, rate["input"])
-        total += _usd_tokens(out, rate["output"])
-        total += _usd_tokens(cache_read, rate["cache"])
-        write_rate = rate.get("cache_write")
-        if write_rate is not None:
-            total += _usd_tokens(cache_write, write_rate)
-    if not priced_any:
-        return None, skipped
-    return total, skipped
-
-
-def format_usd(amount: Decimal) -> str:
-    return f"${amount.quantize(USD_CENTS, rounding=ROUND_HALF_UP)}"
-
-
-def export_quattro(pid: str, rec: dict) -> None:
-    """Fail-soft upgrade copy. State dir, not omarchy share."""
-    if not isinstance(rec, dict):
-        return
-    try:
-        dest_dir = quattro_state_dir()
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        limits = []
-        for w in rec.get("windows") or []:
-            if not isinstance(w, dict) or "used_pct" not in w:
-                continue
-            pct = as_pct(w.get("used_pct"))
-            if pct is None:
-                continue
-            limits.append(
-                {
-                    "label": w.get("label") or w.get("kind") or "Limit",
-                    "percent": float(pct) / 100.0,
-                    "resetsAt": w.get("resets_at") or "",
-                }
-            )
-        is_token_plan = pid == "token-plan"
-        measured_at = rec.get("measured_at")
-        has_measurement = isinstance(measured_at, str) and bool(measured_at)
-        ready = (
-            rec.get("status") == "ok"
-            and not rec.get("last_error")
-            and (not is_token_plan or (not rec.get("reason") and has_measurement))
-        )
-        error_text = str(
-            rec.get("last_error")
-            or rec.get("reason")
-            or ("measurement_time_unknown" if is_token_plan and not has_measurement else "")
-            or (rec.get("status") if rec.get("status") != "ok" else "")
-        )
-        updated_at = measured_at if is_token_plan and has_measurement else ("" if is_token_plan else iso_now())
-        record = {
-            "schemaVersion": 1,
-            "id": pid,
-            "name": rec.get("name") or pid,
-            "updatedAt": updated_at,
-            "ready": ready,
-            "hasLocalStats": bool(rec.get("hasLocalStats")),
-            "tierLabel": rec.get("plan") or "",
-            "usageStatusText": "" if ready else error_text,
-            "authHelpText": str(rec.get("reason") or ""),
-            "limits": limits,
-        }
-        for key in (
-            "todayPrompts",
-            "todaySessions",
-            "todayTotalTokens",
-            "todayTokensByModel",
-            "recentDays",
-            "totalPrompts",
-            "totalSessions",
-            "activeDays",
-            "activeDates",
-            "modelUsage",
-        ):
-            if key in rec:
-                record[key] = rec[key]
-        atomic_write(dest_dir / f"{pid}.json", json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-    except Exception:
-        return
 
 
 # --- TUI ---------------------------------------------------------------------
-
-
-def format_token_count(n) -> str:
-    try:
-        n = int(n or 0)
-    except (TypeError, ValueError):
-        return "0"
-    if n >= 1_000_000_000:
-        return f"{n / 1_000_000_000:.1f}B"
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
 
 
 def parse_reset(ts) -> datetime | None:
@@ -3190,15 +1789,6 @@ def tui_meter(pct, width: int = TUI_METER_WIDTH) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def token_meter(n: int, peak: int, width: int = TUI_METER_WIDTH) -> str:
-    if peak <= 0:
-        return "░" * width
-    ratio = min(1.0, max(0.0, n / peak))
-    filled = round_half_up(ratio * width)
-    filled = max(0, min(width, filled))
-    return "█" * filled + "░" * (width - filled)
-
-
 def _pct_label(pct) -> str:
     value = as_pct(pct)
     if value is None:
@@ -3208,16 +1798,12 @@ def _pct_label(pct) -> str:
     return f"{value}%"
 
 
-def render_dashboard(cache: dict | None = None, selected: str | None = None, prices: dict | None = None) -> str:
+def render_dashboard(cache: dict | None = None, selected: str | None = None) -> str:
     cache = cache if cache is not None else load_cache()
     pid = selected or pick_selected(cache)
     rec = cache.get("providers", {}).get(pid)
     if not isinstance(rec, dict):
         rec = empty_provider(pid if pid in PROVIDER_INDEX else "codex", "unknown", "no_cache")
-    if pid == "codex" and not rec.get("hasLocalStats") and not rec.get("modelUsage"):
-        rec = attach_codex_local_stats(rec)
-    if prices is None:
-        prices = load_prices()
 
     name = rec.get("name") or pid
     plan = rec.get("plan")
@@ -3232,7 +1818,10 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None, pri
     lines.append("")
 
     chips = []
+    all_providers = cache.get("providers", {})
     for cid, cname, _logo in PROVIDERS:
+        if not _provider_usable(all_providers.get(cid)):
+            continue
         label = cname
         if cid == pid:
             chips.append(f"[{label}]")
@@ -3271,62 +1860,6 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None, pri
                 lines.append(prefix + reset)
             lines.append("")
 
-    days = rec.get("recentDays") if isinstance(rec.get("recentDays"), list) else []
-    models = rec.get("modelUsage") if isinstance(rec.get("modelUsage"), dict) else {}
-    today = datetime.now().strftime("%Y-%m-%d")
-    if days:
-        lines.append("TOKENS BY DAY")
-        peak = 0
-        for d in days:
-            if isinstance(d, dict):
-                try:
-                    peak = max(peak, int(d.get("messageCount") or 0))
-                except (TypeError, ValueError):
-                    pass
-        for d in days:
-            if not isinstance(d, dict):
-                continue
-            date = str(d.get("date") or "")
-            try:
-                count = int(d.get("messageCount") or 0)
-            except (TypeError, ValueError):
-                count = 0
-            is_today = date == today
-            try:
-                label = "Today" if is_today else datetime.strptime(date, "%Y-%m-%d").strftime("%a")
-            except ValueError:
-                label = date or "?"
-            mark = "*" if is_today else " "
-            lines.append(f"{mark}{label:<6} {token_meter(count, peak)} {format_token_count(count):>7}")
-        lines.append("")
-
-    if models:
-        lines.append("TOKENS BY MODEL")
-        rows = []
-        for mid, bucket in models.items():
-            if not isinstance(bucket, dict):
-                continue
-            total = (
-                _tok_int(bucket.get("inputTokens"))
-                + _tok_int(bucket.get("outputTokens"))
-                + _tok_int(bucket.get("cacheReadInputTokens"))
-                + _tok_int(bucket.get("cacheCreationInputTokens"))
-            )
-            rows.append((str(mid), total, bucket))
-        rows.sort(key=lambda r: r[1], reverse=True)
-        peak_m = rows[0][1] if rows else 0
-        for mid, total, _bucket in rows[:8]:
-            lines.append(f"{mid:<28} {token_meter(total, peak_m, 16)} {format_token_count(total):>7}")
-        lines.append("")
-
-    lines.append("COST")
-    amount, _skipped = api_equivalent_cost(models or None, prices)
-    if amount is None:
-        lines.append("cost unknown")
-    else:
-        lines.append(f"API would have cost {format_usd(amount)}")
-    lines.append("OAuth incremental $0")
-    lines.append("")
     lines.append("h/l or 1-9 switch · r refresh · q quit")
     return "\n".join(lines) + "\n"
 
@@ -3372,12 +1905,7 @@ def _tui_loop(stdscr) -> int:
         if ch in ("q", "Q"):
             return 0
         if ch in ("r", "R"):
-            cmd_probe([], None)
-            cache = load_cache()
-            rec = cache.get("providers", {}).get("codex")
-            if isinstance(rec, dict):
-                cache["providers"]["codex"] = attach_codex_local_stats(rec, force=True)
-                save_cache(cache)
+            cmd_probe([])
             continue
         if ch in ("l", "L") or ch == curses.KEY_RIGHT:
             cmd_cycle("next")
@@ -3420,15 +1948,10 @@ PROBERS = {
     "charm-hyper": probe_charm_hyper,
     "zai": probe_zai,
     "google": probe_google,
-    "stepfun": probe_stepfun,
 }
 
 
-def probe_one(pid: str, fixture: str | None = None) -> dict:
-    if pid == "codex":
-        return probe_codex(fixture)
-    if pid in ("cursor", "devin"):
-        return PROBERS[pid](fixture)
+def probe_one(pid: str) -> dict:
     fn = PROBERS.get(pid)
     if not fn:
         raise SystemExit(f"unknown provider: {pid}")
@@ -3449,19 +1972,16 @@ def summarize(rec: dict) -> str:
     return " ".join(bits)
 
 
-def cmd_probe(ids: list[str], fixture: str | None) -> int:
+def cmd_probe(ids: list[str]) -> int:
     cache = load_cache()
     targets = ids or [pid for pid, _, _ in PROVIDERS]
     for pid in targets:
-        rec = probe_one(pid, fixture if pid in ("codex", "cursor", "devin", "devin2") else None)
+        rec = probe_one(pid)
         upsert(cache, rec)
         print(summarize(rec))
     cache["selected"] = pick_selected(cache)
     write_selected(cache["selected"])
     save_cache(cache)
-    for pid, rec in (cache.get("providers") or {}).items():
-        if isinstance(rec, dict):
-            export_quattro(pid, rec)
     return 0
 
 
@@ -3551,10 +2071,6 @@ def usage_row_line(index: int, row: dict) -> str:
     anonymous credit reports) render exactly as before.
     """
     extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
-    if "key_ok" in extra:
-        tail = str(extra.get("key_tail") or "")
-        state = "ok" if extra.get("key_ok") else str(extra.get("key_reason") or "dead")
-        return f"{row.get('label') or f'key {index}'} (…{tail}): {state}"
     bit = f"snapshot {index}: {_pct_label(row.get('used_pct'))}"
     account = str(row.get("account") or "").strip()
     if account:
@@ -3744,8 +2260,6 @@ def cmd_waybar() -> int:
     if extra.get("kind") == "credits" and extra_bits.get("remaining_usd") is not None:
         usd = float(extra_bits["remaining_usd"])
         extra_txt = f"${usd:.0f}" if usd >= 10 else f"${usd:.2f}"
-    elif extra_bits.get("live") is not None and extra_bits.get("total") is not None:
-        extra_txt = f"{extra_bits['live']}/{extra_bits['total']}"
     else:
         extra_txt = meter(extra.get("used_pct"))
     text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {extra_txt}"
@@ -3756,11 +2270,7 @@ def cmd_waybar() -> int:
         classes.append("stale")
     pcts = [as_pct(weekly.get("used_pct")), as_pct(extra.get("used_pct"))]
     known = [p for p in pcts if p is not None]
-    if pid == "stepfun":
-        # "Live keys" is a health gauge: 100% is the good end, not a cap.
-        if extra_bits.get("live") is not None and extra_bits.get("live") < extra_bits.get("total", 0):
-            classes.append("warn")
-    elif known and max(known) >= 95:
+    if known and max(known) >= 95:
         classes.append("critical")
     elif known and max(known) >= 80:
         classes.append("warn")
@@ -3779,8 +2289,6 @@ def cmd_waybar() -> int:
         extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
         if "used_pct" in w:
             bit = f"{label}: {w['used_pct']}%"
-        elif extra_bits.get("live") is not None and extra_bits.get("total") is not None:
-            bit = f"{label}: {extra_bits['live']}/{extra_bits['total']} live"
         else:
             bit = f"{label}: —"
         if extra_bits.get("remaining_usd") is not None:
@@ -3816,9 +2324,10 @@ def cmd_waybar() -> int:
 
 def cmd_cycle(direction: str) -> int:
     cache = load_cache()
-    present = [pid for pid, _, _ in PROVIDERS if pid in cache.get("providers", {})]
+    providers = cache.get("providers", {})
+    present = [pid for pid, _, _ in PROVIDERS if _provider_usable(providers.get(pid))]
     if not present:
-        print("no providers in cache")
+        print("no authed providers with usage in cache")
         return 1
     current = pick_selected(cache)
     if current not in present:
@@ -3836,25 +2345,6 @@ def cmd_cycle(direction: str) -> int:
     poke_waybar()
     print(nxt)
     return 0
-
-
-def blank_usage_windows(rec: dict) -> dict:
-    """Drop used_pct after an identity flip so the chip does not keep the other key's meters."""
-    rec = dict(rec)
-    rec["windows"] = [
-        {k: v for k, v in w.items() if k != "used_pct"}
-        for w in (rec.get("windows") or [])
-        if isinstance(w, dict)
-    ]
-    burst = rec.get("burst")
-    if isinstance(burst, dict) and "used_pct" in burst:
-        burst = dict(burst)
-        burst.pop("used_pct", None)
-        rec["burst"] = burst
-    rec["status"] = "unknown"
-    rec["reason"] = "switched"
-    rec.pop("last_error", None)
-    return rec
 
 
 def _identity_helper_failed(pid: str, proc: subprocess.CompletedProcess[str] | None, unavailable: bool) -> int:
@@ -3900,40 +2390,6 @@ def cmd_identity(direction: str) -> int:
         rec["id"] = "token-plan"
         rec = attach_token_plan_identity(rec)
         cache.setdefault("providers", {})["token-plan"] = rec
-        path = cache_path()
-        if path.exists():
-            atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
-        poke_waybar()
-        print((rec.get("identity") or {}).get("id") or "?")
-        return 0
-    if selected == "cursor":
-        swap = os.environ.get("AI_USAGE_CURSOR_OAUTH_SWAP") or which("cursor-oauth-swap")
-        if swap is None:
-            print("cursor: cursor-oauth-swap not found", file=sys.stderr)
-            return 1
-        swap_env = child_env()
-        swap_env["CURSOR_OAUTH_HOME"] = str(cursor_oauth_conf())
-        swap_env["CURSOR_AUTH_FILE"] = str(_cursor_auth_path())
-        try:
-            proc = subprocess.run(
-                [swap, action],
-                env=swap_env,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return _identity_helper_failed("cursor", None, True)
-        if proc.returncode != 0:
-            return _identity_helper_failed("cursor", proc, False)
-        rec = cache.get("providers", {}).get("cursor")
-        if not isinstance(rec, dict):
-            rec = empty_provider("cursor", "unknown", "no_cache")
-        rec = dict(rec)
-        rec["id"] = "cursor"
-        rec = attach_cursor_identity(blank_usage_windows(rec))
-        cache.setdefault("providers", {})["cursor"] = rec
         path = cache_path()
         if path.exists():
             atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
@@ -4011,7 +2467,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     probe = sub.add_parser("probe", help="fetch provider windows into cache")
     probe.add_argument("id", nargs="?", help="provider id (default: all)")
-    probe.add_argument("--fixture", help="Codex or Cursor RPC snapshot JSON (no network)")
     sub.add_parser("waybar", help="print Waybar JSON from cache only")
     cyc = sub.add_parser("cycle", help="rotate selected provider")
     cyc.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
@@ -4019,7 +2474,7 @@ def build_parser() -> argparse.ArgumentParser:
     ident.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
     sub.add_parser("validate", help="schema-check cache")
     sub.add_parser("refresh", help="probe all providers")
-    tui = sub.add_parser("tui", help="Quattro-like usage dashboard")
+    tui = sub.add_parser("tui", help="usage dashboard")
     tui.add_argument("--dump", action="store_true", help="print dashboard and exit")
     sel = sub.add_parser("select", help="set selected provider")
     sel.add_argument("id")
@@ -4036,9 +2491,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "probe":
         ids = [args.id] if args.id else []
-        return cmd_probe(ids, args.fixture)
+        return cmd_probe(ids)
     if args.cmd == "refresh":
-        return cmd_probe([], None)
+        return cmd_probe([])
     if args.cmd == "waybar":
         return cmd_waybar()
     if args.cmd == "cycle":

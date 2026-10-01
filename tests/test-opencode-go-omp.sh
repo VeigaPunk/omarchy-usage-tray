@@ -201,6 +201,7 @@ waybar_json="$("$BIN" waybar 2>&1)"
 python3 - "$waybar_json" <<'PY'
 import json
 import sys
+from datetime import datetime, timezone
 
 payload = json.loads(sys.argv[1])
 assert payload["alt"] == "opencode-go", payload
@@ -208,6 +209,11 @@ assert payload["text"].startswith("O "), payload["text"]
 assert payload["text"].count("bgcolor=") == 3, payload["text"]
 classes = payload["class"].split()
 assert "ok" in classes and "critical" in classes, classes
+# The weekly window resets at 2100-01-01T00:00:00Z; the countdown must be
+# computed, never pinned, or the assertion drifts with the calendar.
+reset = datetime(2100, 1, 1, tzinfo=timezone.utc)
+hours = int((reset - datetime.now(timezone.utc)).total_seconds() // 3600)
+reset_prefix = f"reset {hours // 24}d:"
 tooltip = payload["tooltip"]
 for expected in (
     "OpenCode Go",
@@ -218,7 +224,7 @@ for expected in (
     "snapshot 1: 99% · Monthly limit · 5h 1% · 7d 0% · monthly 99% · fetched: 2100-01-01T00:00:00Z",
     "snapshot 2: 2% · Weekly limit · 5h 0% · 7d 2% · monthly 0%",
     "snapshot 3: 25% · Monthly limit · 5h 10% · 7d 4% · monthly 25%",
-    "reset 26761d:",
+    reset_prefix,
     "snapshot coverage: 3 reports · 0 without usage · 0 disabled",
 ):
     assert expected in tooltip, (expected, tooltip)

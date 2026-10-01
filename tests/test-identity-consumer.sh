@@ -8,9 +8,10 @@ REAL_LOCAL="${AI_USAGE_REAL_LOCAL:-$HOME/.local/bin}"
 SWAP="${AI_USAGE_TOKEN_PLAN_SWAP:-$REAL_LOCAL/token-plan-swap}"
 CODEX_TP="${AI_USAGE_CODEX_TOKEN_PLAN:-$REAL_LOCAL/codex-token-plan}"
 TP_KEY="${AI_USAGE_TOKEN_PLAN_KEY:-$REAL_LOCAL/token-plan-key}"
+# Host-installed helpers, not repo content: skip on machines without them.
 [[ -x "$SWAP" && -x "$CODEX_TP" && -x "$TP_KEY" ]] || {
-  echo "FAIL: host helpers missing" >&2
-  exit 1
+  echo "SKIP: host helpers missing"
+  exit 0
 }
 
 HOST_ACTIVE="$HOME/.config/alibaba-token-plan/active"

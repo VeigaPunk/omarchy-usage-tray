@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
-# M01: fixture → cache → Waybar JSON. No network.
+# M01: probe → cache → Waybar JSON. No network (fake omp).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin/ai-usage"
-FIXTURE="$ROOT/fixtures/codex.pro.json"
 
 if [[ ! -x "$BIN" ]]; then
   echo "FAIL: missing executable $BIN" >&2
-  exit 1
-fi
-if [[ ! -f "$FIXTURE" ]]; then
-  echo "FAIL: missing $FIXTURE" >&2
   exit 1
 fi
 
@@ -19,8 +14,17 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export AI_USAGE_CACHE="$TMP/status.json"
 export AI_USAGE_SELECTED="$TMP/selected"
+export AI_USAGE_OMP_BIN="$TMP/fake-omp"
+cat >"$AI_USAGE_OMP_BIN" <<'SH'
+#!/usr/bin/env bash
+# One openai-codex report: primary weekly window at 62%.
+cat <<'JSON'
+{"reports":[{"provider":"openai-codex","fetchedAt":1790233200000,"limits":[{"id":"openai-codex:primary","window":{"id":"primary","resetsAt":1790793600000},"amount":{"usedFraction":0.62}}]}],"accountsWithoutUsage":[],"disabledCredentials":[]}
+JSON
+SH
+chmod +x "$AI_USAGE_OMP_BIN"
 
-"$BIN" probe codex --fixture "$FIXTURE"
+"$BIN" probe codex
 
 mode="$(stat -c '%a' "$AI_USAGE_CACHE")"
 if [[ "$mode" != "600" ]]; then
@@ -37,7 +41,7 @@ text="$(echo "$json" | jq -r .text)"
 tooltip="$(echo "$json" | jq -r .tooltip)"
 class="$(echo "$json" | jq -r .class)"
 
-# Pinned fixture meters: white-on-gray pango bars, no block-grid glyphs.
+# Metered probe: white-on-gray pango bars, no block-grid glyphs.
 if [[ "$text" == *$'\n'* ]]; then
   echo "FAIL: expected one-line text, got: $text" >&2
   exit 1
@@ -83,8 +87,11 @@ if "░" in payload["text"] and "—" not in payload["text"]:
 print("MISSING_WINDOW_OK")
 
 # Unauth / missing used_pct → em-dash, never empty-block 0% fill.
+# The chip is scoped to authed+metered providers, so the unauth provider only
+# renders once it is the sole remaining row in the cache.
 data = json.loads(cache_path.read_text())
 data["selected"] = "kimi"
+del data["providers"]["codex"]
 data["providers"]["kimi"] = {
     "id": "kimi",
     "name": "Kimi",

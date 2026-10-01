@@ -5,7 +5,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin/ai-usage"
 SWAP="${AI_USAGE_TOKEN_PLAN_SWAP:-$HOME/.local/bin/token-plan-swap}"
-[[ -x "$SWAP" ]] || { echo "FAIL: token-plan-swap missing at $SWAP" >&2; exit 1; }
+# Host-installed helper, not repo content: skip on machines without it.
+[[ -x "$SWAP" ]] || { echo "SKIP: token-plan-swap missing at $SWAP"; exit 0; }
 
 HOST_ACTIVE="$HOME/.config/alibaba-token-plan/active"
 HOST_BEFORE=""
