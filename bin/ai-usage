@@ -64,6 +64,66 @@ def selected_path() -> Path:
     return Path(os.environ.get("AI_USAGE_SELECTED", Path.home() / ".config/ai-usage/selected"))
 
 
+def providers_path() -> Path:
+    return Path(os.environ.get("AI_USAGE_PROVIDERS_FILE", Path.home() / ".config/ai-usage/providers"))
+
+
+def _roster_ids(text: str) -> list[str]:
+    """Provider ids out of one roster source, in order and deduplicated."""
+    return list(dict.fromkeys(tok for tok in re.split(r"[,\s]+", text.strip()) if tok))
+
+
+def _roster_from_env() -> list[str]:
+    """AI_USAGE_PROVIDERS: comma and/or whitespace separated ids."""
+    return _roster_ids(os.environ.get("AI_USAGE_PROVIDERS") or "")
+
+
+def _roster_from_file() -> list[str]:
+    """One provider id per line; `#` comments and blank lines are skipped."""
+    try:
+        text = providers_path().read_text(encoding="utf-8")
+    except OSError:
+        return []
+    ids: list[str] = []
+    for line in text.splitlines():
+        ids.extend(_roster_ids(line.split("#", 1)[0]))
+    return list(dict.fromkeys(ids))
+
+
+# Ids already reported as unknown, so one run warns once per bad id: the roster
+# is re-read by every command that iterates providers.
+_ROSTER_WARNED: set[str] = set()
+
+
+def active_providers() -> list[tuple]:
+    """PROVIDERS scoped to the opt-in roster, or all of them when none is set.
+
+    The env roster wins over ~/.config/ai-usage/providers so one shell run can
+    narrow a single probe without editing the machine's file. An unknown id
+    warns and is skipped, and a roster with nothing known in it falls back to
+    the full tuple, so a typo can never blank the chip.
+    """
+    ids = _roster_from_env() or _roster_from_file()
+    if not ids:
+        return list(PROVIDERS)
+    wanted: set[str] = set()
+    for pid in ids:
+        if pid in PROVIDER_INDEX:
+            wanted.add(pid)
+        elif pid not in _ROSTER_WARNED:
+            _ROSTER_WARNED.add(pid)
+            print(f"ai-usage: unknown provider in roster: {pid}", file=sys.stderr)
+    if not wanted:
+        return list(PROVIDERS)
+    # PROVIDERS order, not roster order: the cycle and the chip row stay
+    # canonical however the roster happens to be sorted.
+    return [row for row in PROVIDERS if row[0] in wanted]
+
+
+def active_provider_ids() -> list[str]:
+    return [pid for pid, _, _ in active_providers()]
+
+
 def waybar_signal() -> int:
     """Realtime-signal offset custom/ai-usage listens on.
 
@@ -328,12 +388,15 @@ def upsert(cache: dict, rec: dict) -> None:
 def pick_selected(cache: dict) -> str:
     current = read_selected(cache)
     providers = cache.get("providers", {})
-    usable = [pid for pid, _, _ in PROVIDERS if _provider_usable(providers.get(pid))]
-    if current in usable:
+    # `select` accepts any known provider, so an off-roster choice still wins
+    # while its record can show a real number; the roster scopes the fallbacks.
+    if current in PROVIDER_INDEX and _provider_usable(providers.get(current)):
         return current
+    roster = active_provider_ids()
+    usable = [pid for pid in roster if _provider_usable(providers.get(pid))]
     if usable:
         return usable[0]
-    present = [pid for pid, _, _ in PROVIDERS if pid in providers]
+    present = [pid for pid in roster if pid in providers]
     if present:
         return present[0]
     return "codex"
@@ -342,7 +405,7 @@ def pick_selected(cache: dict) -> str:
 # --- OMP-metered providers ---------------------------------------------------
 # Every usage meter comes from `omp usage --provider ... --json`; the native
 # CLIs (codex, grok, cursor-agent, devin) are not required because OMP meters
-# those same subscriptions from its auth store. The roster is scoped to
+# those same subscriptions from its auth store. PROVIDERS is scoped to
 # providers OMP actually answers for, so no auth is ever guessed.
 
 # provider id -> (omp provider, ((limit id, kind, short label, long label, primary), ...))
@@ -1819,7 +1882,7 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
 
     chips = []
     all_providers = cache.get("providers", {})
-    for cid, cname, _logo in PROVIDERS:
+    for cid, cname, _logo in active_providers():
         if not _provider_usable(all_providers.get(cid)):
             continue
         label = cname
@@ -1885,7 +1948,7 @@ def _tui_loop(stdscr) -> int:
     curses.curs_set(0)
     stdscr.keypad(True)
     stdscr.nodelay(False)
-    ids = [pid for pid, _, _ in PROVIDERS]
+    ids = active_provider_ids()
     while True:
         text = render_dashboard()
         stdscr.erase()
@@ -1915,7 +1978,8 @@ def _tui_loop(stdscr) -> int:
             cmd_cycle("prev")
             poke_waybar()
             continue
-        if isinstance(ch, str) and ch in "123456789":
+        # A roster shorter than 9 providers has no key for the higher digits.
+        if isinstance(ch, str) and ch in "123456789" and int(ch) <= len(ids):
             cmd_select(ids[int(ch) - 1])
             continue
         if ch == curses.KEY_RESIZE:
@@ -1974,7 +2038,7 @@ def summarize(rec: dict) -> str:
 
 def cmd_probe(ids: list[str]) -> int:
     cache = load_cache()
-    targets = ids or [pid for pid, _, _ in PROVIDERS]
+    targets = ids or active_provider_ids()
     for pid in targets:
         rec = probe_one(pid)
         upsert(cache, rec)
@@ -2325,7 +2389,7 @@ def cmd_waybar() -> int:
 def cmd_cycle(direction: str) -> int:
     cache = load_cache()
     providers = cache.get("providers", {})
-    present = [pid for pid, _, _ in PROVIDERS if _provider_usable(providers.get(pid))]
+    present = [pid for pid in active_provider_ids() if _provider_usable(providers.get(pid))]
     if not present:
         print("no authed providers with usage in cache")
         return 1
@@ -2466,14 +2530,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"ai-usage {TOOL_VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
     probe = sub.add_parser("probe", help="fetch provider windows into cache")
-    probe.add_argument("id", nargs="?", help="provider id (default: all)")
+    probe.add_argument("id", nargs="?", help="provider id (default: active roster)")
     sub.add_parser("waybar", help="print Waybar JSON from cache only")
     cyc = sub.add_parser("cycle", help="rotate selected provider")
     cyc.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
     ident = sub.add_parser("identity", help="rotate identity inside the selected provider")
     ident.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
     sub.add_parser("validate", help="schema-check cache")
-    sub.add_parser("refresh", help="probe all providers")
+    sub.add_parser("refresh", help="probe the active roster")
     tui = sub.add_parser("tui", help="usage dashboard")
     tui.add_argument("--dump", action="store_true", help="print dashboard and exit")
     sel = sub.add_parser("select", help="set selected provider")

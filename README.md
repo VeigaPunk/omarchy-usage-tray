@@ -154,6 +154,43 @@ service environment for the 5-minute probe:
 Values are literal — systemd expands nothing inside the file. The same
 `AI_USAGE_*` variables work when set in your shell for one-off runs.
 
+### Provider roster
+
+By default every provider above is probed and cycled. An installation can opt in
+to a subset — the models actually authed on that machine — so the probe skips
+subscriptions nobody uses and the chip cycles only through providers that can
+show a number.
+
+`AI_USAGE_PROVIDERS` takes a comma and/or whitespace separated id list
+(`AI_USAGE_PROVIDERS="codex kimi"`) and wins when set, so a shell can narrow a
+one-off run; it also works from `~/.config/ai-usage/env` to scope the timer.
+Otherwise the roster comes from `~/.config/ai-usage/providers`, one id per line,
+with `#` comments and blank lines skipped:
+
+```
+# authed on this machine
+codex
+kimi
+zai
+```
+
+`AI_USAGE_PROVIDERS_FILE` overrides that path (the tests point it at a temp
+file). With neither source set — or with a roster that names no known provider —
+all 11 providers stay active, so the default behaviour is unchanged. An unknown
+id prints one warning line to stderr (`ai-usage: unknown provider in roster:
+<id>`, once per run) and is skipped; it never fails a probe.
+
+The roster scopes the defaults: `probe` / `refresh` with no id, the click and
+scroll cycle, the TUI chip row and its number keys, and the provider the chip
+falls back to when the selected one has no usable record. Nothing named
+explicitly is restricted — `ai-usage probe zai` and `ai-usage select zai` both
+work while `zai` is off the roster, and the chip renders that selection as soon
+as a record for it exists.
+
+To add a provider you have just authed, add a line to
+`~/.config/ai-usage/providers`. The systemd timer picks it up on its next run
+(5 minutes), or run `ai-usage probe` to fetch it immediately.
+
 ## Local clone
 
 ```bash
