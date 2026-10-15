@@ -37,6 +37,21 @@ Missing data is never invented: a window the provider did not answer renders as
 `—`, and a provider that cannot be reached keeps its last good meters and shows
 the bounded reason instead.
 
+### Token Plan console authentication
+
+Token Plan API keys can serve model requests without exposing quota data.
+Each stored OMP credential also needs the matching account's QwenCloud or
+Bailian console Cookie header for usage reporting. See OMP's
+[Token Plan login guidance](https://github.com/can1357/oh-my-pi/blob/main/packages/ai/README.md).
+Cookies are sensitive and session-lived: keep them in OMP's credential store,
+never in the provider roster, service environment, usage cache, or repository.
+Reconnect the corresponding console session when it expires.
+
+For multiple keys, check that `omp usage --provider alibaba-token-plan --json`
+returns one report per account, then run `ai-usage probe token-plan`. A working
+key listed under `accountsWithoutUsage` has no quota report; it is not a zero
+usage reading.
+
 ### Token Plan add-on credits
 
 Token Plan meters the monthly plan window and purchased add-on bundles (Credit
@@ -51,6 +66,14 @@ percentages only — so override them per tier with
 `AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS` still honored) and
 `AI_USAGE_TOKEN_PLAN_ADDON_CREDITS` (both **per account**). OMP emits only the
 monthly window today, so the add-on path stays dormant until it reports one.
+
+The default monthly pool is **45,000 credits per account (Standard)**. Pro
+grants **180,000 per account**: set
+`AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS=180000` in `~/.config/ai-usage/env` for a
+Pro-only pool. Three Pro accounts therefore total 540,000 monthly credits.
+For an immediate one-off refresh, pass the same variable to
+`ai-usage probe token-plan`; the environment file is loaded by the timer,
+not by interactive shell commands.
 
 ### Charm Hyper credits
 

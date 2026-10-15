@@ -48,7 +48,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # Local environment for ai-usage.service (optional; the unit tolerates it
 # being absent). Values are literal: no shell expansion happens here.
 #AI_USAGE_OMP_BIN=$HOME/.local/bin/omp
-#AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS=40000
+#AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS=45000
 #AI_USAGE_TOKEN_PLAN_ADDON_CREDITS=20000
 #AI_USAGE_CHARM_HYPER_LOW_CREDITS=25
 EOF
