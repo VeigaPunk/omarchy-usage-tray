@@ -19,11 +19,10 @@ from pathlib import Path
 # Cache schema. 2 replaced the Token Plan `capacity` block with credit totals
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
-# User-facing release. Every usage meter now comes from `omp usage --json`;
-# native CLI probes (codex RPC, grok/cursor/devin HTTP) are gone, so the
-# tool version jumps a minor.
-TOOL_VERSION = "1.7.0"
+# User-facing release.
+TOOL_VERSION = "1.7.1"
 METER_WIDTH = 6
+TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
 METER_TRACK = "#3a3a3a"
 NBSP = "\u00a0"
@@ -719,15 +718,15 @@ def _token_plan_addon_credits() -> int:
 
 
 def _credits_label(value) -> str:
-    """Compact credit readout: 19999.62 -> 20.0k, 140000 -> 140k, 950 -> 950."""
+    """Compact credit readout: 539999 -> 540k, 23912 -> 24k, 6632.16 -> 6.6k, 950 -> 950."""
     number = _token_plan_number(value)
     if number is None:
         return "—"
     amount = float(number)
     if amount >= 10000:
-        return f"{amount / 1000:.1f}k"
+        return f"{round_half_up(amount / 1000)}k"
     if amount >= 1000:
-        return f"{amount / 1000:.2f}k"
+        return f"{amount / 1000:.1f}".rstrip("0").rstrip(".") + "k"
     return f"{amount:.0f}"
 
 
@@ -1824,6 +1823,7 @@ def parse_reset(ts) -> datetime | None:
 
 
 def format_reset_in(ts) -> str:
+    """Countdown to a reset: `2d 14h`, `3d`, `2h 13m`, `45m`, or `now`."""
     dt = parse_reset(ts)
     if dt is None:
         return ""
@@ -1835,9 +1835,9 @@ def format_reset_in(ts) -> str:
     hours = minutes // 60
     days = hours // 24
     if days > 0:
-        return f"{days}d {hours % 24}h"
+        return f"{days}d {hours % 24}h" if hours % 24 else f"{days}d"
     if hours > 0:
-        return f"{hours}h {minutes % 60}m"
+        return f"{hours}h {minutes % 60}m" if minutes % 60 else f"{hours}h"
     return f"{max(1, minutes)}m"
 
 
@@ -1851,12 +1851,15 @@ def tui_meter(pct, width: int = TUI_METER_WIDTH) -> str:
 
 
 def _pct_label(pct) -> str:
+    """Whole percent: 24.83 -> 25%. Never a false 0% or 100% at the edges."""
     value = as_pct(pct)
     if value is None:
         return "—"
-    if float(value) == int(value):
-        return f"{int(value)}%"
-    return f"{value}%"
+    if 0 < value < 1:
+        return "<1%"
+    if 99 < value < 100:
+        return "99%"
+    return f"{round_half_up(value)}%"
 
 
 def render_dashboard(cache: dict | None = None, selected: str | None = None) -> str:
@@ -2054,14 +2057,14 @@ def round_half_up(n: float) -> int:
     return int(n + 0.5) if n >= 0 else int(n - 0.5)
 
 
-def meter(pct) -> str:
+def meter(pct, width: int = METER_WIDTH) -> str:
     """Gray track, white fill — no block-grid characters."""
     value = as_pct(pct)
     if value is None:
         return "—"
-    filled = round_half_up(value * METER_WIDTH / 100.0)
-    filled = max(0, min(METER_WIDTH, filled))
-    rest = METER_WIDTH - filled
+    filled = round_half_up(value * width / 100.0)
+    filled = max(0, min(width, filled))
+    rest = width - filled
     inner = ""
     if filled:
         inner += f"<span bgcolor='{METER_FILL}'>{NBSP * filled}</span>"
@@ -2070,20 +2073,14 @@ def meter(pct) -> str:
     return f"<span bgcolor='{METER_TRACK}'>{inner}</span>"
 
 
-def format_reset_in(ts) -> str:
-    """Compact countdown: `2d:05h (CEST)` — day:hour plus the local tz label."""
-    dt = parse_reset(ts)
-    if dt is None:
-        return ""
-    remaining = dt - datetime.now(timezone.utc)
-    seconds = remaining.total_seconds()
-    if not (seconds > 0):
-        return "now"
-    hours = int(seconds // 3600)
-    days = hours // 24
-    tz = dt.astimezone().strftime("%Z")
-    suffix = f" ({tz})" if tz else ""
-    return f"{days}d:{hours % 24:02d}h{suffix}"
+def tooltip_meter(pct, width: int = TOOLTIP_METER_WIDTH) -> str:
+    """Thin tracks rather than full-line backgrounds in multiline tooltips."""
+    value = as_pct(pct)
+    if value is None:
+        return "—".ljust(width)
+    filled = max(0, min(width, round_half_up(value * width / 100.0)))
+    track = "━"
+    return track * filled + f"<span fgalpha='30%'>{track * (width - filled)}</span>"
 
 
 def window_by_kind(rec: dict, kind: str) -> dict | None:
@@ -2125,49 +2122,139 @@ def _timestamp_age_sec(stamp) -> float | None:
     return max(0.0, time.time() - parsed.timestamp())
 
 
-def usage_row_line(index: int, row: dict) -> str:
-    """One stored-snapshot line for the chip tooltip.
+def age_text(seconds) -> str:
+    """Coarse age: `just now`, `4m ago`, `3h ago`, `2d ago`."""
+    if seconds is None:
+        return "unknown"
+    s = int(seconds)
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
 
-    Providers that can name a row (OpenCode Go's binding window) add that name
-    and every window the row measured; providers that cannot (Token Plan's
-    anonymous credit reports) render exactly as before.
+
+def reset_phrase(ts) -> str:
+    reset = format_reset_in(ts)
+    if not reset:
+        return ""
+    return "resets now" if reset == "now" else f"resets in {reset}"
+
+
+def muted(text: str) -> str:
+    """Secondary tooltip text, dimmed so the meters carry the eye."""
+    return f"<span fgalpha='80%'>{pango_escape(text)}</span>"
+
+
+def display_label(label, accounts: int) -> str:
+    """Drop a redundant count, but keep smaller per-window coverage visible."""
+    text = str(label or "").strip()
+    text = text.removeprefix(f"{accounts}-account ")
+    return text[:1].upper() + text[1:] if text else "Limit"
+
+
+def report_count(rec: dict) -> int:
+    snapshot = rec.get("snapshot") if isinstance(rec.get("snapshot"), dict) else {}
+    reports = snapshot.get("reports")
+    return reports if isinstance(reports, int) and not isinstance(reports, bool) else 0
+
+
+def tooltip_header(rec: dict, fallback: str, notes: list[str]) -> list[str]:
+    """Bold provider name, dimmed context notes, then the bounded reason/error."""
+    title = f"<b>{pango_escape(str(rec.get('name') or fallback))}</b>"
+    if rec.get("plan"):
+        title += "  " + muted(str(rec["plan"]))
+    lines = [title]
+    lines.extend(muted(note) for note in notes)
+    if rec.get("reason"):
+        lines.append(muted(str(rec["reason"])))
+    if rec.get("last_error"):
+        lines.append("last error: " + pango_escape(str(rec["last_error"])))
+    return lines
+
+
+def window_lines(windows: list[dict], accounts: int) -> list[str]:
+    """Aligned `Label  [meter]  25%  resets in 2d 14h` rows."""
+    labelled = [(display_label(w.get("label") or w.get("kind"), accounts), w) for w in windows]
+    width = max((len(label) for label, _ in labelled), default=0)
+    out = []
+    for label, w in labelled:
+        pct = w.get("used_pct")
+        bar = tooltip_meter(pct)
+        line = f"{pango_escape(label.ljust(width))}  {bar} {pango_escape(_pct_label(pct).rjust(4))}"
+        tail = []
+        extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
+        if extra_bits.get("remaining_usd") is not None:
+            tail.append(f"${float(extra_bits['remaining_usd']):.2f} left")
+        reset = reset_phrase(w.get("resets_at"))
+        if reset:
+            tail.append(reset)
+        if tail:
+            line += "  " + muted(" · ".join(tail))
+        out.append(line)
+    return out
+
+
+def usage_row_line(index: int, row: dict) -> str:
+    """One stored snapshot: meter, percent, what binds it, when it resets.
+
+    The fetch time shows only once a row has gone stale; fresh rows need no
+    timestamp. OMP exposes no account identity, so rows are numbered.
     """
-    extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
-    bit = f"snapshot {index}: {_pct_label(row.get('used_pct'))}"
+    pct = row.get("used_pct")
+    bar = tooltip_meter(pct, METER_WIDTH)
+    line = f"{index:>2}  {bar} {pango_escape(_pct_label(pct).rjust(4))}"
+    detail = []
     account = str(row.get("account") or "").strip()
     if account:
-        bit += f" · {account[:8]}"
-    label = str(row.get("label") or "").strip()
+        detail.append(account[:8])
+    label = re.sub(r"\s+limit$", "", str(row.get("label") or "").strip(), flags=re.IGNORECASE)
     if label:
-        bit += f" · {label}"
-    measured = row.get("windows") if isinstance(row.get("windows"), dict) else {}
-    for entry in measured.values():
-        if isinstance(entry, dict):
-            bit += f" · {entry.get('label') or entry.get('kind_label') or '?'} {_pct_label(entry.get('used_pct'))}"
-    fetched_at = row.get("fetched_at")
-    fetched_age = _timestamp_age_sec(fetched_at)
-    fetched_text = str(fetched_at) if fetched_age is not None else "unknown"
-    if fetched_age is not None:
-        fetched_text += f" ({int(fetched_age)}s ago)"
-    bit += f" · fetched: {fetched_text}"
+        detail.append(label)
     remaining = _token_plan_number(row.get("credits_remaining"))
     total = _token_plan_number(row.get("credits_total"))
     if remaining is not None and total is not None:
-        bit += f" · {_credits_label(remaining)}/{_credits_label(total)} credits"
-    if row.get("resets_at"):
-        reset = format_reset_in(row["resets_at"])
-        bit += f" · reset {reset or row['resets_at']}"
-    return bit
+        detail.append(f"{_credits_label(remaining)} of {_credits_label(total)} left")
+    if detail:
+        line += "  " + pango_escape(" · ".join(detail))
+    tail = []
+    reset = reset_phrase(row.get("resets_at"))
+    if reset:
+        tail.append(reset)
+    age = _timestamp_age_sec(row.get("fetched_at"))
+    if age is None:
+        tail.append("fetch time unknown")
+    elif age > STALE_AFTER_SEC:
+        tail.append(f"fetched {age_text(age)}")
+    if tail:
+        line += "  " + muted(" · ".join(tail))
+    return line
 
 
-def coverage_line(snapshot: dict) -> str:
-    """Report coverage, so a partial snapshot never reads as a full fleet."""
-    return (
-        "snapshot coverage: "
-        f"{snapshot.get('reports', 0)} reports · "
-        f"{snapshot.get('accounts_without_usage', 0)} without usage · "
-        f"{snapshot.get('disabled_credentials', 0)} disabled"
-    )
+def coverage_line(snapshot: dict) -> str | None:
+    """Credentials OMP could not meter, so a partial fleet never reads as
+    whole. Silent when every credential reported."""
+    bits = []
+    without = snapshot.get("accounts_without_usage") or 0
+    disabled = snapshot.get("disabled_credentials") or 0
+    if without:
+        bits.append(f"{without} account{'s' if without != 1 else ''} without usage data")
+    if disabled:
+        bits.append(f"{disabled} credential{'s' if disabled != 1 else ''} disabled")
+    return muted(" · ".join(bits)) if bits else None
+
+
+def _row_section(rows: list) -> list[str]:
+    lines = [usage_row_line(index, item) for index, item in enumerate(rows, 1) if isinstance(item, dict)]
+    return [""] + lines if lines else []
+
+
+def _snapshot_section(rec: dict) -> list[str]:
+    snapshot = rec.get("snapshot")
+    line = coverage_line(snapshot) if isinstance(snapshot, dict) else None
+    return [line] if line else []
 
 
 def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
@@ -2178,8 +2265,8 @@ def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
     credits_total = _token_plan_number(credits.get("total"))
     mark = f"{logo} @{ident_id}" if ident_id else logo
     text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {meter(hottest.get('used_pct'))}"
-    if credits_remaining is not None and credits_total is not None:
-        text += f" {pango_escape(f'{_credits_label(credits_remaining)}/{_credits_label(credits_total)}')}"
+    if credits_remaining is not None:
+        text += f" {pango_escape(_credits_label(credits_remaining))} left"
     classes = [str(rec.get("status") or "unknown")]
     account_usage = rec.get("account_usage")
     account_usage = account_usage if isinstance(account_usage, list) else []
@@ -2196,43 +2283,30 @@ def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
     elif hottest_pct is not None and hottest_pct >= 80:
         classes.append("warn")
 
-    lines = [str(rec.get("name") or "Token Plan")]
+    notes = []
+    if report_count(rec) > 1:
+        notes.append(f"{report_count(rec)} account reports")
     if ident_id:
-        lines.append(f"active route: {ident_id} · routing only; not mapped to a snapshot")
-    if rec.get("reason"):
-        lines.append(str(rec["reason"]))
-    if rec.get("last_error"):
-        lines.append("last error: " + str(rec["last_error"]))
-    lines.append(f"{weekly.get('label') or 'Account credits'}: {_pct_label(weekly.get('used_pct'))}")
-    if credits_remaining is not None and credits_total is not None:
-        lines.append(
-            "credits: "
-            f"{_credits_label(credits_remaining)} remaining of {_credits_label(credits_total)}"
-            f" · {_credits_label(credits.get('used'))} used"
+        notes.append(f"active route: {ident_id} · routing only")
+    lines = tooltip_header(rec, "Token Plan", notes)
+    lines.append("")
+    lines.extend(
+        window_lines(
+            [
+                weekly or window("weekly", "Account credits", None),
+                hottest or window("special", "Hottest account", None),
+            ],
+            report_count(rec),
         )
-
-    hottest_index = None
-    if hottest_pct is not None:
-        for index, item in enumerate(account_usage, 1):
-            if isinstance(item, dict) and as_pct(item.get("used_pct")) == hottest_pct:
-                hottest_index = index
-                break
-    hottest_line = f"{hottest.get('label') or 'Hottest account'}: {_pct_label(hottest.get('used_pct'))}"
-    if hottest_index is not None:
-        hottest_line += f" · snapshot {hottest_index}"
-    lines.append(hottest_line)
-
-    for index, item in enumerate(account_usage, 1):
-        if isinstance(item, dict):
-            lines.append(usage_row_line(index, item))
-
-    snapshot = rec.get("snapshot")
-    if isinstance(snapshot, dict):
-        lines.append(coverage_line(snapshot))
+    )
+    if credits_remaining is not None and credits_total is not None:
+        lines.append(f"{_credits_label(credits_remaining)} of {_credits_label(credits_total)} credits left")
+    lines.extend(_row_section(account_usage))
+    lines.extend(_snapshot_section(rec))
     return {
         "text": text,
-        "tooltip": pango_escape("\n".join(lines)),
-        "class": " ".join(classes),
+        "tooltip": "\n".join(lines),
+        "class": classes,
         "alt": "token-plan",
     }
 
@@ -2243,8 +2317,7 @@ def _charm_hyper_waybar_payload(rec: dict, logo: str) -> dict:
     remaining = _token_plan_number(credits.get("remaining"))
     counter = f"{_credits_label(remaining)}cr" if remaining is not None else "—"
     text = f"{pango_escape(logo)} {pango_escape(counter)}"
-    measured_at = rec.get("measured_at")
-    measured_age = _timestamp_age_sec(measured_at)
+    measured_age = _timestamp_age_sec(rec.get("measured_at"))
     classes = [str(rec.get("status") or "unknown")]
     if measured_age is not None and measured_age > STALE_AFTER_SEC:
         classes.append("stale")
@@ -2254,41 +2327,38 @@ def _charm_hyper_waybar_payload(rec: dict, logo: str) -> dict:
     elif remaining is not None and floor is not None and remaining <= floor:
         classes.append("warn")
 
-    lines = [str(rec.get("name") or "Charm Hyper")]
-    if rec.get("reason"):
-        lines.append(str(rec["reason"]))
-    if rec.get("last_error"):
-        lines.append("last error: " + str(rec["last_error"]))
+    rows = [row for row in rec.get("account_usage") or [] if isinstance(row, dict)]
+    notes = [f"total across {len(rows)} credentials"] if len(rows) > 1 else []
+    lines = tooltip_header(rec, "Charm Hyper", notes)
+    lines.append("")
     if remaining is None:
-        lines.append("credits: —")
+        lines.append("— credits left")
     else:
-        kept = " (last good)" if rec.get("last_error") and rec.get("status") == "ok" else ""
-        lines.append(f"credits: {_credits_label(remaining)} left{kept}")
-    if isinstance(measured_at, str) and measured_at:
-        stamp = measured_at
-        if measured_age is not None:
-            stamp += f" ({int(measured_age)}s ago)"
-        lines.append(f"measured: {stamp}")
+        line = f"<b>{pango_escape(_credits_label(remaining))}</b> credits left"
+        if rec.get("last_error") and rec.get("status") == "ok":
+            line += "  " + muted("(last good)")
+        lines.append(line)
+    hint = "prepaid · no reset window"
     if floor is not None:
-        lines.append(f"warn below {_credits_label(floor)} credits")
-    for index, row in enumerate(rec.get("account_usage") or [], 1):
-        if not isinstance(row, dict):
-            continue
-        bit = f"snapshot {index}: {_credits_label(row.get('remaining_credits'))} credits"
-        fetched_at = row.get("fetched_at")
-        fetched_age = _timestamp_age_sec(fetched_at)
-        fetched_text = str(fetched_at) if fetched_age is not None else "unknown"
-        if fetched_age is not None:
-            fetched_text += f" ({int(fetched_age)}s ago)"
-        bit += f" · fetched: {fetched_text}"
-        lines.append(bit)
-    snapshot = rec.get("snapshot")
-    if isinstance(snapshot, dict):
-        lines.append(coverage_line(snapshot))
+        hint += f" · warns below {_credits_label(floor)}"
+    lines.append(muted(hint))
+    if len(rows) > 1:
+        lines.append("")
+        for index, row in enumerate(rows, 1):
+            line = f"{index:>2}  {pango_escape(_credits_label(row.get('remaining_credits')))} credits"
+            age = _timestamp_age_sec(row.get("fetched_at"))
+            if age is None:
+                line += "  " + muted("fetch time unknown")
+            elif age > STALE_AFTER_SEC:
+                line += "  " + muted(f"fetched {age_text(age)}")
+            lines.append(line)
+    lines.extend(_snapshot_section(rec))
+    if measured_age is not None:
+        lines.append(muted(f"updated {age_text(measured_age)}"))
     return {
         "text": text,
-        "tooltip": pango_escape("\n".join(lines)),
-        "class": " ".join(classes),
+        "tooltip": "\n".join(lines),
+        "class": classes,
         "alt": "charm-hyper",
     }
 
@@ -2336,48 +2406,35 @@ def cmd_waybar() -> int:
         classes.append("critical")
     elif known and max(known) >= 80:
         classes.append("warn")
-    lines = [f"{rec.get('name') or pid}" + (f" ({rec['plan']})" if rec.get("plan") else "")]
+
+    rows = [item for item in rec.get("account_usage") or [] if isinstance(item, dict)]
+    notes = []
+    if report_count(rec) > 1:
+        notes.append(f"{report_count(rec)} account reports")
     if ident_id:
         title = str(ident.get("title") or ident_id)
-        lines.append(f"identity: {ident_id}" + (f" · {title}" if title and title != ident_id else ""))
-    if rec.get("reason"):
-        lines.append(str(rec["reason"]))
-    if rec.get("last_error"):
-        lines.append("last error: " + str(rec["last_error"]))
-    for w in rec.get("windows") or []:
-        if not isinstance(w, dict):
-            continue
-        label = w.get("label") or w.get("kind")
-        extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
-        if "used_pct" in w:
-            bit = f"{label}: {w['used_pct']}%"
-        else:
-            bit = f"{label}: —"
-        if extra_bits.get("remaining_usd") is not None:
-            bit += f"  ${float(extra_bits['remaining_usd']):.2f} left"
-        if w.get("resets_at"):
-            reset = format_reset_in(w["resets_at"])
-            bit += f"  reset {reset or w['resets_at']}"
-        lines.append(bit)
+        notes.append(f"identity: {ident_id}" + (f" · {title}" if title and title != ident_id else ""))
+    elif len(rows) == 1 and str(rows[0].get("account") or "").strip():
+        notes.append(f"account: {str(rows[0]['account']).strip()[:8]}")
+    lines = tooltip_header(rec, pid, notes)
+    limits = [w for w in rec.get("windows") or [] if isinstance(w, dict)]
     burst = rec.get("burst")
     if isinstance(burst, dict) and "used_pct" in burst:
-        bit = f"{burst.get('label') or 'burst'}: {burst['used_pct']}%"
-        if burst.get("resets_at"):
-            reset = format_reset_in(burst["resets_at"])
-            bit += f"  reset {reset or burst['resets_at']}"
-        lines.append(bit)
-    for index, item in enumerate(rec.get("account_usage") or [], 1):
-        if isinstance(item, dict):
-            lines.append(usage_row_line(index, item))
-    snapshot = rec.get("snapshot")
-    if isinstance(snapshot, dict):
-        lines.append(coverage_line(snapshot))
+        limits.append(burst)
+    if limits:
+        lines.append("")
+        lines.extend(window_lines(limits, report_count(rec)))
+    # A single snapshot repeats the limits above; rows only earn space when
+    # there are several to compare.
+    if len(rows) > 1:
+        lines.extend(_row_section(rows))
+    lines.extend(_snapshot_section(rec))
     if age is not None:
-        lines.append(f"cache {int(age)}s ago")
+        lines.append(muted(f"updated {age_text(age)}"))
     payload = {
         "text": text,
-        "tooltip": pango_escape("\n".join(lines)),
-        "class": " ".join(classes),
+        "tooltip": "\n".join(lines),
+        "class": classes,
         "alt": pid,
     }
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")

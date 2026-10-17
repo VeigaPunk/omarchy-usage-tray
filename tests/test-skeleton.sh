@@ -39,7 +39,7 @@ echo "$json" | jq -e '.text and .tooltip and .class and .alt' >/dev/null
 
 text="$(echo "$json" | jq -r .text)"
 tooltip="$(echo "$json" | jq -r .tooltip)"
-class="$(echo "$json" | jq -r .class)"
+class="$(echo "$json" | jq -r '.class | join(" ")')"
 
 # Metered probe: white-on-gray pango bars, no block-grid glyphs.
 if [[ "$text" == *$'\n'* ]]; then
@@ -66,6 +66,7 @@ fi
 # Missing used_pct must never become a guessed fill.
 python3 - "$AI_USAGE_CACHE" "$BIN" <<'PY'
 import json, os, subprocess, sys, tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 cache_path = Path(sys.argv[1])
 bin_path = sys.argv[2]
@@ -85,6 +86,27 @@ if "—" not in payload["text"] and "–" not in payload["text"]:
 if "░" in payload["text"] and "—" not in payload["text"]:
     raise SystemExit("FAIL: invented empty-bar percent for missing window")
 print("MISSING_WINDOW_OK")
+
+# Small positive usage must not say zero, and the less-than sign must not
+# break Waybar's Pango tooltip. Near-exhaustion must not claim an exhausted
+# account until the actual meter reaches 100%.
+for pct, expected in ((0.4, "<1%"), (99.6, "99%"), (100, "100%")):
+    for w in prov["windows"]:
+        w["used_pct"] = pct
+    prov["account_usage"] = [
+        {"used_pct": pct, "label": "<shared & metered>"},
+        {"used_pct": 0},
+    ]
+    cache_path.write_text(json.dumps(data))
+    payload = json.loads(subprocess.check_output([bin_path, "waybar"], env=env, text=True))
+    root = ET.fromstring(f"<tooltip>{payload['tooltip']}</tooltip>")
+    plain = "".join(root.itertext())
+    weekly = next(line for line in plain.splitlines() if line.startswith("7 days "))
+    account = next(line for line in plain.splitlines() if line.startswith(" 1 "))
+    assert expected in weekly.split(), (pct, weekly)
+    assert expected in account.split(), (pct, account)
+    assert "<shared & metered>" in account, account
+print("PERCENT_BOUNDARIES_OK")
 
 # Unauth / missing used_pct → em-dash, never empty-block 0% fill.
 # The chip is scoped to authed+metered providers, so the unauth provider only
@@ -115,7 +137,7 @@ if "—" not in text and "–" not in text:
     raise SystemExit(f"FAIL: unauth text must contain em-dash, got {text!r}")
 if "░" in text or "▓" in text:
     raise SystemExit(f"FAIL: unauth must not render empty-block 0%, got {text!r}")
-if payload.get("class") and "ok" == payload["class"]:
+if "ok" in payload.get("class", []):
     raise SystemExit(f"FAIL: unauth class looks ok: {payload['class']!r}")
 print("UNAUTH_DASH_OK")
 PY

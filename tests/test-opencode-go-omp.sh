@@ -200,34 +200,37 @@ waybar_json="$("$BIN" waybar 2>&1)"
 
 python3 - "$waybar_json" <<'PY'
 import json
+import re
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 payload = json.loads(sys.argv[1])
 assert payload["alt"] == "opencode-go", payload
-assert payload["text"].startswith("O "), payload["text"]
-assert payload["text"].count("bgcolor=") == 3, payload["text"]
-classes = payload["class"].split()
+classes = payload["class"]
 assert "ok" in classes and "critical" in classes, classes
+tooltip = payload["tooltip"]
+ET.fromstring(f"<t>{tooltip}</t>")
+plain = re.sub(r"<[^>]+>", "", tooltip).replace("━", "")
+
+
+def row(prefix):
+    return next(line.split() for line in plain.splitlines() if line.startswith(prefix))
+
+
+# Averages render as whole percents: 3.6667 -> 4%, 41.3333 -> 41%.
+assert "2%" in row("Weekly "), plain
+assert "4%" in row("5 Hour "), plain
+assert "41%" in row("Monthly "), plain
+assert "99%" in row("Hottest account "), plain
+# Each key shows its binding window, so a capped key is obvious.
+assert row(" 1 ")[1:3] == ["99%", "Monthly"], plain
+assert row(" 2 ")[1:3] == ["2%", "Weekly"], plain
+assert row(" 3 ")[1:3] == ["25%", "Monthly"], plain
 # The weekly window resets at 2100-01-01T00:00:00Z; the countdown must be
 # computed, never pinned, or the assertion drifts with the calendar.
-reset = datetime(2100, 1, 1, tzinfo=timezone.utc)
-hours = int((reset - datetime.now(timezone.utc)).total_seconds() // 3600)
-reset_prefix = f"reset {hours // 24}d:"
-tooltip = payload["tooltip"]
-for expected in (
-    "OpenCode Go",
-    "3-account weekly: 2%",
-    "3-account 5 Hour: 3.6667%",
-    "3-account monthly: 41.3333%",
-    "Hottest account: 99%",
-    "snapshot 1: 99% · Monthly limit · 5h 1% · 7d 0% · monthly 99% · fetched: 2100-01-01T00:00:00Z",
-    "snapshot 2: 2% · Weekly limit · 5h 0% · 7d 2% · monthly 0%",
-    "snapshot 3: 25% · Monthly limit · 5h 10% · 7d 4% · monthly 25%",
-    reset_prefix,
-    "snapshot coverage: 3 reports · 0 without usage · 0 disabled",
-):
-    assert expected in tooltip, (expected, tooltip)
+days = int((datetime(2100, 1, 1, tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() // 86400)
+assert f"in {days}d" in " ".join(row("Weekly ")), plain
 for forbidden in ("synth-ocg", "opencode.ai/zen/go"):
     assert forbidden not in sys.argv[1], forbidden
 PY
@@ -263,6 +266,7 @@ partial_waybar="$("$BIN" waybar 2>&1)"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 3 ]] || fail "cache consumers invoked OMP for partial data"
 python3 - "$AI_USAGE_CACHE" "$partial_waybar" <<'PY'
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as fh:
@@ -280,8 +284,13 @@ assert [row.get("used_pct") for row in rec["account_usage"]] == [99, None, 25], 
 assert rec["account_usage"][1] == {"fetched_at": "2100-01-01T00:01:00Z"}, rec["account_usage"][1]
 waybar = json.loads(sys.argv[2])
 assert "partial_usage" in waybar["tooltip"], waybar
-assert "Hottest account: —" in waybar["tooltip"], waybar
-assert "snapshot 2: — · fetched: 2100-01-01T00:01:00Z" in waybar["tooltip"], waybar
+plain = re.sub(r"<[^>]+>", "", waybar["tooltip"])
+lines = plain.splitlines()
+# An unanswered window reads as a dash, never an invented zero.
+assert next(line for line in lines if line.startswith("Hottest account ")).split()[2:] == ["—", "—"], plain
+assert next(line for line in lines if line.startswith(" 2 ")).split() == ["2", "—", "—"], plain
+weekly = next(line for line in lines if "weekly" in line.lower())
+assert "2-account" in weekly, plain
 PY
 
 "$BIN" validate || fail "cache with OpenCode Go rows failed validation"

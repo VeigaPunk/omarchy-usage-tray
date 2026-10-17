@@ -5,7 +5,7 @@ accounts), OpenCode Go, Charm Hyper, Z.ai, and Google usage. Left-click or
 scroll to cycle providers; right-click cycles identities for the selected
 provider when supported.
 
-Current release: **1.7.0** (`ai-usage --version`).
+Current release: **1.7.1** (`ai-usage --version`).
 
 Every usage meter comes from `omp usage --provider <id> --json` — the native
 CLIs (codex, grok, cursor-agent, devin) are not required, because OMP meters
@@ -98,9 +98,9 @@ rolling 5-hour, and the shared third-party pools (Claude & GPT) on the same
 two windows. OMP reports each shared pool once per backing model under one
 `sharedGroup`, so the chip dedupes them and keeps the highest reading — one
 quota, never a sum. The compact bars show the Gemini weekly average and the
-hottest account; the tooltip lists all four pools per snapshot. `g` is the
-logo; right-click is a no-op because the credential lives in OMP's auth store
-with no local file to flip.
+hottest account; the tooltip shows the four pool averages and each account's
+binding pool. `g` is the logo; right-click is a no-op because the credential
+lives in OMP's auth store with no local file to flip.
 
 ## Install
 
@@ -154,22 +154,28 @@ Waybar themselves. The 60s interval is only a safety net, so the chart can
 never sit on a stale provider.
 
 Multi-account providers report one snapshot per stored credential. The chip
-shows an `N-account` average followed by the hottest account, and the tooltip
-lists every snapshot with its binding window, fetch age, and reset. OMP exposes
+shows an average followed by the hottest account. Hover for aligned visual
+meters, whole percentages, and short reset countdowns (`2d 14h`, `45m`).
+Multi-account rows focus on each snapshot's binding window; fetch ages appear
+only when stale, and missing/disabled credentials remain explicit. The account
+count appears once in the header unless a window has fewer reports. OMP exposes
 no stable account identity, so rows stay anonymous by design.
 
 OpenCode Go meters three windows per key: rolling 5-hour, weekly, and monthly.
 Monthly anchors on the subscription anniversary, so a key can sit at its
 monthly cap while the weekly window still reads empty — the hottest-account
-slot tracks whichever window is closest to its limit, and the chip turns red
-past 95%. `O` is the logo; right-click there is a no-op because OMP already
-rotates those keys per request.
+slot tracks whichever window is closest to its limit. A red underline warns
+at 95% without dimming the label. New OMP keys are included automatically on
+the next probe; run `ai-usage probe opencode-go` to refresh immediately.
+`O` is the logo; right-click there is a no-op because OMP already rotates
+those keys per request.
 
 Token Plan's compact bars show the average utilization across OMP-metered
-credentials and the hottest reported snapshot, followed by remaining/total
-credits. `T @<slot>` is the active execution route, not the owner of either
-meter. See [Token Plan add-on credits](#token-plan-add-on-credits) for the
-credit model.
+credentials and the hottest reported snapshot, followed by a rounded remaining
+balance (`24k left`). The tooltip retains the remaining/total credits and the
+per-account breakdown. `T @<slot>` is the active execution route, not the owner
+of either meter. See [Token Plan add-on credits](#token-plan-add-on-credits) for
+the credit model.
 
 Token Plan right-click runs `token-plan-swap toggle`. That helper cycles the
 slots in `~/.config/alibaba-token-plan/slots` and rewrites

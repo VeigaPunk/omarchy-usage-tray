@@ -174,27 +174,32 @@ waybar_json="$("$BIN" waybar 2>&1)"
 
 python3 - "$waybar_json" <<'PY'
 import json
+import re
 import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 
 payload = json.loads(sys.argv[1])
-assert payload["alt"] == "zai", payload
-assert payload["text"].startswith("Z "), payload["text"]
-# weekly 15% fills one cell (fill+track), hottest 90% fills five (fill+track).
-assert payload["text"].count("bgcolor=") == 4, payload["text"]
-classes = payload["class"].split()
+classes = payload["class"]
 assert "ok" in classes and "warn" in classes, classes
 tooltip = payload["tooltip"]
-for expected in (
-    "Z.ai",
-    "2-account weekly: 15%",
-    "2-account 5 Hour: 70%",
-    "Hottest account: 90%",
-    "snapshot 1: 50% · 5 Hour limit · 5h 50% · 7d 10% · fetched: 2100-01-01T00:00:00Z",
-    "snapshot 2: 90% · 5 Hour limit · 5h 90% · 7d 20% · fetched: 2100-01-01T00:01:00Z",
-    "reset 26761d:",
-    "snapshot coverage: 2 reports · 0 without usage · 0 disabled",
-):
-    assert expected in tooltip, (expected, tooltip)
+ET.fromstring(f"<t>{tooltip}</t>")
+plain = re.sub(r"<[^>]+>", "", tooltip).replace("━", "")
+
+
+def row(prefix):
+    return next(line.split() for line in plain.splitlines() if line.startswith(prefix))
+
+
+assert "15%" in row("Weekly "), plain
+assert "70%" in row("5 Hour "), plain
+assert "90%" in row("Hottest account "), plain
+# Per-account rows: percent plus the window that binds that account.
+assert row(" 1 ")[1:4] == ["50%", "5", "Hour"], plain
+assert row(" 2 ")[1:4] == ["90%", "5", "Hour"], plain
+# The weekly countdown is computed against now, never pinned to a calendar.
+days = int((datetime(2100, 1, 8, tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() // 86400)
+assert f"in {days}d" in " ".join(row("Weekly ")), plain
 for forbidden in ("synth-zai", "api.z.ai"):
     assert forbidden not in sys.argv[1], forbidden
 PY
@@ -230,6 +235,7 @@ partial_waybar="$("$BIN" waybar 2>&1)"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 3 ]] || fail "cache consumers invoked OMP for partial data"
 python3 - "$AI_USAGE_CACHE" "$partial_waybar" <<'PY'
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as fh:
@@ -246,8 +252,11 @@ assert [row.get("used_pct") for row in rec["account_usage"]] == [50, None], rec[
 assert rec["account_usage"][1] == {"fetched_at": "2100-01-01T00:01:00Z"}, rec["account_usage"][1]
 waybar = json.loads(sys.argv[2])
 assert "partial_usage" in waybar["tooltip"], waybar
-assert "Hottest account: —" in waybar["tooltip"], waybar
-assert "snapshot 2: — · fetched: 2100-01-01T00:01:00Z" in waybar["tooltip"], waybar
+plain = re.sub(r"<[^>]+>", "", waybar["tooltip"])
+lines = plain.splitlines()
+# An unanswered window reads as a dash, never an invented zero.
+assert next(line for line in lines if line.startswith("Hottest account ")).split()[2:] == ["—", "—"], plain
+assert next(line for line in lines if line.startswith(" 2 ")).split() == ["2", "—", "—"], plain
 PY
 
 "$BIN" validate || fail "cache with Z.ai rows failed validation"

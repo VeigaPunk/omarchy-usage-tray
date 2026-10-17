@@ -289,34 +289,31 @@ waybar_json="$("$BIN" waybar 2>&1)"
 
 python3 - "$waybar_json" <<'PY'
 import json
+import re
 import sys
+import xml.etree.ElementTree as ET
 
 raw = sys.argv[1]
 payload = json.loads(raw)
 assert payload["alt"] == "token-plan", payload
-assert "ok" in payload["class"].split(), payload
-assert payload["text"].startswith("T @gmail "), payload["text"]
-assert payload["text"].count("bgcolor=") >= 2, payload["text"]
-assert "148.4k/155.0k" in payload["text"], payload["text"]
+assert "ok" in payload["class"], payload
+assert payload["text"].endswith(" 148k left"), payload["text"]
 tooltip = payload["tooltip"]
-for expected in (
-    "Token Plan",
-    "active route: gmail · routing only; not mapped to a snapshot",
-    "3-account credits: 4.2788%",
-    "credits: 148.4k remaining of 155.0k · 6.63k used",
-    "Hottest account: 7.6923% · snapshot 3",
-    "snapshot 1: 0%",
-    "snapshot 2: 3.627%",
-    "snapshot 3: 7.6923%",
-    "45.0k/45.0k credits",
-    "43.4k/45.0k credits",
-    "60.0k/65.0k credits",
-    "2100-01-01T00:00:00Z",
-    "2100-01-01T00:01:00Z",
-    "2100-01-01T00:02:00Z",
-    "snapshot coverage: 3 reports · 0 without usage · 0 disabled",
-):
-    assert expected in tooltip, (expected, tooltip)
+ET.fromstring(f"<t>{tooltip}</t>")
+plain = re.sub(r"<[^>]+>", "", tooltip).replace("━", "")
+
+
+def row(prefix):
+    return next(line.split() for line in plain.splitlines() if line.startswith(prefix))
+
+
+assert "4%" in row("Credits "), plain
+assert "8%" in row("Hottest account "), plain
+assert {"148k", "155k"} <= set(plain.split()), plain
+# Per-account rows: percent and remaining/total credits for that account.
+assert row(" 1 ")[1:5] == ["0%", "45k", "of", "45k"], plain
+assert row(" 2 ")[1:5] == ["4%", "43k", "of", "45k"], plain
+assert row(" 3 ")[1:5] == ["8%", "60k", "of", "65k"], plain
 for forbidden in (
     "account 1",
     "gmail: 3.627%",
@@ -366,6 +363,7 @@ partial_tui="$("$BIN" tui 2>&1)"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 3 ]] || fail "cache consumers invoked OMP for partial data"
 python3 - "$AI_USAGE_CACHE" "$partial_waybar" "$partial_tui" <<'PY'
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as fh:
@@ -380,7 +378,9 @@ assert rec["windows"] == [
 assert [row.get("used_pct") for row in rec["account_usage"]] == [0, None, 30], rec
 waybar = json.loads(sys.argv[2])
 assert "partial_usage" in waybar["tooltip"], waybar
-assert "Hottest account: —" in waybar["tooltip"], waybar
+plain = re.sub(r"<[^>]+>", "", waybar["tooltip"])
+hottest = next(line for line in plain.splitlines() if line.startswith("Hottest account "))
+assert hottest.split()[2:] == ["—", "—"], plain
 assert "ok  partial_usage" in sys.argv[3], sys.argv[3]
 PY
 
