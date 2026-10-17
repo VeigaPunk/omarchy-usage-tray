@@ -104,11 +104,32 @@ with no local file to flip.
 
 ## Install
 
+Quattro bar:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/VeigaPunk/omarchy-usage-tray/main/install.sh | bash
+omarchy plugin add https://github.com/VeigaPunk/omarchy-usage-tray.git --enable
 ```
 
-Re-run the same line to update.
+Waybar on this machine. The installer edits `~/.config/waybar/` only after you run it, and it backs up the files first. It does not write under `~/.local/share/omarchy`.
+
+```bash
+git clone https://github.com/VeigaPunk/omarchy-usage-tray.git
+cd omarchy-usage-tray
+./install.sh
+```
+
+Re-run `./install.sh` from the checkout to update.
+
+Dependencies: Python 3, `omp` on `PATH` for the meters, and either the Omarchy Quattro shell or Waybar. The optional user timer uses systemd. No sudo.
+
+## Remove
+
+```bash
+./uninstall.sh
+omarchy plugin remove io.github.veigapunk.usage-tray
+```
+
+`./uninstall.sh` stops `ai-usage.timer`, deletes the user units, and drops the `custom/ai-usage` Waybar module and Hyprland rule. It leaves `~/.config/ai-usage/env` alone. Delete the `#custom-ai-usage` rules in `~/.config/waybar/style.css` if you still want them gone.
 
 ## What it does
 
