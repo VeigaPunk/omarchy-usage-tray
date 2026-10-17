@@ -14,6 +14,8 @@ metered providers (status ok, a numeric window, or a credit balance — see
 `_provider_usable`): a provider that cannot show a real number drops out of
 the cycle instead of rendering an invented zero.
 
+**Wiki:** [Devin wiki](https://app.devin.ai/org/veigapunk/wiki/VeigaPunk/omarchy-usage-tray?branch=main)
+
 ## Providers
 
 Every provider below is metered on every probe, from `omp usage --json`, and
