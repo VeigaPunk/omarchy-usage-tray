@@ -17,6 +17,11 @@ BarWidget {
 
   property string chip: "usage"
 
+  // This plugin's own singleton service (Service.qml) when a trusted bar hosts
+  // the widget; a replacement bar injects a service-less facade, so this is
+  // null there and the fallback timer below stays the only refresh trigger.
+  readonly property var usageService: root.bar?.shell?.serviceFor?.(root.moduleName) ?? null
+
   readonly property bool opened: false
   function open() { root.run(["cycle", "next"]) }
   function close() {}
@@ -59,6 +64,16 @@ BarWidget {
     running: true
     repeat: true
     onTriggered: root.refresh()
+  }
+
+  // Re-render as soon as the service's 5-minute probe lands; the 60 s timer
+  // stays the fallback for bars that hand widgets no service facade.
+  Connections {
+    target: root.usageService
+    ignoreUnknownSignals: true
+    function onProbed() {
+      root.refresh()
+    }
   }
 
   WidgetButton {

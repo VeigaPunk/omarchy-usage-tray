@@ -1,11 +1,11 @@
 # omarchy-usage-tray
 
 Waybar chip for Omarchy: Codex, Token Plan, Grok, Kimi, Cursor, Devin (both
-accounts), OpenCode Go, Charm Hyper, Z.ai, and Google usage. Left-click or
-scroll to cycle providers; right-click cycles identities for the selected
-provider when supported.
+accounts), OpenCode Go, Charm Hyper, Z.ai, Google, and Anthropic usage.
+Left-click or scroll to cycle providers; right-click cycles identities for the
+selected provider when supported.
 
-Current release: **1.7.1** (`ai-usage --version`).
+Current release: **1.8.0** (`ai-usage --version`).
 
 Every usage meter comes from `omp usage --provider <id> --json` — the native
 CLIs (codex, grok, cursor-agent, devin) are not required, because OMP meters
@@ -34,6 +34,7 @@ the chip renders whichever one is selected.
 | `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
 | `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
 | `g` | Google | Gemini weekly + 5-hour, shared Claude & GPT pools, hottest account | `omp usage --provider google-antigravity --json` |
+| `A` | Anthropic | Weekly 7-day, 5-hour, per-model weekly caps (e.g. Fable), hottest account | `omp usage --provider anthropic --json` |
 
 Missing data is never invented: a window the provider did not answer renders as
 `—`, and a provider that cannot be reached keeps its last good meters and shows
@@ -102,6 +103,19 @@ hottest account; the tooltip shows the four pool averages and each account's
 binding pool. `g` is the logo; right-click is a no-op because the credential
 lives in OMP's auth store with no local file to flip.
 
+### Anthropic model caps
+
+The Claude subscription carries two shared, account-wide walls — a rolling
+5-hour window and the weekly window — plus one weekly cap per model family
+(Fable, Opus, Sonnet, …). A cap is not a slice of the wall: it reads and blocks
+only its own model family, but an exhausted cap still counts toward the
+hottest-account slot, so the chip warns while the shared walls read idle. The
+compact bars show the shared weekly average and the hottest account; the
+tooltip adds the shared 5-hour average and one row per model cap. Pay-as-you-go
+Extra Usage is reported in dollars, not a rate window, so it is not metered.
+`A` is the logo; right-click is a no-op because the credential lives in OMP's
+auth store with no local file to flip.
+
 ## Install
 
 Quattro bar:
@@ -109,6 +123,11 @@ Quattro bar:
 ```bash
 omarchy plugin add https://github.com/VeigaPunk/omarchy-usage-tray.git --enable
 ```
+
+The plugin refreshes its own meters: its service runs `ai-usage refresh` when
+the shell loads it and every 5 minutes after, writing the cache the chip
+renders, so a Quattro install needs no installer and no systemd timer. `omp`
+must be on `PATH` and signed in to the providers you want metered.
 
 Waybar on this machine. The installer edits `~/.config/waybar/` only after you run it, and it backs up the files first. It does not write under `~/.local/share/omarchy`.
 
@@ -120,7 +139,7 @@ cd omarchy-usage-tray
 
 Re-run `./install.sh` from the checkout to update.
 
-Dependencies: Python 3, `omp` on `PATH` for the meters, and either the Omarchy Quattro shell or Waybar. The optional user timer uses systemd. No sudo.
+Dependencies: Python 3, `omp` on `PATH` for the meters, and either the Omarchy Quattro shell or Waybar. The Waybar install's refresh timer is a systemd user unit; Quattro needs none. No sudo.
 
 ## Remove
 
@@ -129,7 +148,7 @@ Dependencies: Python 3, `omp` on `PATH` for the meters, and either the Omarchy Q
 omarchy plugin remove io.github.veigapunk.usage-tray
 ```
 
-`./uninstall.sh` stops `ai-usage.timer`, deletes the user units, and drops the `custom/ai-usage` Waybar module and Hyprland rule. It leaves `~/.config/ai-usage/env` alone. Delete the `#custom-ai-usage` rules in `~/.config/waybar/style.css` if you still want them gone.
+`./uninstall.sh` stops `ai-usage.timer`, deletes the user units, and drops the `custom/ai-usage` Waybar module and Hyprland rule. It leaves `~/.config/ai-usage/env` alone. Delete the `#custom-ai-usage` rules in `~/.config/waybar/style.css` if you still want them gone. `omarchy plugin remove` disables the Quattro widget and its refresh service before deleting the checkout; the cache in `~/.cache/ai-usage/` stays until you delete it.
 
 ## What it does
 
@@ -187,9 +206,10 @@ Kimi runs both OAuth accounts through `omp auth-gateway` (127.0.0.1:8791): the
 gateway round-robins new sessions across the stored `kimi-code` credentials and
 retries on the other account after a usage-limit block, so the chip meters the
 fleet and right-click just reports the balanced state. Cursor / Codex / Grok /
-OpenCode Go / Charm Hyper / Z.ai / Google stay no-ops — OpenCode Go keys rotate
-inside OMP, and Charm Hyper's, Cursor's, and Google's credentials live in OMP's
-auth store, so none has a live file for the chip to flip.
+OpenCode Go / Charm Hyper / Z.ai / Google / Anthropic stay no-ops — OpenCode Go
+keys rotate inside OMP, and Charm Hyper's, Cursor's, Google's, and Anthropic's
+credentials live in OMP's auth store, so none has a live file for the chip to
+flip.
 
 ## Configuration
 
@@ -228,7 +248,7 @@ zai
 
 `AI_USAGE_PROVIDERS_FILE` overrides that path (the tests point it at a temp
 file). With neither source set — or with a roster that names no known provider —
-all 11 providers stay active, so the default behaviour is unchanged. An unknown
+all 12 providers stay active, so the default behaviour is unchanged. An unknown
 id prints one warning line to stderr (`ai-usage: unknown provider in roster:
 <id>`, once per run) and is skipped; it never fails a probe.
 

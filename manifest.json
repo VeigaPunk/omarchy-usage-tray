@@ -2,12 +2,13 @@
   "schemaVersion": 1,
   "id": "io.github.veigapunk.usage-tray",
   "name": "Usage Tray",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "author": "VeigaPunk",
   "license": "MIT",
-  "description": "Bar chip for Codex, Grok, Kimi, Cursor, Devin, OpenCode Go, and the other OMP usage meters.",
-  "kinds": ["bar-widget"],
+  "description": "Bar chip for Codex, Anthropic, Grok, Kimi, Cursor, Devin, OpenCode Go, and the other OMP usage meters. The plugin refreshes its meters itself from omp every 5 minutes, so the chip stays current without any extra system timer.",
+  "kinds": ["service", "bar-widget"],
   "entryPoints": {
+    "service": "Service.qml",
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {

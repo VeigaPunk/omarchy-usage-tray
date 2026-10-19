@@ -20,7 +20,7 @@ from pathlib import Path
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
 # User-facing release.
-TOOL_VERSION = "1.7.1"
+TOOL_VERSION = "1.8.0"
 METER_WIDTH = 6
 TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
@@ -41,6 +41,7 @@ PROVIDERS = (
     ("charm-hyper", "Charm Hyper", "H"),
     ("zai", "Z.ai", "Z"),
     ("google", "Google", "g"),
+    ("anthropic", "Anthropic", "A"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -1611,6 +1612,219 @@ def probe_google() -> dict:
     return rec
 
 
+# --- Anthropic ----------------------------------------------------------------
+
+# OMP meters the Claude subscription as `anthropic`: shared account-wide walls
+# `anthropic:5h` / `anthropic:7d` (`scope.shared`), per-model weekly caps
+# `anthropic:7d:<tier>` (`scope.tier`, e.g. fable/opus/sonnet/mythos — a cap
+# blocks only its model family, never the whole account), and `anthropic:extra`
+# pay-as-you-go spend in USD, which is not a rate window and is not metered.
+# Caps still join the hottest-account slot, so an exhausted model cap warns
+# while the shared walls read idle.
+
+# Wall limit id -> (kind, short label, long label); caps are recognized by the
+# `anthropic:7d:` prefix and emit one `tier-<slug>` window each.
+ANTHROPIC_WALL_KINDS = {
+    "anthropic:7d": ("weekly", "7d", "Weekly limit"),
+    "anthropic:5h": ("session", "5h", "5 Hour limit"),
+}
+ANTHROPIC_TIER_PREFIX = "anthropic:7d:"
+
+
+def _anthropic_tier(limit: dict, suffix: str) -> tuple[str, str, str] | None:
+    """(kind, short label, long label) for one model-cap limit, or None.
+
+    The slug is the scope tier when OMP sets one, else the id suffix, and must
+    be a lowercase id to be recognized; the display name is the trailing
+    parenthetical of the limit label (`Claude 7 Day (Fable)` -> `Fable`).
+    """
+    scope = limit.get("scope") if isinstance(limit.get("scope"), dict) else {}
+    tier = scope.get("tier")
+    slug = tier if isinstance(tier, str) and tier else suffix
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug):
+        return None
+    label = limit.get("label")
+    match = re.search(r"\(([^()]*)\)\s*$", label) if isinstance(label, str) else None
+    name = match.group(1).strip() if match and match.group(1).strip() else slug.capitalize()
+    return f"tier-{slug}", f"{name} 7d", f"{name} weekly"
+
+
+def _anthropic_report(report: dict) -> dict:
+    """One credential snapshot, in percent, shaped like the Google row."""
+    row: dict = {}
+    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
+    if fetched_at:
+        row["fetched_at"] = fetched_at
+    found: dict[str, tuple[float, str | None, str, str]] = {}
+    tier_order: list[str] = []
+    limits = report.get("limits") if isinstance(report.get("limits"), list) else []
+    for limit in limits:
+        if not isinstance(limit, dict):
+            continue
+        lid = limit.get("id")
+        if not isinstance(lid, str):
+            continue
+        if lid in ANTHROPIC_WALL_KINDS:
+            kind, short, kind_label = ANTHROPIC_WALL_KINDS[lid]
+        elif lid.startswith(ANTHROPIC_TIER_PREFIX):
+            tier = _anthropic_tier(limit, lid[len(ANTHROPIC_TIER_PREFIX):])
+            if tier is None:
+                continue
+            kind, short, kind_label = tier
+            if kind not in tier_order:
+                tier_order.append(kind)
+        else:
+            continue
+        amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
+        frac = _opencode_go_fraction(amount.get("usedFraction"))
+        if frac is None:
+            continue
+        win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+        # A repeated id is the same meter read twice; keep the highest reading.
+        prev = found.get(kind)
+        if prev is None or frac > prev[0]:
+            found[kind] = (
+                frac,
+                iso_from_unix(win.get("resetsAt") or limit.get("resetsAt")),
+                short,
+                kind_label,
+            )
+    measured: dict[str, dict] = {}
+    for kind in ["weekly", "session", *tier_order]:
+        if kind not in found:
+            continue
+        frac, resets_at, short, kind_label = found[kind]
+        entry: dict = {"label": short, "kind_label": kind_label, "used_pct": as_pct(frac * 100.0)}
+        if resets_at:
+            entry["resets_at"] = resets_at
+        measured[kind] = entry
+    if not measured:
+        return row
+    binding = max(measured.items(), key=lambda item: item[1].get("used_pct") or 0.0)[1]
+    row["windows"] = measured
+    row["label"] = binding["kind_label"]
+    row["used_pct"] = binding["used_pct"]
+    if binding.get("resets_at"):
+        row["resets_at"] = binding["resets_at"]
+    return row
+
+
+def _empty_anthropic(reason: str) -> dict:
+    rec = empty_provider("anthropic", "unknown", reason)
+    rec["windows"] = [
+        window("weekly", "Weekly", None),
+        window("session", "5 Hour", None),
+        window("special", "Hottest account", None),
+    ]
+    rec["account_usage"] = []
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
+
+
+def probe_anthropic() -> dict:
+    payload, failure = omp_usage_payload("anthropic")
+    if payload is None:
+        return _empty_anthropic(failure or "bad_payload")
+
+    raw_reports = payload["reports"]
+    reports = [
+        report
+        for report in raw_reports
+        if isinstance(report, dict) and report.get("provider") == "anthropic"
+    ]
+    rows = [_anthropic_report(report) for report in reports]
+    accounts_without_usage = payload.get("accountsWithoutUsage")
+    disabled_credentials = payload.get("disabledCredentials")
+    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
+    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
+    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
+
+    weekly, weekly_accounts, weekly_reset = _omp_window_average(rows, "weekly")
+    session, session_accounts, session_reset = _omp_window_average(rows, "session")
+    # Caps in the order accounts first report them, following OMP's own
+    # ranking rather than a pinned tier list.
+    tier_names: dict[str, str] = {}
+    for row in rows:
+        row_windows = row.get("windows")
+        if not isinstance(row_windows, dict):
+            continue
+        for kind, entry in row_windows.items():
+            if kind in tier_names or not kind.startswith("tier-"):
+                continue
+            kind_label = str(entry.get("kind_label") or "") if isinstance(entry, dict) else ""
+            tier_names[kind] = kind_label.removesuffix(" weekly") or kind.removeprefix("tier-").capitalize()
+
+    row_pcts = [row.get("used_pct") for row in rows]
+    complete_reports = (
+        bool(rows)
+        and len(raw_reports) == len(rows)
+        and isinstance(accounts_without_usage, list)
+        and missing_count == 0
+        and all(pct is not None for pct in row_pcts)
+        and all(isinstance(row.get("fetched_at"), str) for row in rows)
+    )
+    declared_accounts = _omp_declared_accounts(payload, "anthropic")
+    under_reported = declared_accounts is not None and len(rows) != declared_accounts
+    complete_coverage = complete_reports and not under_reported
+    hottest = max(row_pcts) if complete_coverage and row_pcts else None
+    hottest_reset = None
+    if hottest is not None:
+        hottest_reset = next(
+            (row.get("resets_at") for row in rows if row.get("used_pct") == hottest and row.get("resets_at")),
+            None,
+        )
+    windows = [
+        window(
+            "weekly",
+            f"{weekly_accounts}-account weekly" if weekly_accounts else "Weekly",
+            weekly,
+            weekly_reset,
+        ),
+        window(
+            "session",
+            f"{session_accounts}-account 5 Hour" if session_accounts else "5 Hour",
+            session,
+            session_reset,
+        ),
+    ]
+    tier_averages = []
+    for kind, name in tier_names.items():
+        avg, tier_accounts, tier_reset = _omp_window_average(rows, kind)
+        tier_averages.append(avg)
+        windows.append(
+            window(
+                kind,
+                f"{tier_accounts}-account {name} weekly" if tier_accounts else f"{name} weekly",
+                avg,
+                tier_reset,
+            )
+        )
+    windows.append(window("special", "Hottest account", hottest, hottest_reset))
+    averages = [weekly, session, *tier_averages]
+    status = "ok" if any(pct is not None for pct in averages) else "unknown"
+    rec = {
+        "id": "anthropic",
+        "name": "Anthropic",
+        "logo": "A",
+        "status": status,
+        "windows": windows,
+        "account_usage": rows,
+        "snapshot": {
+            "reports": len(rows),
+            "accounts_without_usage": missing_count,
+            "disabled_credentials": disabled_count,
+        },
+    }
+    timestamps = [row.get("fetched_at") for row in rows]
+    if complete_reports and all(isinstance(stamp, str) for stamp in timestamps):
+        rec["measured_at"] = min(timestamps)
+    if status != "ok":
+        rec["reason"] = "no_used_pct"
+    elif not complete_coverage or disabled_count > 0 or not lists_valid:
+        rec["reason"] = "partial_usage"
+    return rec
+
+
 # --- Grok --------------------------------------------------------------------
 
 
@@ -2013,6 +2227,7 @@ PROBERS = {
     "charm-hyper": probe_charm_hyper,
     "zai": probe_zai,
     "google": probe_google,
+    "anthropic": probe_anthropic,
 }
 
 
