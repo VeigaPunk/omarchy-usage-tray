@@ -1,11 +1,12 @@
 # omarchy-usage-tray
 
 Waybar chip for Omarchy: Codex, Token Plan, Grok, Kimi, Cursor, Devin (both
-accounts), OpenCode Go, Charm Hyper, Z.ai, Google, and Anthropic usage.
+accounts), OpenCode Go, Charm Hyper, Z.ai, Google, Anthropic, and Command Code
+usage.
 Left-click or scroll to cycle providers; right-click cycles identities for the
 selected provider when supported.
 
-Current release: **1.8.0** (`ai-usage --version`).
+Current release: **1.9.0** (`ai-usage --version`).
 
 Every usage meter comes from `omp usage --provider <id> --json` — the native
 CLIs (codex, grok, cursor-agent, devin) are not required, because OMP meters
@@ -35,6 +36,7 @@ the chip renders whichever one is selected.
 | `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
 | `g` | Google | Gemini weekly + 5-hour, shared Claude & GPT pools, hottest account | `omp usage --provider google-antigravity --json` |
 | `A` | Anthropic | Weekly 7-day, 5-hour, per-model weekly caps (e.g. Fable), hottest account | `omp usage --provider anthropic --json` |
+| `⌘` | Command Code | Weekly + 5-hour credit windows, hottest account, credit balance across accounts | `omp usage --provider commandcode --json` |
 
 Missing data is never invented: a window the provider did not answer renders as
 `—`, and a provider that cannot be reached keeps its last good meters and shows
@@ -115,6 +117,24 @@ tooltip adds the shared 5-hour average and one row per model cap. Pay-as-you-go
 Extra Usage is reported in dollars, not a rate window, so it is not metered.
 `A` is the logo; right-click is a no-op because the credential lives in OMP's
 auth store with no local file to flip.
+
+### Command Code credits
+
+Command Code meters each API-key credential with a rolling 5-hour and a weekly
+credit window, reported as a share of the plan cap (GOAT: 14 and 35 credits for
+the 5-hour and weekly windows), plus the credit balance — monthly + purchased +
+free credits, a counter with no ceiling and no reported reset time. The chip
+renders the `⌘` logo, a weekly-average bar, a hottest-account bar, and the
+summed balance as a counter (`⌘ ▭ ▭ 140cr`). The balance is summed once per
+credit pool: credentials in the same org share one pool and count once. If any
+credential answers no balance the total is withheld instead of understated —
+the chip drops the counter, the tooltip shows `—`, and the reason reads
+`partial_usage`. An account at zero balance turns the chip red even while its
+windows read idle, because it is blocked. The tooltip shows the weekly and
+5-hour averages, the hottest account, a `Credit balance … credits left` line,
+and one numbered row per account with its binding window and balance.
+Pay-as-you-go accounts report only the balance. `⌘` is the logo; right-click
+is a no-op because the credentials live in OMP's auth store.
 
 ## Install
 
@@ -206,10 +226,10 @@ Kimi runs both OAuth accounts through `omp auth-gateway` (127.0.0.1:8791): the
 gateway round-robins new sessions across the stored `kimi-code` credentials and
 retries on the other account after a usage-limit block, so the chip meters the
 fleet and right-click just reports the balanced state. Cursor / Codex / Grok /
-OpenCode Go / Charm Hyper / Z.ai / Google / Anthropic stay no-ops — OpenCode Go
-keys rotate inside OMP, and Charm Hyper's, Cursor's, Google's, and Anthropic's
-credentials live in OMP's auth store, so none has a live file for the chip to
-flip.
+OpenCode Go / Charm Hyper / Z.ai / Google / Anthropic / Command Code stay
+no-ops — OpenCode Go keys rotate inside OMP, and Charm Hyper's, Cursor's,
+Google's, Anthropic's, and Command Code's credentials live in OMP's auth
+store, so none has a live file for the chip to flip.
 
 ## Configuration
 
@@ -248,7 +268,7 @@ zai
 
 `AI_USAGE_PROVIDERS_FILE` overrides that path (the tests point it at a temp
 file). With neither source set — or with a roster that names no known provider —
-all 12 providers stay active, so the default behaviour is unchanged. An unknown
+all 13 providers stay active, so the default behaviour is unchanged. An unknown
 id prints one warning line to stderr (`ai-usage: unknown provider in roster:
 <id>`, once per run) and is skipped; it never fails a probe.
 

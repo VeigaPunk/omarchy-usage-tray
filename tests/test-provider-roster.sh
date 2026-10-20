@@ -69,7 +69,7 @@ names = {
     "kimi": ("Kimi", "K"), "cursor": ("Cursor", "R"), "devin": ("Devin", "D"),
     "devin2": ("Devin 2", "d"), "opencode-go": ("OpenCode Go", "O"),
     "charm-hyper": ("Charm Hyper", "H"), "zai": ("Z.ai", "Z"), "google": ("Google", "g"),
-    "anthropic": ("Anthropic", "A"),
+    "anthropic": ("Anthropic", "A"), "commandcode": ("Command Code", "⌘"),
 }
 providers = {}
 for step, spec in enumerate(specs, start=1):
@@ -245,15 +245,15 @@ if "$BIN" probe bogus-model >/dev/null 2>&1; then
   fail "probe accepted an unknown provider id"
 fi
 
-# No roster probes all 12 providers, as before.
+# No roster probes all 13 providers, as before.
 unset AI_USAGE_PROVIDERS
 rm -f "$AI_USAGE_CACHE"
 : >"$AI_USAGE_OMP_LOG"
 "$BIN" probe >/dev/null
-[[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 12 ]] ||
-  fail "no-roster probe ran $(wc -l <"$AI_USAGE_OMP_LOG") omp calls, want 12"
-[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 12 ]] ||
-  fail "no-roster probe did not cache 12 providers"
+[[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 13 ]] ||
+  fail "no-roster probe ran $(wc -l <"$AI_USAGE_OMP_LOG") omp calls, want 13"
+[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 13 ]] ||
+  fail "no-roster probe did not cache 13 providers"
 
 # --- select stays unrestricted; chip row is roster-scoped --------------------
 

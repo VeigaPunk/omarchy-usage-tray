@@ -20,7 +20,7 @@ from pathlib import Path
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
 # User-facing release.
-TOOL_VERSION = "1.8.0"
+TOOL_VERSION = "1.9.0"
 METER_WIDTH = 6
 TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
@@ -42,6 +42,7 @@ PROVIDERS = (
     ("zai", "Z.ai", "Z"),
     ("google", "Google", "g"),
     ("anthropic", "Anthropic", "A"),
+    ("commandcode", "Command Code", "⌘"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -1825,6 +1826,234 @@ def probe_anthropic() -> dict:
     return rec
 
 
+# --- Command Code -------------------------------------------------------------
+
+# Command Code (OMP provider `commandcode`) stores one credential per API key
+# and meters two shared credit pools per credential: the rolling 5-hour quota
+# (`commandcode:5h`) and the weekly quota (`commandcode:7d`), each answered as
+# usedFraction against the GOAT-plan cap (14 and 35 credits). The fraction is
+# the meter; the absolute credit amounts are not a separate counter.
+# `commandcode:balance` is a different thing: monthly + purchased + free
+# credits, a counter with no ceiling and no reported reset, so the chip
+# carries it as a `140cr` readout. Credits are queried per org, so when
+# `scope.orgId` is present several credentials draw on one balance pool: the
+# probe sums unique pools once (at their lowest reading) instead of
+# double-counting a shared pool. A partially answered fleet withholds the
+# balance rather than understating it.
+# Pay-as-you-go accounts report only the balance, which still makes them usable.
+# Rows stay anonymous: no email, accountId, orgId, or metadata reaches the cache.
+COMMANDCODE_WINDOWS = (
+    ("commandcode:7d", "weekly", "7d", "Weekly limit"),
+    ("commandcode:5h", "session", "5h", "5 Hour limit"),
+)
+COMMANDCODE_KINDS = {wid: (kind, short, label) for wid, kind, short, label in COMMANDCODE_WINDOWS}
+COMMANDCODE_BALANCE_ID = "commandcode:balance"
+
+
+def _commandcode_balance(limit: dict) -> int | float | None:
+    """Balance reading: finite, non-bool, negatives clamped to 0.
+
+    An overdrawn account has nothing left, not a negative counter.
+    """
+    amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
+    raw = amount.get("remaining")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    number = float(raw)
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    number = max(0.0, number)
+    return int(number) if number.is_integer() else number
+
+
+def _commandcode_report(report: dict) -> dict:
+    """One credential snapshot, in percent, plus its balance reading."""
+    row: dict = {}
+    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
+    if fetched_at:
+        row["fetched_at"] = fetched_at
+    found: dict[str, tuple[float, str | None]] = {}
+    balance = None
+    limits = report.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict):
+            continue
+        lid = limit.get("id")
+        if not isinstance(lid, str):
+            continue
+        if lid == COMMANDCODE_BALANCE_ID:
+            reading = _commandcode_balance(limit)
+            # A repeated balance limit is the same counter read twice.
+            if reading is not None and (balance is None or reading < balance):
+                balance = reading
+            continue
+        if lid not in COMMANDCODE_KINDS:
+            continue
+        amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
+        frac = _opencode_go_fraction(amount.get("usedFraction"))
+        if frac is None:
+            continue
+        win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+        prev = found.get(lid)
+        # A repeated id is the same meter read twice; keep the highest reading.
+        if prev is None or frac > prev[0]:
+            found[lid] = (frac, iso_from_unix(win.get("resetsAt") or limit.get("resetsAt")))
+    measured: dict[str, dict] = {}
+    for wid, kind, short, label in COMMANDCODE_WINDOWS:
+        if wid not in found:
+            continue
+        frac, resets_at = found[wid]
+        entry: dict = {"label": short, "kind_label": label, "used_pct": as_pct(frac * 100.0)}
+        if resets_at:
+            entry["resets_at"] = resets_at
+        measured[kind] = entry
+    if measured:
+        binding = max(measured.items(), key=lambda item: item[1].get("used_pct") or 0.0)[1]
+        row["windows"] = measured
+        row["label"] = binding["kind_label"]
+        row["used_pct"] = binding["used_pct"]
+        if binding.get("resets_at"):
+            row["resets_at"] = binding["resets_at"]
+    if balance is not None:
+        row["remaining_credits"] = balance
+    return row
+
+
+def _commandcode_pool_key(report: dict, index: int) -> str:
+    """Which balance pool a credential draws from, for summation only.
+
+    The key never reaches the cache: the probe uses it to count a shared pool
+    once and then drops it.
+    """
+    limits = report.get("limits")
+    for limit in limits if isinstance(limits, list) else []:
+        if isinstance(limit, dict) and limit.get("id") == COMMANDCODE_BALANCE_ID:
+            scope = limit.get("scope") if isinstance(limit.get("scope"), dict) else {}
+            for field in ("orgId", "accountId"):
+                value = scope.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            break
+    meta = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
+    for field in ("orgId", "accountId"):
+        value = meta.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return f"report-{index}"
+
+
+def _empty_commandcode(reason: str) -> dict:
+    rec = empty_provider("commandcode", "unknown", reason)
+    rec["windows"] = [
+        window("weekly", "Weekly", None),
+        window("session", "5 Hour", None),
+        window("special", "Hottest account", None),
+        window("credits", "Credit balance", None),
+    ]
+    rec["account_usage"] = []
+    rec["credits"] = {}
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
+
+
+def probe_commandcode() -> dict:
+    payload, failure = omp_usage_payload("commandcode")
+    if payload is None:
+        return _empty_commandcode(failure or "bad_payload")
+
+    raw_reports = payload["reports"]
+    reports = [
+        report
+        for report in raw_reports
+        if isinstance(report, dict) and report.get("provider") == "commandcode"
+    ]
+    rows = [_commandcode_report(report) for report in reports]
+    accounts_without_usage = payload.get("accountsWithoutUsage")
+    disabled_credentials = payload.get("disabledCredentials")
+    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
+    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
+    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
+
+    weekly, weekly_accounts, weekly_reset = _omp_window_average(rows, "weekly")
+    session, session_accounts, session_reset = _omp_window_average(rows, "session")
+
+    row_pcts = [row.get("used_pct") for row in rows]
+    complete_reports = (
+        bool(rows)
+        and len(raw_reports) == len(rows)
+        and isinstance(accounts_without_usage, list)
+        and missing_count == 0
+        and all(pct is not None for pct in row_pcts)
+        and all(isinstance(row.get("fetched_at"), str) for row in rows)
+    )
+    declared_accounts = _omp_declared_accounts(payload, "commandcode")
+    under_reported = declared_accounts is not None and len(rows) != declared_accounts
+    complete_coverage = complete_reports and not under_reported
+    hottest = max(row_pcts) if complete_coverage and row_pcts else None
+    hottest_reset = None
+    if hottest is not None:
+        hottest_reset = next(
+            (row.get("resets_at") for row in rows if row.get("used_pct") == hottest and row.get("resets_at")),
+            None,
+        )
+
+    balances_complete = bool(rows) and all(row.get("remaining_credits") is not None for row in rows)
+    credits: dict = {}
+    if balances_complete:
+        pools: dict[str, float] = {}
+        for index, (report, row) in enumerate(zip(reports, rows)):
+            value = float(row["remaining_credits"])
+            key = _commandcode_pool_key(report, index)
+            pools[key] = value if key not in pools else min(pools[key], value)
+        total = sum(pools.values())
+        credits["remaining"] = int(total) if total.is_integer() else round(total, 2)
+
+    status = "ok" if weekly is not None or session is not None or credits else "unknown"
+    windows = [
+        window(
+            "weekly",
+            f"{weekly_accounts}-account weekly" if weekly_accounts else "Weekly",
+            weekly,
+            weekly_reset,
+        ),
+        window(
+            "session",
+            f"{session_accounts}-account 5 Hour" if session_accounts else "5 Hour",
+            session,
+            session_reset,
+        ),
+        window("special", "Hottest account", hottest, hottest_reset),
+        window(
+            "credits",
+            "Credit balance",
+            None,
+            extra={"remaining_credits": credits["remaining"]} if credits else None,
+        ),
+    ]
+    rec = {
+        "id": "commandcode",
+        "name": "Command Code",
+        "logo": "⌘",
+        "status": status,
+        "windows": windows,
+        "account_usage": rows,
+        "credits": credits,
+        "snapshot": {
+            "reports": len(rows),
+            "accounts_without_usage": missing_count,
+            "disabled_credentials": disabled_count,
+        },
+    }
+    timestamps = [row.get("fetched_at") for row in rows]
+    if complete_reports and all(isinstance(stamp, str) for stamp in timestamps):
+        rec["measured_at"] = min(timestamps)
+    if status != "ok":
+        rec["reason"] = "no_used_pct"
+    elif not complete_coverage or disabled_count > 0 or not lists_valid or not balances_complete:
+        rec["reason"] = "partial_usage"
+    return rec
+
+
 # --- Grok --------------------------------------------------------------------
 
 
@@ -2228,6 +2457,7 @@ PROBERS = {
     "zai": probe_zai,
     "google": probe_google,
     "anthropic": probe_anthropic,
+    "commandcode": probe_commandcode,
 }
 
 
@@ -2397,10 +2627,16 @@ def window_lines(windows: list[dict], accounts: int) -> list[str]:
     out = []
     for label, w in labelled:
         pct = w.get("used_pct")
+        extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
+        # A counter with no ceiling has no meter to fill: show the number.
+        balance = _token_plan_number(extra_bits.get("remaining_credits")) if pct is None else None
+        if balance is not None:
+            amount = pango_escape(_credits_label(balance))
+            out.append(f"{pango_escape(label.ljust(width))}  {amount} credits left")
+            continue
         bar = tooltip_meter(pct)
         line = f"{pango_escape(label.ljust(width))}  {bar} {pango_escape(_pct_label(pct).rjust(4))}"
         tail = []
-        extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
         if extra_bits.get("remaining_usd") is not None:
             tail.append(f"${float(extra_bits['remaining_usd']):.2f} left")
         reset = reset_phrase(w.get("resets_at"))
@@ -2432,6 +2668,9 @@ def usage_row_line(index: int, row: dict) -> str:
     total = _token_plan_number(row.get("credits_total"))
     if remaining is not None and total is not None:
         detail.append(f"{_credits_label(remaining)} of {_credits_label(total)} left")
+    balance = _token_plan_number(row.get("remaining_credits"))
+    if balance is not None:
+        detail.append(f"{_credits_label(balance)} credits left")
     if detail:
         line += "  " + pango_escape(" · ".join(detail))
     tail = []
@@ -2610,19 +2849,25 @@ def cmd_waybar() -> int:
     else:
         extra_txt = meter(extra.get("used_pct"))
     text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {extra_txt}"
+    credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
+    remaining = _token_plan_number(credits.get("remaining"))
+    if remaining is not None:
+        text += f" {pango_escape(_credits_label(remaining))}cr"
     status = rec.get("status") or "unknown"
     classes = [status]
     age = cache_age_sec(cache)
     if age is not None and age > STALE_AFTER_SEC:
         classes.append("stale")
+    rows = [item for item in rec.get("account_usage") or [] if isinstance(item, dict)]
+    # An empty balance blocks the account even while its windows read idle.
+    exhausted = any(_token_plan_number(row.get("remaining_credits")) == 0 for row in rows)
     pcts = [as_pct(weekly.get("used_pct")), as_pct(extra.get("used_pct"))]
     known = [p for p in pcts if p is not None]
-    if known and max(known) >= 95:
+    if exhausted or (known and max(known) >= 95):
         classes.append("critical")
     elif known and max(known) >= 80:
         classes.append("warn")
 
-    rows = [item for item in rec.get("account_usage") or [] if isinstance(item, dict)]
     notes = []
     if report_count(rec) > 1:
         notes.append(f"{report_count(rec)} account reports")
