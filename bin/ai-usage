@@ -2354,9 +2354,15 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
             extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
             balance = _token_plan_number(extra_bits.get("remaining_credits")) if pct is None else None
             if balance is not None:
-                # A prepaid balance has no ceiling, so the number is the meter.
+                # A balance has no ceiling, so the number is the meter. Charm
+                # Hyper is prepaid; Command Code's monthly credits refill on a
+                # billing date OMP does not report.
                 lines.append(f"{label:<28} {_credits_label(balance):>4} cr")
-                lines.append("prepaid credits · no reset window")
+                lines.append(
+                    "monthly + purchased + free credits · refill date not reported"
+                    if rec.get("id") == "commandcode"
+                    else "prepaid credits · no reset window"
+                )
                 lines.append("")
                 continue
             lines.append(f"{label:<28} {_pct_label(pct):>4}")
