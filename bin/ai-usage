@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -407,7 +409,9 @@ def pick_selected(cache: dict) -> str:
 # --- OMP-metered providers ---------------------------------------------------
 # Every usage meter comes from `omp usage --provider ... --json`; the native
 # CLIs (codex, grok, cursor-agent, devin) are not required because OMP meters
-# those same subscriptions from its auth store. PROVIDERS is scoped to
+# those same subscriptions from its auth store. Cursor alone also reads its
+# usage summary, signed with OMP's Cursor login, for the Included total that
+# `omp usage` drops. PROVIDERS is scoped to
 # providers OMP actually answers for, so no auth is ever guessed.
 
 # provider id -> (omp provider, ((limit id, kind, short label, long label, primary), ...))
@@ -421,8 +425,8 @@ OMP_FALLBACK_SPECS = {
         ("xai-oauth:product:grokchat:1w", "component", "chat", "GrokChat (Weekly)", False),
     )),
     "cursor": ("cursor", (
-        ("cursor:usd:individual-auto", "monthly", "models", "Cursor Models", True),
-        ("cursor:usd:individual-api", "monthly", "other", "Other Models", True),
+        ("cursor:usd:individual-auto", "monthly", "auto", "Auto", True),
+        ("cursor:usd:individual-api", "monthly", "api", "API", True),
     )),
     "devin": ("devin", (
         ("devin:quota:weekly", "weekly", "7d", "Weekly Quota", True),
@@ -2506,8 +2510,110 @@ def probe_kimi() -> dict:
 # --- Cursor ------------------------------------------------------------------
 
 
+CURSOR_USAGE_SUMMARY_URL = "https://cursor.com/api/usage-summary"
+
+
+def _cursor_usage_summary() -> dict | None:
+    """Cursor's dashboard usage summary, signed with OMP's Cursor login.
+
+    `omp usage` keeps the Auto and API percentages but drops the Included
+    total that Auto draws from; this is the summary cursor-agent's /usage
+    reads. The token never leaves this function, and every failure is None.
+    """
+    omp = os.environ.get("AI_USAGE_OMP_BIN") or which("omp")
+    if not omp:
+        return None
+    try:
+        proc = subprocess.run(
+            [omp, "token", "cursor"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+            env=child_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    lines = proc.stdout.strip().splitlines() if proc.returncode == 0 and proc.stdout else []
+    token = lines[-1].strip() if lines else ""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    user = str(claims.get("sub") or "").split("|")[-1] if isinstance(claims, dict) else ""
+    if not user:
+        return None
+    url = os.environ.get("AI_USAGE_CURSOR_SUMMARY_URL") or CURSOR_USAGE_SUMMARY_URL
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "Cookie": f"WorkosCursorSessionToken={user}%3A%3A{token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as resp:
+            data = json.load(resp)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _apply_cursor_summary(rec: dict, summary: dict) -> dict:
+    """Included / Auto / API meters as cursor-agent shows them.
+
+    Auto-selected requests draw on the Included total; named models draw on
+    the API pool. Auto is a share of Included, so only Included and API feed
+    Hottest.
+    """
+    usage = summary.get("individualUsage") if isinstance(summary.get("individualUsage"), dict) else {}
+    plan = usage.get("plan") if isinstance(usage.get("plan"), dict) else {}
+    total = as_pct(plan.get("totalPercentUsed"))
+    auto = as_pct(plan.get("autoPercentUsed"))
+    api = as_pct(plan.get("apiPercentUsed"))
+    if total is None:
+        return rec
+    reset = iso_from_unix(summary.get("billingCycleEnd"))
+    meters = [("Included", total), ("Auto", auto), ("API", api)]
+    hottest = max(pct for pct in (total, api) if pct is not None)
+    rec = dict(rec)
+    rec["status"] = "ok"
+    rec.pop("reason", None)
+    rec["windows"] = [
+        *(window("monthly", label, pct, reset) for label, pct in meters if pct is not None),
+        window("special", "Hottest", hottest, reset),
+    ]
+    account = next(
+        (row.get("account") for row in rec.get("account_usage") or [] if isinstance(row, dict) and row.get("account")),
+        None,
+    )
+    now = iso_now()
+    rows = []
+    for label, pct in meters:
+        if pct is None:
+            continue
+        row: dict = {"label": label, "used_pct": pct}
+        if account:
+            row["account"] = account
+        if reset:
+            row["resets_at"] = reset
+        row["fetched_at"] = now
+        rows.append(row)
+    rec["account_usage"] = rows
+    rec["measured_at"] = now
+    membership = str(summary.get("membershipType") or "").strip()
+    if membership:
+        rec["plan"] = membership.capitalize()
+    return rec
+
+
 def probe_cursor() -> dict:
     rec = _omp_fallback_rec("cursor") or empty_provider("cursor", "unauth", "no_omp_usage")
+    # One login signs the summary, so it only describes a single-account fleet.
+    if (rec.get("snapshot") or {}).get("reports", 1) <= 1:
+        summary = _cursor_usage_summary()
+        if summary is not None:
+            rec = _apply_cursor_summary(rec, summary)
     return attach_cursor_identity(rec)
 
 # --- Devin -------------------------------------------------------------------
@@ -3152,7 +3258,7 @@ def cmd_waybar() -> int:
         sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
         return 0
     mark = f"{logo} {ident_id}" if ident_id else logo
-    weekly = window_by_kind(rec, "weekly") or {}
+    weekly = window_by_kind(rec, "weekly") or window_by_kind(rec, "monthly") or {}
     extra = extra_window(rec)
     extra_bits = extra.get("extra") if isinstance(extra.get("extra"), dict) else {}
     if extra.get("kind") == "credits" and extra_bits.get("remaining_usd") is not None:

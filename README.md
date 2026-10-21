@@ -31,7 +31,7 @@ selected.
 | `T` | Token Plan | Per-account credits across the fleet, hottest account, add-on packs | `omp usage --provider alibaba-token-plan --json` |
 | `G` | Grok | Weekly credits, hottest account | `omp usage --provider xai-oauth --json` |
 | `K` | Kimi | Monthly total, 5-hour, monthly code — per OAuth account, averaged + hottest | `omp usage --provider kimi-code --json` |
-| `R` | Cursor | Monthly models + other models, hottest | `omp usage --provider cursor --json` |
+| `R` | Cursor | Monthly Included + Auto + API, hottest | `omp usage --provider cursor --json` + Cursor's usage summary (signed with `omp token cursor`) |
 | `D` | Devin | Weekly quota, hottest account | `omp usage --provider devin --json` |
 | `d` | Devin 2 | Weekly quota, second account | `omp usage --provider devin --json` (second report row) |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
