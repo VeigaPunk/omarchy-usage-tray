@@ -245,15 +245,16 @@ if "$BIN" probe bogus-model >/dev/null 2>&1; then
   fail "probe accepted an unknown provider id"
 fi
 
-# No roster probes all 13 providers, as before.
+# No roster probes all 14 providers, as before. Inception reads OMP's auth store
+# and transcripts directly, so 13 of them call omp.
 unset AI_USAGE_PROVIDERS
 rm -f "$AI_USAGE_CACHE"
 : >"$AI_USAGE_OMP_LOG"
 "$BIN" probe >/dev/null
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 13 ]] ||
   fail "no-roster probe ran $(wc -l <"$AI_USAGE_OMP_LOG") omp calls, want 13"
-[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 13 ]] ||
-  fail "no-roster probe did not cache 13 providers"
+[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 14 ]] ||
+  fail "no-roster probe did not cache 14 providers"
 
 # --- select stays unrestricted; chip row is roster-scoped --------------------
 

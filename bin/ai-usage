@@ -20,7 +20,7 @@ from pathlib import Path
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
 # User-facing release.
-TOOL_VERSION = "1.9.0"
+TOOL_VERSION = "1.10.0"
 METER_WIDTH = 6
 TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
@@ -43,6 +43,7 @@ PROVIDERS = (
     ("google", "Google", "g"),
     ("anthropic", "Anthropic", "A"),
     ("commandcode", "Command Code", "⌘"),
+    ("inception", "Inception", "I"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -2054,6 +2055,289 @@ def probe_commandcode() -> dict:
     return rec
 
 
+# --- Inception ---------------------------------------------------------------
+
+# Inception (Mercury) API keys carry a one-time 100M-token grant per account,
+# but the API answers no quota (its OpenAPI spec lists only completions and
+# models) and the console balance sits behind a session cookie. OMP stores
+# each key as an `inception` api_key credential and stamps every assistant
+# message it records with that credential's id, so the meter is a ledger: the
+# tokens OMP spent per key, summed from its session transcripts, against the
+# per-key grant. Usage made outside OMP, or in deleted transcripts, is
+# invisible to it, and the record says so.
+INCEPTION_PROVIDER = "inception"
+INCEPTION_TOKENS_PER_KEY = 100_000_000
+INCEPTION_LEDGER_VERSION = 1
+# Transcripts are read in chunks and only lines naming the provider are
+# parsed: the corpus runs to gigabytes and almost none of it is Inception.
+INCEPTION_NEEDLE = b"inception"
+INCEPTION_CHUNK = 8 << 20
+
+
+def omp_agent_dir() -> Path:
+    return Path(os.environ.get("AI_USAGE_OMP_AGENT_DIR", Path.home() / ".omp/agent"))
+
+
+def inception_ledger_path() -> Path:
+    return cache_path().parent / "inception-ledger.json"
+
+
+def _inception_tokens_per_key() -> int:
+    return _token_plan_pool("AI_USAGE_INCEPTION_TOKENS_PER_KEY", INCEPTION_TOKENS_PER_KEY)
+
+def _inception_expected_key_count(default: int) -> int:
+    """Expected live keys, allowing an explicit slot for a key outside OMP."""
+    raw = os.environ.get("AI_USAGE_INCEPTION_EXPECTED_KEYS")
+    if not raw:
+        return default
+    try:
+        expected = int(raw)
+    except ValueError:
+        return default
+    return max(default, expected) if expected > 0 else default
+
+
+def _tokens_label(value) -> str:
+    """Compact token readout: 400000000 -> 400M, 99876543 -> 99.9M, 12345 -> 12k."""
+    number = _token_plan_number(value)
+    if number is None:
+        return "—"
+    amount = float(number)
+    if amount >= 1_000_000:
+        millions = amount / 1_000_000
+        if millions >= 100:
+            return f"{round_half_up(millions)}M"
+        return f"{millions:.1f}".rstrip("0").rstrip(".") + "M"
+    return _credits_label(amount)
+
+
+def _inception_credentials() -> tuple[list[tuple[int, bool]] | None, str | None]:
+    """(credential id, disabled) per stored key, from OMP's auth store.
+
+    Only the id and the disabled cause are selected: key material never
+    leaves the database.
+    """
+    import sqlite3
+
+    db = omp_agent_dir() / "agent.db"
+    if not db.is_file():
+        return None, "no_auth_store"
+    try:
+        con = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute(
+                "SELECT id, disabled_cause FROM auth_credentials WHERE provider = ? ORDER BY id",
+                (INCEPTION_PROVIDER,),
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None, "auth_store_unreadable"
+    return [(int(cid), cause is not None) for cid, cause in rows], None
+
+
+def _inception_entry(line: bytes) -> list | None:
+    """[dedupe key, credential id or None, tokens] for one Inception reply."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    if not isinstance(msg, dict) or msg.get("role") != "assistant" or msg.get("provider") != INCEPTION_PROVIDER:
+        return None
+    usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+    tokens = _token_plan_number(usage.get("totalTokens"))
+    if tokens is None:
+        parts = [_token_plan_number(usage.get(k)) for k in ("input", "output", "cacheRead", "cacheWrite")]
+        tokens = sum(p for p in parts if p is not None)
+    if not tokens:
+        return None
+    cred = msg.get("credentialId")
+    if isinstance(cred, bool) or not isinstance(cred, int):
+        cred = None
+    # A forked or resumed session copies earlier replies into a new file;
+    # the response id counts each reply once.
+    rid = msg.get("responseId")
+    key = rid if isinstance(rid, str) and rid else f"{msg.get('timestamp')}:{cred}:{tokens}"
+    return [key, cred, int(tokens)]
+
+
+def _inception_scan(path: Path, offset: int) -> tuple[list, int]:
+    """Inception replies in complete lines from `offset`, and where they end.
+
+    A trailing partial line is left for the next probe, so an append in
+    progress is never half-counted.
+    """
+    entries: list = []
+    consumed = offset
+    carry = b""
+    with path.open("rb") as fh:
+        fh.seek(offset)
+        while True:
+            chunk = fh.read(INCEPTION_CHUNK)
+            if not chunk:
+                break
+            data = carry + chunk
+            cut = data.rfind(b"\n")
+            if cut < 0:
+                carry = data
+                continue
+            body, carry = data[: cut + 1], data[cut + 1 :]
+            consumed += len(body)
+            if INCEPTION_NEEDLE not in body:
+                continue
+            for line in body.split(b"\n"):
+                if INCEPTION_NEEDLE in line:
+                    item = _inception_entry(line)
+                    if item is not None:
+                        entries.append(item)
+    return entries, consumed
+
+
+def _inception_ledger() -> dict:
+    """Tokens per credential id across every OMP transcript, read incrementally.
+
+    `inception-ledger.json` remembers each transcript's inode, size, mtime,
+    and read offset: unchanged files are skipped, appended ones are read from
+    the offset, and replaced or truncated ones are read again.
+    """
+    root = omp_agent_dir() / "sessions"
+    ledger_path = inception_ledger_path()
+    try:
+        saved = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict) or saved.get("version") != INCEPTION_LEDGER_VERSION:
+        saved = {}
+    known = saved.get("files") if isinstance(saved.get("files"), dict) else {}
+    files: dict = {}
+    changed = len(known) == 0
+    paths = sorted(root.rglob("*.jsonl")) if root.is_dir() else []
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        name = str(path)
+        prev = known.get(name)
+        prev = prev if isinstance(prev, dict) else None
+        if prev and prev.get("ino") == st.st_ino and prev.get("mtime_ns") == st.st_mtime_ns and prev.get("size") == st.st_size:
+            files[name] = prev
+            continue
+        changed = True
+        resume = prev is not None and prev.get("ino") == st.st_ino and st.st_size >= int(prev.get("offset") or 0)
+        offset = int(prev["offset"]) if resume else 0
+        entries = list(prev.get("entries") or []) if resume else []
+        try:
+            found, offset = _inception_scan(path, offset)
+        except OSError:
+            continue
+        entries.extend(found)
+        files[name] = {"ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "offset": offset, "entries": entries}
+    if changed or len(files) != len(known):
+        atomic_write(ledger_path, json.dumps({"version": INCEPTION_LEDGER_VERSION, "files": files}, separators=(",", ":")) + "\n")
+
+    seen: set = set()
+    by_credential: dict[int, int] = {}
+    unattributed = 0
+    for item in files.values():
+        for key, cred, tokens in item.get("entries") or []:
+            if key in seen:
+                continue
+            seen.add(key)
+            if cred is None:
+                unattributed += tokens
+            else:
+                by_credential[cred] = by_credential.get(cred, 0) + tokens
+    return {"by_credential": by_credential, "unattributed": unattributed}
+
+
+def _empty_inception(status: str, reason: str) -> dict:
+    rec = empty_provider("inception", status, reason, plan="OMP ledger")
+    rec["windows"] = [window("weekly", "Fleet tokens", None), window("special", "Hottest key", None)]
+    rec["account_usage"] = []
+    rec["tokens"] = {}
+    return rec
+
+
+def probe_inception() -> dict:
+    creds, failure = _inception_credentials()
+    if creds is None:
+        return _empty_inception("unauth", failure or "no_auth_store")
+    enabled = [cid for cid, disabled in creds if not disabled]
+    if not enabled:
+        return _empty_inception("unauth", "no_credentials")
+    try:
+        ledger = _inception_ledger()
+    except OSError:
+        return _empty_inception("unknown", "ledger_unreadable")
+
+    grant = _inception_tokens_per_key()
+    expected_keys = _inception_expected_key_count(len(enabled))
+    unmetered_keys = expected_keys - len(enabled)
+    now = iso_now()
+    rows = []
+    for cid in enabled:
+        used = min(ledger["by_credential"].get(cid, 0), grant)
+        rows.append(
+            {
+                "label": f"key {cid}",
+                "used_pct": ratio(used, grant),
+                "tokens_used": used,
+                "tokens_total": grant,
+                "tokens_remaining": grant - used,
+                "fetched_at": now,
+            }
+        )
+    for index in range(unmetered_keys):
+        rows.append(
+            {
+                "label": f"key not in OMP {index + 1}",
+                "used_pct": None,
+                "tokens_used": None,
+                "tokens_total": grant,
+                "tokens_remaining": None,
+                "fetched_at": now,
+            }
+        )
+    total = grant * expected_keys
+    # Replies OMP recorded without a credential id still drew on some key.
+    used = min(sum(row["tokens_used"] or 0 for row in rows) + ledger["unattributed"], total)
+    tokens = {
+        "used": used,
+        "total": total,
+        "remaining": None if unmetered_keys else total - used,
+    }
+    if unmetered_keys:
+        tokens["key_count"] = expected_keys
+        tokens["unmetered_keys"] = unmetered_keys
+    if ledger["unattributed"]:
+        tokens["unattributed"] = ledger["unattributed"]
+    disabled_count = len(creds) - len(enabled)
+    rec = {
+        "id": "inception",
+        "name": "Inception",
+        "logo": "I",
+        "plan": "OMP ledger",
+        "status": "ok",
+        "windows": [
+            window("weekly", "OMP-metered fleet" if unmetered_keys else "Fleet tokens", ratio(used, total)),
+            window(
+                "special",
+                "Hottest metered key" if unmetered_keys else "Hottest key",
+                max((row["used_pct"] for row in rows if row["used_pct"] is not None), default=None),
+            ),
+        ],
+        "account_usage": rows,
+        "tokens": tokens,
+        "snapshot": {"reports": len(enabled), "accounts_without_usage": 0, "disabled_credentials": disabled_count},
+        "measured_at": now,
+    }
+    if disabled_count or unmetered_keys:
+        rec["reason"] = "partial_usage"
+    return rec
+
+
 # --- Grok --------------------------------------------------------------------
 
 
@@ -2373,6 +2657,18 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
                 lines.append(prefix + reset)
             lines.append("")
 
+    tokens = rec.get("tokens") if isinstance(rec.get("tokens"), dict) else {}
+    tokens_left = _token_plan_number(tokens.get("remaining"))
+    tokens_total = _token_plan_number(tokens.get("total"))
+    unmetered_keys = _token_plan_number(tokens.get("unmetered_keys")) or 0
+    if tokens_left is not None:
+        lines.append(f"{'Tokens left':<28} {_tokens_label(tokens_left)} of {_tokens_label(tokens_total)}")
+        lines.append("one-time grant · tokens OMP spent, not usage elsewhere")
+        lines.append("")
+    elif unmetered_keys and tokens_total is not None:
+        lines.append(f"{'Grant capacity':<28} {_tokens_label(tokens_total)} across {tokens.get('key_count')} keys")
+        lines.append(f"{unmetered_keys} key(s) not in OMP; usage unknown")
+        lines.append("")
     lines.append("h/l or 1-9 switch · r refresh · q quit")
     return "\n".join(lines) + "\n"
 
@@ -2464,6 +2760,7 @@ PROBERS = {
     "google": probe_google,
     "anthropic": probe_anthropic,
     "commandcode": probe_commandcode,
+    "inception": probe_inception,
 }
 
 
@@ -2485,6 +2782,11 @@ def summarize(rec: dict) -> str:
     remaining = _token_plan_number(credits.get("remaining"))
     if remaining is not None:
         bits.append(f"credits={_credits_label(remaining)}")
+    tokens = rec.get("tokens") if isinstance(rec.get("tokens"), dict) else {}
+    if _token_plan_number(tokens.get("remaining")) is not None:
+        bits.append(f"tokens_left={_tokens_label(tokens['remaining'])}")
+    elif _token_plan_number(tokens.get("unmetered_keys")):
+        bits.append(f"keys={tokens.get('key_count')}")
     return " ".join(bits)
 
 
@@ -2674,6 +2976,10 @@ def usage_row_line(index: int, row: dict) -> str:
     total = _token_plan_number(row.get("credits_total"))
     if remaining is not None and total is not None:
         detail.append(f"{_credits_label(remaining)} of {_credits_label(total)} left")
+    tokens_left = _token_plan_number(row.get("tokens_remaining"))
+    tokens_total = _token_plan_number(row.get("tokens_total"))
+    if tokens_left is not None and tokens_total is not None:
+        detail.append(f"{_tokens_label(tokens_left)} of {_tokens_label(tokens_total)} tokens left")
     balance = _token_plan_number(row.get("remaining_credits"))
     if balance is not None:
         detail.append(f"{_credits_label(balance)} credits left")
@@ -2859,6 +3165,14 @@ def cmd_waybar() -> int:
     remaining = _token_plan_number(credits.get("remaining"))
     if remaining is not None:
         text += f" {pango_escape(_credits_label(remaining))}cr"
+    tokens = rec.get("tokens") if isinstance(rec.get("tokens"), dict) else {}
+    tokens_left = _token_plan_number(tokens.get("remaining"))
+    tokens_total = _token_plan_number(tokens.get("total"))
+    unmetered_keys = _token_plan_number(tokens.get("unmetered_keys")) or 0
+    if tokens_left is not None:
+        text += f" {pango_escape(_tokens_label(tokens_left))} left"
+    elif unmetered_keys:
+        text += f" {pango_escape(str(tokens.get('key_count')))} keys"
     status = rec.get("status") or "unknown"
     classes = [status]
     age = cache_age_sec(cache)
@@ -2890,6 +3204,17 @@ def cmd_waybar() -> int:
     if limits:
         lines.append("")
         lines.extend(window_lines(limits, report_count(rec)))
+    if tokens_total is not None:
+        if tokens_left is not None:
+            lines.append(f"{_tokens_label(tokens_left)} of {_tokens_label(tokens_total)} tokens left")
+            hint = "one-time grant · tokens OMP spent, not usage elsewhere"
+        else:
+            lines.append(f"{_tokens_label(tokens_total)} grant across {tokens.get('key_count')} keys")
+            hint = f"{unmetered_keys} key(s) not in OMP; usage unknown"
+        unattributed = _token_plan_number(tokens.get("unattributed"))
+        if unattributed:
+            hint += f" · {_tokens_label(unattributed)} without a key id"
+        lines.append(muted(hint))
     # A single snapshot repeats the limits above; rows only earn space when
     # there are several to compare.
     if len(rows) > 1:
