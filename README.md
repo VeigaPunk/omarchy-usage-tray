@@ -38,7 +38,7 @@ selected.
 | `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
 | `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
 | `g` | Google | Gemini weekly + 5-hour, shared Claude & GPT pools, hottest account | `omp usage --provider google-antigravity --json` |
-| `A` | Anthropic | Weekly 7-day, 5-hour, per-model weekly caps (e.g. Fable), hottest account | `omp usage --provider anthropic --json` |
+| `A` | Anthropic | One meter per account, filled to its binding window: 5-hour, weekly 7-day, or a per-model weekly cap (e.g. Fable) | `omp usage --provider anthropic --json` |
 | `⌘` | Command Code | Weekly + 5-hour credit windows, hottest account, credit balance across accounts | `omp usage --provider commandcode --json` |
 | `I` | Inception | Fleet tokens used of the 100M-per-key grant, hottest key, tokens left | OMP session transcripts + auth store (no usage API) |
 
@@ -114,10 +114,14 @@ lives in OMP's auth store with no local file to flip.
 The Claude subscription carries two shared, account-wide walls — a rolling
 5-hour window and the weekly window — plus one weekly cap per model family
 (Fable, Opus, Sonnet, …). A cap is not a slice of the wall: it reads and blocks
-only its own model family, but an exhausted cap still counts toward the
-hottest-account slot, so the chip warns while the shared walls read idle. The
-compact bars show the shared weekly average and the hottest account; the
-tooltip adds the shared 5-hour average and one row per model cap. Pay-as-you-go
+only its own model family, but an exhausted cap still binds its account's
+meter, so the chip warns while the shared walls read idle. The chip shows one
+meter per Claude account, left to right in OMP's credential order, each filled
+to the window that binds that account: an exhausted account next to an idle one
+reads as a full bar and an empty bar, not a half-full average. An account OMP
+lists without usage stays on the chip as `—`. The tooltip keeps the shared
+weekly and 5-hour averages, one row per model cap, the hottest account, and
+numbered account rows that match the meters left to right. Pay-as-you-go
 Extra Usage is reported in dollars, not a rate window, so it is not metered.
 `A` is the logo; right-click is a no-op because the credential lives in OMP's
 auth store with no local file to flip.
@@ -233,8 +237,9 @@ Waybar themselves. The 60s interval is only a safety net, so the chart can
 never sit on a stale provider.
 
 Multi-account providers report one snapshot per stored credential. The chip
-shows an average followed by the hottest account. Hover for aligned visual
-meters, whole percentages, and short reset countdowns (`2d 14h`, `45m`).
+shows an average followed by the hottest account (Anthropic: one meter per
+account). Hover for aligned visual meters, whole percentages, and short reset
+countdowns (`2d 14h`, `45m`).
 Multi-account rows focus on each snapshot's binding window; fetch ages appear
 only when stale, and missing/disabled credentials remain explicit. The account
 count appears once in the header unless a window has fewer reports. OMP exposes

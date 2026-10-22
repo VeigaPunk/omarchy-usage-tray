@@ -3235,6 +3235,21 @@ def _charm_hyper_waybar_payload(rec: dict, logo: str) -> dict:
     }
 
 
+def _anthropic_chip_pcts(rec: dict, rows: list[dict]) -> list[float | None]:
+    """One reading per stored Claude credential, in OMP's report order.
+
+    Each account reads the window that binds it (5-hour wall, weekly wall, or a
+    model cap). A credential OMP listed without usage keeps an unknown slot, so
+    an account never drops off the chip; no accounts at all reads as one dash.
+    """
+    snapshot = rec.get("snapshot") if isinstance(rec.get("snapshot"), dict) else {}
+    unmetered = snapshot.get("accounts_without_usage")
+    if not isinstance(unmetered, int) or isinstance(unmetered, bool) or unmetered < 0:
+        unmetered = 0
+    pcts = [as_pct(row.get("used_pct")) for row in rows] + [None] * unmetered
+    return pcts or [None]
+
+
 def cmd_waybar() -> int:
     cache = load_cache()
     pid = pick_selected(cache)
@@ -3258,15 +3273,23 @@ def cmd_waybar() -> int:
         sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
         return 0
     mark = f"{logo} {ident_id}" if ident_id else logo
-    weekly = window_by_kind(rec, "weekly") or window_by_kind(rec, "monthly") or {}
-    extra = extra_window(rec)
-    extra_bits = extra.get("extra") if isinstance(extra.get("extra"), dict) else {}
-    if extra.get("kind") == "credits" and extra_bits.get("remaining_usd") is not None:
-        usd = float(extra_bits["remaining_usd"])
-        extra_txt = f"${usd:.0f}" if usd >= 10 else f"${usd:.2f}"
+    rows = [item for item in rec.get("account_usage") or [] if isinstance(item, dict)]
+    if pid == "anthropic":
+        # Each Claude account is its own meter: averaging an exhausted account
+        # with an idle one would hide which credential still has headroom.
+        pcts = _anthropic_chip_pcts(rec, rows)
+        text = " ".join([pango_escape(mark), *(meter(pct) for pct in pcts)])
     else:
-        extra_txt = meter(extra.get("used_pct"))
-    text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {extra_txt}"
+        weekly = window_by_kind(rec, "weekly") or window_by_kind(rec, "monthly") or {}
+        extra = extra_window(rec)
+        extra_bits = extra.get("extra") if isinstance(extra.get("extra"), dict) else {}
+        if extra.get("kind") == "credits" and extra_bits.get("remaining_usd") is not None:
+            usd = float(extra_bits["remaining_usd"])
+            extra_txt = f"${usd:.0f}" if usd >= 10 else f"${usd:.2f}"
+        else:
+            extra_txt = meter(extra.get("used_pct"))
+        text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {extra_txt}"
+        pcts = [as_pct(weekly.get("used_pct")), as_pct(extra.get("used_pct"))]
     credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
     remaining = _token_plan_number(credits.get("remaining"))
     if remaining is not None:
@@ -3284,10 +3307,8 @@ def cmd_waybar() -> int:
     age = cache_age_sec(cache)
     if age is not None and age > STALE_AFTER_SEC:
         classes.append("stale")
-    rows = [item for item in rec.get("account_usage") or [] if isinstance(item, dict)]
     # An empty balance blocks the account even while its windows read idle.
     exhausted = any(_token_plan_number(row.get("remaining_credits")) == 0 for row in rows)
-    pcts = [as_pct(weekly.get("used_pct")), as_pct(extra.get("used_pct"))]
     known = [p for p in pcts if p is not None]
     if exhausted or (known and max(known) >= 95):
         classes.append("critical")

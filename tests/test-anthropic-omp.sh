@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Anthropic behavior: one isolated OMP probe, shared walls + per-model caps,
-# cache-only Waybar.
+# one chip meter per account, cache-only Waybar.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -68,7 +68,7 @@ if [[ "${AI_USAGE_ANTHROPIC_PARTIAL:-}" == 1 ]]; then
       "limits": []
     }
   ],
-  "accountsWithoutUsage": [],
+  "accountsWithoutUsage": [{"provider": "anthropic", "type": "oauth"}],
   "disabledCredentials": [],
   "capacity": {
     "anthropic": [
@@ -205,14 +205,23 @@ PY
 waybar_json="$("$BIN" waybar 2>&1)"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 1 ]] || fail "Waybar rendering invoked OMP"
 
-python3 - "$waybar_json" <<'PY'
+python3 - "$waybar_json" "$BIN" <<'PY'
+import importlib.machinery
+import importlib.util
 import json
 import re
 import sys
 import xml.etree.ElementTree as ET
 
+loader = importlib.machinery.SourceFileLoader("ai_usage", sys.argv[2])
+spec = importlib.util.spec_from_loader("ai_usage", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
 payload = json.loads(sys.argv[1])
-assert payload["text"].startswith("A "), payload["text"]
+# One meter per account in OMP's report order, each at the window that binds
+# it (53% 5-hour, 90% Fable cap) — not the 26% weekly average.
+assert payload["text"] == f"A {mod.meter(53)} {mod.meter(90)}", payload["text"]
 classes = payload["class"]
 assert "ok" in classes and "warn" in classes, classes
 tooltip = payload["tooltip"]
@@ -264,10 +273,17 @@ partial_output="$("$BIN" probe anthropic 2>&1)"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 3 ]] || fail "partial probe invoked OMP more than once"
 partial_waybar="$("$BIN" waybar 2>&1)"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 3 ]] || fail "cache consumers invoked OMP for partial data"
-python3 - "$AI_USAGE_CACHE" "$partial_waybar" <<'PY'
+python3 - "$AI_USAGE_CACHE" "$partial_waybar" "$BIN" <<'PY'
+import importlib.machinery
+import importlib.util
 import json
 import re
 import sys
+
+loader = importlib.machinery.SourceFileLoader("ai_usage", sys.argv[3])
+spec = importlib.util.spec_from_loader("ai_usage", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
 
 with open(sys.argv[1], encoding="utf-8") as fh:
     rec = json.load(fh)["providers"]["anthropic"]
@@ -284,6 +300,9 @@ assert [row.get("used_pct") for row in rec["account_usage"]] == [53, None], rec[
 assert rec["account_usage"][1] == {"fetched_at": "2100-01-01T00:01:00Z"}, rec["account_usage"][1]
 waybar = json.loads(sys.argv[2])
 assert "partial_usage" in waybar["tooltip"], waybar
+# The answered account keeps its meter; the empty report and the credential
+# OMP listed without usage stay on the chip as dashes, never as zeros.
+assert waybar["text"] == f"A {mod.meter(53)} — —", waybar["text"]
 plain = re.sub(r"<[^>]+>", "", waybar["tooltip"]).replace("━", "")
 lines = plain.splitlines()
 # An unanswered window reads as a dash, never an invented zero.
