@@ -1,12 +1,12 @@
 # omarchy-usage-tray
 
 Waybar chip for Omarchy: Codex, Token Plan, Grok, Kimi, Cursor, Devin (both
-accounts), OpenCode Go, Charm Hyper, Z.ai, Google, Anthropic, Command Code, and
-Inception usage.
+accounts), OpenCode Go, Charm Hyper, Z.ai, MiniMax, Google, Anthropic, Command
+Code, and Inception usage.
 Left-click or scroll to cycle providers; right-click cycles identities for the
 selected provider when supported.
 
-Current release: **1.10.0** (`ai-usage --version`).
+Current release: **1.11.0** (`ai-usage --version`).
 
 Every usage meter except Inception's comes from
 `omp usage --provider <id> --json` — the native CLIs (codex, grok,
@@ -37,6 +37,7 @@ selected.
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
 | `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
 | `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
+| `M` | MiniMax | 7-day, 5-hour, hottest account | `omp usage --provider minimax-code --json` |
 | `g` | Google | Gemini weekly + 5-hour, shared Claude & GPT pools, hottest account | `omp usage --provider google-antigravity --json` |
 | `A` | Anthropic | One meter per account, filled to its binding window: 5-hour, weekly 7-day, or a per-model weekly cap (e.g. Fable) | `omp usage --provider anthropic --json` |
 | `⌘` | Command Code | Weekly + 5-hour credit windows, hottest account, credit balance across accounts | `omp usage --provider commandcode --json` |
@@ -271,10 +272,11 @@ Kimi runs both OAuth accounts through `omp auth-gateway` (127.0.0.1:8791): the
 gateway round-robins new sessions across the stored `kimi-code` credentials and
 retries on the other account after a usage-limit block, so the chip meters the
 fleet and right-click just reports the balanced state. Cursor / Codex / Grok /
-OpenCode Go / Charm Hyper / Z.ai / Google / Anthropic / Command Code /
+OpenCode Go / Charm Hyper / Z.ai / MiniMax / Google / Anthropic / Command Code /
 Inception stay no-ops — OpenCode Go keys rotate inside OMP, and Charm Hyper's,
-Cursor's, Google's, Anthropic's, Command Code's, and Inception's credentials
-live in OMP's auth store, so none has a live file for the chip to flip.
+Cursor's, MiniMax's, Google's, Anthropic's, Command Code's, and Inception's
+credentials live in OMP's auth store, so none has a live file for the chip to
+flip.
 
 ## Configuration
 

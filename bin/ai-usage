@@ -22,7 +22,7 @@ from pathlib import Path
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
 # User-facing release.
-TOOL_VERSION = "1.10.0"
+TOOL_VERSION = "1.11.0"
 METER_WIDTH = 6
 TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
@@ -42,6 +42,7 @@ PROVIDERS = (
     ("opencode-go", "OpenCode Go", "O"),
     ("charm-hyper", "Charm Hyper", "H"),
     ("zai", "Z.ai", "Z"),
+    ("minimax", "MiniMax", "M"),
     ("google", "Google", "g"),
     ("anthropic", "Anthropic", "A"),
     ("commandcode", "Command Code", "⌘"),
@@ -434,6 +435,12 @@ OMP_FALLBACK_SPECS = {
     # Same OMP provider as devin; probe_devin2 pins the second account row.
     "devin2": ("devin", (
         ("devin:quota:weekly", "weekly", "7d", "Weekly Quota", True),
+    )),
+    # MiniMax Token Plan: one shared "general" pool per credential, metered on
+    # a rolling 5-hour and a 7-day window.
+    "minimax": ("minimax-code", (
+        ("general:7d", "weekly", "7d", "7 Day", True),
+        ("general:5h", "session", "5h", "5 Hour", True),
     )),
 }
 
@@ -2628,6 +2635,10 @@ def probe_devin2() -> dict:
     return _omp_fallback_rec("devin2", report_index=1) or empty_provider("devin2", "unauth", "no_omp_usage")
 
 
+def probe_minimax() -> dict:
+    return _omp_fallback_rec("minimax") or empty_provider("minimax", "unauth", "no_omp_usage")
+
+
 
 # --- TUI ---------------------------------------------------------------------
 
@@ -2863,6 +2874,7 @@ PROBERS = {
     "opencode-go": probe_opencode_go,
     "charm-hyper": probe_charm_hyper,
     "zai": probe_zai,
+    "minimax": probe_minimax,
     "google": probe_google,
     "anthropic": probe_anthropic,
     "commandcode": probe_commandcode,
