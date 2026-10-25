@@ -86,6 +86,35 @@ if [[ "${AI_USAGE_CC_PARTIAL:-}" == 1 ]]; then
 JSON
   exit 0
 fi
+if [[ "${AI_USAGE_CC_OVERDRAWN:-}" == 1 ]]; then
+  # Live shape: two credentials past their weekly cap answer usedFraction > 1.
+  cat <<'JSON'
+{
+  "generatedAt": 4102444920000,
+  "reports": [
+    {"provider": "commandcode", "fetchedAt": 4102444800000, "limits": [
+      {"id": "commandcode:5h", "amount": {"used": 0, "limit": 14, "usedFraction": 0, "unit": "credits"}, "status": "ok"},
+      {"id": "commandcode:7d", "window": {"id": "7d", "resetsAt": 4103049600000}, "amount": {"used": 35.17, "limit": 35, "usedFraction": 1.0049, "unit": "credits"}, "status": "exhausted"},
+      {"id": "commandcode:balance", "scope": {"accountId": "synth-cc-a"}, "amount": {"remaining": 34.83, "unit": "credits"}}
+    ]},
+    {"provider": "commandcode", "fetchedAt": 4102444800000, "limits": [
+      {"id": "commandcode:5h", "amount": {"used": 0, "limit": 14, "usedFraction": 0, "unit": "credits"}, "status": "ok"},
+      {"id": "commandcode:7d", "window": {"id": "7d", "resetsAt": 4103049600000}, "amount": {"used": 35.1, "limit": 35, "usedFraction": 1.0029, "unit": "credits"}, "status": "exhausted"},
+      {"id": "commandcode:balance", "scope": {"accountId": "synth-cc-b"}, "amount": {"remaining": 34.9, "unit": "credits"}}
+    ]},
+    {"provider": "commandcode", "fetchedAt": 4102444800000, "limits": [
+      {"id": "commandcode:5h", "amount": {"used": 0, "limit": 14, "usedFraction": 0, "unit": "credits"}, "status": "ok"},
+      {"id": "commandcode:7d", "amount": {"used": 0, "limit": 35, "usedFraction": 0, "unit": "credits"}, "status": "ok"},
+      {"id": "commandcode:balance", "scope": {"accountId": "synth-cc-c"}, "amount": {"remaining": 70, "unit": "credits"}}
+    ]}
+  ],
+  "accountsWithoutUsage": [],
+  "disabledCredentials": [],
+  "capacity": {"commandcode": [{"window": "7d", "accounts": 3}]}
+}
+JSON
+  exit 0
+fi
 if [[ "${AI_USAGE_CC_EXHAUSTED:-}" == 1 ]]; then
   cat <<'JSON'
 {
@@ -345,6 +374,13 @@ line = next(line for line in plain.splitlines() if line.startswith("Credit balan
 assert line.split()[2:] == ["—", "—"], line
 PY
 unset AI_USAGE_CC_PARTIAL
+
+export AI_USAGE_CC_OVERDRAWN=1
+overdrawn_output="$("$BIN" probe commandcode 2>&1)"
+# Over-cap fractions are exhausted accounts, not 1% readings.
+[[ "$overdrawn_output" == 'commandcode ok weekly=66.6667 session=0 special=100 credits=140' ]] ||
+  fail "overdrawn weekly windows were not read as exhausted: $overdrawn_output"
+unset AI_USAGE_CC_OVERDRAWN
 
 "$BIN" validate || fail "cache with Command Code rows failed validation"
 

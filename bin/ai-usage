@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import signal
@@ -1878,6 +1879,20 @@ def _commandcode_balance(limit: dict) -> int | float | None:
     return int(number) if number.is_integer() else number
 
 
+def _commandcode_fraction(value) -> float | None:
+    """`usedFraction` in 0..1; above 1 means overdrawn, clamped to full.
+
+    An exhausted window answers just over 1 (e.g. 1.0049). The percent-tolerant
+    OpenCode Go reader would misread that as 1% and hide an exhausted account.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    frac = float(value)
+    if math.isnan(frac) or math.isinf(frac):
+        return None
+    return max(0.0, min(1.0, frac))
+
+
 def _commandcode_report(report: dict) -> dict:
     """One credential snapshot, in percent, plus its balance reading."""
     row: dict = {}
@@ -1902,7 +1917,7 @@ def _commandcode_report(report: dict) -> dict:
         if lid not in COMMANDCODE_KINDS:
             continue
         amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
-        frac = _opencode_go_fraction(amount.get("usedFraction"))
+        frac = _commandcode_fraction(amount.get("usedFraction"))
         if frac is None:
             continue
         win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
