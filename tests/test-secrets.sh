@@ -32,16 +32,13 @@ for dir in fixtures bin deploy systemd tests; do
 done
 
 note "== banned invocations in ship paths =="
-# token-plan-key prints the API key to stdout — never exec from bar/timer.
 # omarchy refresh waybar copies stock config over ~/.config/waybar.
 # bl --verbose / grok --debug dump HTTP auth material to stderr.
 # Comments that document the ban do not count.
 BANNED=(
-  'token-plan-key'
   'omarchy refresh waybar'
   'omarchy-refresh-waybar'
   'bl --verbose'
-  'bl usage token-plan --verbose'
   'grok --debug'
   'jq . ~/.codex/auth.json'
   'jq . ~/.grok/auth.json'
@@ -99,7 +96,7 @@ if [[ -f "$snippet" ]]; then
   else
     # path+line only
     printf 'exec at %s\n' "$(printf '%s\n' "$exec_line" | sed 's/:.*//')"
-    if printf '%s\n' "$exec_line" | grep -Eq 'probe|refresh|token-plan-key|bl |grok |kimi |codex '; then
+    if printf '%s\n' "$exec_line" | grep -Eq 'probe|refresh|bl |grok |kimi |codex '; then
       fail "waybar exec is not cache-only (PATH: deploy/waybar-ai-usage.jsonc)"
     fi
     if ! printf '%s\n' "$exec_line" | grep -Eq 'ai-usage waybar|usage\.py'; then

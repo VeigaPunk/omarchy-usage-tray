@@ -1,12 +1,12 @@
 # omarchy-usage-tray
 
-Waybar chip for Omarchy: Codex, Token Plan, Grok, Kimi, Cursor, Devin (both
-accounts), OpenCode Go, Charm Hyper, Z.ai, MiniMax, Google, Anthropic, Command
+Waybar chip for Omarchy: Codex, Grok, Kimi, Cursor, Devin (both
+accounts), OpenCode Go, Z.ai, MiniMax, Google, Anthropic, Command
 Code, and Inception usage.
 Left-click or scroll to cycle providers; right-click cycles identities for the
 selected provider when supported.
 
-Current release: **1.11.0** (`ai-usage --version`).
+Current release: **1.12.0** (`ai-usage --version`).
 
 Every usage meter except Inception's comes from
 `omp usage --provider <id> --json` — the native CLIs (codex, grok,
@@ -28,14 +28,12 @@ selected.
 | Logo | Provider | Windows the chip shows | Source |
 |---|---|---|---|
 | `C` | Codex | Weekly 7-day, hottest account | `omp usage --provider openai-codex --json` |
-| `T` | Token Plan | Per-account credits across the fleet, hottest account, add-on packs | `omp usage --provider alibaba-token-plan --json` |
 | `G` | Grok | Weekly credits, hottest account | `omp usage --provider xai-oauth --json` |
 | `K` | Kimi | Monthly total, 5-hour, monthly code — per OAuth account, averaged + hottest | `omp usage --provider kimi-code --json` |
 | `R` | Cursor | Monthly Included + Auto + API, hottest | `omp usage --provider cursor --json` + Cursor's usage summary (signed with `omp token cursor`) |
 | `D` | Devin | Weekly quota, hottest account | `omp usage --provider devin --json` |
 | `d` | Devin 2 | Weekly quota, second account | `omp usage --provider devin --json` (second report row) |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
-| `H` | Charm Hyper | Prepaid credit balance, summed over every credential | `omp usage --provider charm-hyper --json` |
 | `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
 | `M` | MiniMax | 7-day, 5-hour, hottest account | `omp usage --provider minimax-code --json` |
 | `g` | Google | Gemini weekly + 5-hour, shared Claude & GPT pools, hottest account | `omp usage --provider google-antigravity --json` |
@@ -46,58 +44,6 @@ selected.
 Missing data is never invented: a window the provider did not answer renders as
 `—`, and a provider that cannot be reached keeps its last good meters and shows
 the bounded reason instead.
-
-### Token Plan console authentication
-
-Token Plan API keys can serve model requests without exposing quota data.
-Each stored OMP credential also needs the matching account's QwenCloud or
-Bailian console Cookie header for usage reporting. See OMP's
-[Token Plan login guidance](https://github.com/can1357/oh-my-pi/blob/main/packages/ai/README.md).
-Cookies are sensitive and session-lived: keep them in OMP's credential store,
-never in the provider roster, service environment, usage cache, or repository.
-Reconnect the corresponding console session when it expires.
-
-For multiple keys, check that `omp usage --provider alibaba-token-plan --json`
-returns one report per account, then run `ai-usage probe token-plan`. A working
-key listed under `accountsWithoutUsage` has no quota report; it is not a zero
-usage reading.
-
-### Token Plan add-on credits
-
-Token Plan meters the monthly plan window and purchased add-on bundles (Credit
-Pack, $15) as separate pools. The chip supports both: when a report carries a
-`credits:addon` window, that account's row is `monthly + packs`, the tooltip
-prints `x/y credits` per snapshot, and an account whose plan reads 100% while a
-pack still holds credits shows its real headroom instead of a false zero.
-
-Pool sizes are declared rather than scraped — the console usage RPC answers
-percentages only — so override them per tier with
-`AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS` (legacy
-`AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS` still honored) and
-`AI_USAGE_TOKEN_PLAN_ADDON_CREDITS` (both **per account**). OMP emits only the
-monthly window today, so the add-on path stays dormant until it reports one.
-
-The default monthly pool is **45,000 credits per account (Standard)**. Pro
-grants **180,000 per account**: set
-`AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS=180000` in `~/.config/ai-usage/env` for a
-Pro-only pool. Three Pro accounts therefore total 540,000 monthly credits.
-For an immediate one-off refresh, pass the same variable to
-`ai-usage probe token-plan`; the environment file is loaded by the timer,
-not by interactive shell commands.
-
-### Charm Hyper credits
-
-Charm Hyper is prepaid, and OMP answers with a balance rather than a
-percentage: the endpoint reports how many credits are left and there is no
-window to fill. The chip therefore renders a counter (`H 238cr`) and no bar.
-Balances from every stored credential are added up; if one credential answers
-nothing, the total is withheld instead of understated, and the chip keeps the
-last good count alongside the bounded reason. A retained count is labelled
-`last good` in the tooltip.
-
-`AI_USAGE_CHARM_HYPER_LOW_CREDITS` (in credits, compared against the reported
-total) turns the chip red below a floor; zero credits is always critical. Left
-unset, only an exhausted balance alarms.
 
 ### Google shared pools
 
@@ -230,7 +176,7 @@ omarchy plugin remove io.github.veigapunk.usage-tray
 | Gesture | Action |
 |---|---|
 | Left-click | Next provider |
-| Right-click | Next identity / active route (Token Plan slots) |
+| Right-click | Next identity where one exists (Kimi reports its balanced state) |
 | Scroll | Cycle providers |
 
 Click and scroll change the chip immediately: `cycle` / `identity` signal
@@ -255,27 +201,14 @@ the next probe; run `ai-usage probe opencode-go` to refresh immediately.
 `O` is the logo; right-click there is a no-op because OMP already rotates
 those keys per request.
 
-Token Plan's compact bars show the average utilization across OMP-metered
-credentials and the hottest reported snapshot, followed by a rounded remaining
-balance (`24k left`). The tooltip retains the remaining/total credits and the
-per-account breakdown. `T @<slot>` is the active execution route, not the owner
-of either meter. See [Token Plan add-on credits](#token-plan-add-on-credits) for
-the credit model.
-
-Token Plan right-click runs `token-plan-swap toggle`. That helper cycles the
-slots in `~/.config/alibaba-token-plan/slots` and rewrites
-`~/.bailian/config.json` from `keys/$active`. Codex, xask, and
-`token-plan-key` follow that route. The route change preserves OMP's fleet
-meters; 1Password is only used by `token-plan-swap pull`.
-
 Kimi runs both OAuth accounts through `omp auth-gateway` (127.0.0.1:8791): the
 gateway round-robins new sessions across the stored `kimi-code` credentials and
 retries on the other account after a usage-limit block, so the chip meters the
 fleet and right-click just reports the balanced state. Cursor / Codex / Grok /
-OpenCode Go / Charm Hyper / Z.ai / MiniMax / Google / Anthropic / Command Code /
-Inception stay no-ops — OpenCode Go keys rotate inside OMP, and Charm Hyper's,
-Cursor's, MiniMax's, Google's, Anthropic's, Command Code's, and Inception's
-credentials live in OMP's auth store, so none has a live file for the chip to
+OpenCode Go / Z.ai / MiniMax / Google / Anthropic / Command Code /
+Inception stay no-ops — OpenCode Go keys rotate inside OMP, and Cursor's,
+MiniMax's, Google's, Anthropic's, Command Code's, and Inception's credentials
+live in OMP's auth store, so none has a live file for the chip to
 flip.
 
 ## Configuration
@@ -285,9 +218,6 @@ service environment for the 5-minute probe:
 
 ```ini
 #AI_USAGE_OMP_BIN=/home/you/.local/bin/omp
-#AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS=45000
-#AI_USAGE_TOKEN_PLAN_ADDON_CREDITS=20000
-#AI_USAGE_CHARM_HYPER_LOW_CREDITS=25
 #AI_USAGE_INCEPTION_TOKENS_PER_KEY=100000000
 #AI_USAGE_INCEPTION_EXPECTED_KEYS=4
 ```
@@ -317,7 +247,7 @@ zai
 
 `AI_USAGE_PROVIDERS_FILE` overrides that path (the tests point it at a temp
 file). With neither source set — or with a roster that names no known provider —
-all 14 providers stay active, so the default behaviour is unchanged. An unknown
+all 13 providers stay active, so the default behaviour is unchanged. An unknown
 id prints one warning line to stderr (`ai-usage: unknown provider in roster:
 <id>`, once per run) and is skipped; it never fails a probe.
 

@@ -65,10 +65,10 @@ from datetime import datetime, timezone
 
 cache_path, selected_path, selected, specs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 names = {
-    "codex": ("Codex", "C"), "token-plan": ("Token Plan", "T"), "grok": ("Grok", "G"),
+    "codex": ("Codex", "C"), "grok": ("Grok", "G"),
     "kimi": ("Kimi", "K"), "cursor": ("Cursor", "R"), "devin": ("Devin", "D"),
     "devin2": ("Devin 2", "d"), "opencode-go": ("OpenCode Go", "O"),
-    "charm-hyper": ("Charm Hyper", "H"), "zai": ("Z.ai", "Z"), "google": ("Google", "g"),
+    "zai": ("Z.ai", "Z"), "google": ("Google", "g"),
     "anthropic": ("Anthropic", "A"), "commandcode": ("Command Code", "⌘"),
 }
 providers = {}
@@ -245,17 +245,17 @@ if "$BIN" probe bogus-model >/dev/null 2>&1; then
   fail "probe accepted an unknown provider id"
 fi
 
-# No roster probes all 15 providers, as before. Inception reads OMP's auth store
-# and transcripts directly, so 14 of them call `omp usage` (Cursor also asks
+# No roster probes all 13 providers, as before. Inception reads OMP's auth store
+# and transcripts directly, so 12 of them call `omp usage` (Cursor also asks
 # `omp token cursor` for its usage summary).
 unset AI_USAGE_PROVIDERS
 rm -f "$AI_USAGE_CACHE"
 : >"$AI_USAGE_OMP_LOG"
 "$BIN" probe >/dev/null
-[[ "$(grep -c '^usage ' "$AI_USAGE_OMP_LOG")" == 14 ]] ||
-  fail "no-roster probe ran $(grep -c '^usage ' "$AI_USAGE_OMP_LOG") omp usage calls, want 14"
-[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 15 ]] ||
-  fail "no-roster probe did not cache 15 providers"
+[[ "$(grep -c '^usage ' "$AI_USAGE_OMP_LOG")" == 12 ]] ||
+  fail "no-roster probe ran $(grep -c '^usage ' "$AI_USAGE_OMP_LOG") omp usage calls, want 12"
+[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 13 ]] ||
+  fail "no-roster probe did not cache 13 providers"
 
 # --- select stays unrestricted; chip row is roster-scoped --------------------
 

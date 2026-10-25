@@ -16,14 +16,14 @@ import sys
 import tempfile
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-# Cache schema. 2 replaced the Token Plan `capacity` block with credit totals
+# Cache schema. 2 replaced the v1 `capacity` block with credit totals
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
 # User-facing release.
-TOOL_VERSION = "1.11.0"
+TOOL_VERSION = "1.12.0"
 METER_WIDTH = 6
 TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
@@ -34,14 +34,12 @@ STALE_AFTER_SEC = 20 * 60
 
 PROVIDERS = (
     ("codex", "Codex", "C"),
-    ("token-plan", "Token Plan", "T"),
     ("grok", "Grok", "G"),
     ("kimi", "Kimi", "K"),
     ("cursor", "Cursor", "R"),
     ("devin", "Devin", "D"),
     ("devin2", "Devin 2", "d"),
     ("opencode-go", "OpenCode Go", "O"),
-    ("charm-hyper", "Charm Hyper", "H"),
     ("zai", "Z.ai", "Z"),
     ("minimax", "MiniMax", "M"),
     ("google", "Google", "g"),
@@ -144,7 +142,7 @@ def waybar_signal() -> int:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return fallback
-    match = re.search(r'"custom/ai-usage"\s*:\s*\{.*?"signal"\s*:\s*(\d+)', text, re.S)
+    match = re.search(r'"custom/ai-usage"\s*:\s*\{.*?"signal"\s*:\s*(\d+)', text, re.DOTALL)
     if not match:
         return fallback
     try:
@@ -184,7 +182,7 @@ def poke_waybar() -> None:
 
 
 def iso_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def iso_from_unix(ts) -> str | None:
@@ -196,7 +194,7 @@ def iso_from_unix(ts) -> str | None:
         n = float(ts)
         if n >= 1e12:
             n = n / 1000.0
-        return datetime.fromtimestamp(int(n), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.fromtimestamp(int(n), tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     except (TypeError, ValueError, OSError, OverflowError):
         return None
 
@@ -210,7 +208,7 @@ def as_pct(value) -> float | None:
         pct = float(value)
     except (TypeError, ValueError):
         return None
-    if pct != pct or pct in (float("inf"), float("-inf")):
+    if math.isnan(pct) or math.isinf(pct):
         return None
     pct = round(pct, 4)
     return max(0.0, min(100.0, pct))
@@ -352,7 +350,6 @@ def child_env() -> dict:
     for key in (
         "XAI_API_KEY",
         "GROK_API_KEY",
-        "BAILIAN_TOKEN_PLAN_API_KEY",
     ):
         env.pop(key, None)
     return env
@@ -361,7 +358,7 @@ def child_env() -> dict:
 def _has_meter(rec: dict) -> bool:
     """Is this record worth retaining across a failed probe?
 
-    Percent windows are the common case; Charm Hyper's prepaid balance has no
+    Percent windows are the common case; a prepaid credit balance has no
     ceiling to meter, so an observed credit count is a meter too.
     """
     if any("used_pct" in w for w in rec.get("windows") or [] if isinstance(w, dict)):
@@ -562,9 +559,7 @@ def _provider_usable(rec) -> bool:
     if isinstance(burst, dict) and burst.get("used_pct") is not None:
         return True
     credits = rec.get("credits")
-    if isinstance(credits, dict) and credits.get("remaining") is not None:
-        return True
-    return False
+    return bool(isinstance(credits, dict) and credits.get("remaining") is not None)
 
 
 # --- Codex -------------------------------------------------------------------
@@ -572,52 +567,6 @@ def _provider_usable(rec) -> bool:
 
 def probe_codex() -> dict:
     return _omp_fallback_rec("codex") or empty_provider("codex", "unauth", "no_omp_usage")
-
-
-# --- Token Plan --------------------------------------------------------------
-
-
-def token_plan_conf() -> Path:
-    return Path(
-        os.environ.get(
-            "AI_USAGE_TOKEN_PLAN_CONF",
-            Path.home() / ".config" / "alibaba-token-plan",
-        )
-    )
-
-
-def token_plan_identities() -> list[dict]:
-    path = token_plan_conf() / "slots"
-    out: list[dict] = []
-    if not path.is_file():
-        return out
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("|")
-        sid = parts[0].strip()
-        if not sid:
-            continue
-        title = parts[2].strip() if len(parts) > 2 else sid
-        ident = parts[3].strip() if len(parts) > 3 else ""
-        out.append({"id": sid, "label": sid, "title": title, "ident": ident})
-    return out
-
-
-def token_plan_active_id() -> str | None:
-    path = token_plan_conf() / "active"
-    if not path.is_file():
-        return None
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return value or None
 
 
 def cursor_oauth_conf() -> Path:
@@ -687,28 +636,7 @@ def attach_cursor_identity(rec: dict) -> dict:
     return rec
 
 
-def attach_token_plan_identity(rec: dict) -> dict:
-    slots = token_plan_identities()
-    if not slots:
-        return rec
-    active = token_plan_active_id() or slots[0]["id"]
-    match = next((s for s in slots if s["id"] == active), slots[0])
-    rec["identity"] = {
-        "id": match["id"],
-        "label": match["id"],
-        "title": match.get("title") or match["id"],
-    }
-    rec["identities"] = [{"id": s["id"], "label": s["id"]} for s in slots]
-    return rec
-
-
-# Token Plan credit pools are per account: OMP forwards usage fractions, not
-# absolute balances. The default is Standard's 45,000 monthly credits; Pro
-# grants 180,000. A purchased Credit Pack adds 20,000 to its owner's pool
-# when OMP reports a separate credits:addon window.
-# Override per plan tier with AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS
-# (legacy AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS still honored) /
-# AI_USAGE_TOKEN_PLAN_ADDON_CREDITS.
+# Positive-integer override for pool sizes (Inception's per-key grant).
 def _token_plan_pool(env_name: str, default: int) -> int:
     raw = os.environ.get(env_name)
     if raw:
@@ -719,17 +647,6 @@ def _token_plan_pool(env_name: str, default: int) -> int:
         if value > 0:
             return value
     return default
-
-
-def _token_plan_monthly_credits() -> int:
-    return _token_plan_pool(
-        "AI_USAGE_TOKEN_PLAN_MONTHLY_CREDITS",
-        _token_plan_pool("AI_USAGE_TOKEN_PLAN_WEEKLY_CREDITS", 45000),
-    )
-
-
-def _token_plan_addon_credits() -> int:
-    return _token_plan_pool("AI_USAGE_TOKEN_PLAN_ADDON_CREDITS", 20000)
 
 
 def _credits_label(value) -> str:
@@ -749,7 +666,7 @@ def _token_plan_number(value) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     number = float(value)
-    if number != number or number in (float("inf"), float("-inf")) or number < 0:
+    if math.isnan(number) or math.isinf(number) or number < 0:
         return None
     return int(number) if number.is_integer() else number
 
@@ -766,188 +683,7 @@ def _token_plan_timestamp(value) -> str | None:
     stamp = parse_reset(value)
     if stamp is None:
         return None
-    return stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _empty_token_plan(reason: str) -> dict:
-    return attach_token_plan_identity(
-        {
-            "id": "token-plan",
-            "name": "Token Plan",
-            "logo": "T",
-            "status": "unknown",
-            "reason": reason,
-            "windows": [
-                window("weekly", "Account credits", None),
-                window("special", "Hottest account", None),
-            ],
-            "account_usage": [],
-            "credits": {},
-            "snapshot": {
-                "reports": 0,
-                "accounts_without_usage": 0,
-                "disabled_credentials": 0,
-            },
-        }
-    )
-
-
-def _token_plan_report_usage(report: dict) -> dict:
-    """Per-account usage in credits.
-
-    The plan window and the purchased add-on pool are separate meters, so
-    utilization is computed over their combined credits: an account whose plan
-    reads 100% while an active Credit Pack still holds credits is mostly idle,
-    not exhausted. `credits:addon` is absent for accounts that never bought a
-    bundle, which then fall back to the weekly pool alone.
-    """
-    usage: dict = {}
-    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
-    if fetched_at:
-        usage["fetched_at"] = fetched_at
-    limits = report.get("limits")
-    if not isinstance(limits, list):
-        return usage
-    plan_fraction = None
-    addon_fraction = None
-    resets_at = None
-    for limit in limits:
-        if not isinstance(limit, dict):
-            continue
-        win = limit.get("window")
-        window_id = win.get("id") if isinstance(win, dict) else None
-        amount = limit.get("amount")
-        fraction = _token_plan_number(amount.get("usedFraction")) if isinstance(amount, dict) else None
-        if fraction is not None and float(fraction) > 1:
-            fraction = None
-        if limit.get("id") == "credits:monthly" and window_id == "monthly":
-            if fraction is not None:
-                plan_fraction = float(fraction)
-            resets_at = _token_plan_timestamp(
-                limit.get("resetsAt") or (win.get("resetsAt") if isinstance(win, dict) else None)
-            )
-        elif limit.get("id") == "credits:addon" and fraction is not None:
-            addon_fraction = float(fraction)
-    if plan_fraction is None:
-        return usage
-    monthly = _token_plan_monthly_credits()
-    total = monthly + (_token_plan_addon_credits() if addon_fraction is not None else 0)
-    used = monthly * plan_fraction
-    if addon_fraction is not None:
-        used += _token_plan_addon_credits() * addon_fraction
-    if total > 0:
-        usage["used_pct"] = as_pct(100.0 * used / total)
-    usage["credits_total"] = total
-    usage["credits_used"] = round(used, 2)
-    usage["credits_remaining"] = round(total - used, 2)
-    if resets_at:
-        usage["resets_at"] = resets_at
-    return usage
-
-
-def probe_token_plan() -> dict:
-    payload, failure = omp_usage_payload("alibaba-token-plan")
-    if payload is None:
-        return _empty_token_plan(failure or "bad_payload")
-
-    raw_reports = payload["reports"]
-    account_usage = [
-        _token_plan_report_usage(report)
-        for report in raw_reports
-        if isinstance(report, dict) and report.get("provider") == "alibaba-token-plan"
-    ]
-    accounts_without_usage = payload.get("accountsWithoutUsage")
-    disabled_credentials = payload.get("disabledCredentials")
-    usage_lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
-    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
-    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
-    snapshot = {
-        "reports": len(account_usage),
-        "accounts_without_usage": missing_count,
-        "disabled_credentials": disabled_count,
-    }
-
-    # Credits, not account-equivalents: OMP's own capacity block counts only the
-    # plan window, so a funded add-on would still read as "0 remaining".
-    credits_total = 0.0
-    credits_used = 0.0
-    credits_complete = bool(account_usage)
-    for item in account_usage:
-        row_total = _token_plan_number(item.get("credits_total"))
-        row_used = _token_plan_number(item.get("credits_used"))
-        if row_total is None or row_used is None:
-            credits_complete = False
-            continue
-        credits_total += float(row_total)
-        credits_used += float(row_used)
-    credits = (
-        {
-            "total": round(credits_total, 2),
-            "used": round(credits_used, 2),
-            "remaining": round(credits_total - credits_used, 2),
-        }
-        if credits_complete and credits_total > 0
-        else {}
-    )
-    report_pcts = [as_pct(item.get("used_pct")) for item in account_usage]
-    known_pcts = [pct for pct in report_pcts if pct is not None]
-    complete_reports = (
-        bool(account_usage)
-        and len(raw_reports) == len(account_usage)
-        and isinstance(accounts_without_usage, list)
-        and missing_count == 0
-        and all(pct is not None for pct in report_pcts)
-    )
-    declared_accounts = _omp_declared_accounts(payload, "alibaba-token-plan", "monthly")
-    under_reported = declared_accounts is not None and len(account_usage) != declared_accounts
-    if credits:
-        average = ratio(credits["used"], credits["total"])
-        average_accounts = len(account_usage)
-    elif known_pcts:
-        average = as_pct(sum(known_pcts) / len(known_pcts))
-        average_accounts = len(known_pcts)
-    else:
-        average = None
-        average_accounts = None
-    complete_coverage = complete_reports and bool(credits) and not under_reported
-    hottest = max(report_pcts) if complete_coverage else None
-    average_label = f"{average_accounts}-account credits" if average_accounts else "Account credits"
-    windows = [
-        window("weekly", average_label, average),
-        window("special", "Hottest account", hottest),
-    ]
-    status = "ok" if average is not None else "unknown"
-    rec = {
-        "id": "token-plan",
-        "name": "Token Plan",
-        "logo": "T",
-        "status": status,
-        "windows": windows,
-        "account_usage": account_usage,
-        "credits": credits,
-        "snapshot": snapshot,
-    }
-    timestamps = [item.get("fetched_at") for item in account_usage]
-    timestamps_complete = (
-        bool(timestamps)
-        and len(raw_reports) == len(account_usage)
-        and not under_reported
-        and all(isinstance(stamp, str) for stamp in timestamps)
-    )
-    if timestamps_complete:
-        rec["measured_at"] = min(timestamps)
-    partial = (
-        not complete_coverage
-        or disabled_count > 0
-        or not usage_lists_valid
-        or not timestamps_complete
-        or not credits
-    )
-    if status != "ok":
-        rec["reason"] = "no_used_pct"
-    elif partial:
-        rec["reason"] = "partial_usage"
-    return attach_token_plan_identity(rec)
+    return stamp.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def omp_usage_payload(provider: str) -> tuple[dict | None, str | None]:
@@ -1046,7 +782,7 @@ def _opencode_go_fraction(value) -> float | None:
         frac = float(value)
     except (TypeError, ValueError):
         return None
-    if frac != frac or frac in (float("inf"), float("-inf")):
+    if math.isnan(frac) or math.isinf(frac):
         return None
     if frac > 1:
         frac = frac / 100.0
@@ -1193,117 +929,6 @@ def probe_opencode_go() -> dict:
     if status != "ok":
         rec["reason"] = "no_used_pct"
     elif not complete_coverage or disabled_count > 0 or not lists_valid:
-        rec["reason"] = "partial_usage"
-    return rec
-
-
-# --- Charm Hyper -------------------------------------------------------------
-
-# Charm Hyper prepays credits: OMP's credits endpoint answers a balance, not a
-# usage window, so the record carries credits and no percentage — there is no
-# ceiling to meter against. A partially answered fleet is withheld instead of
-# summed, because an understated balance would raise a false low-credit alarm.
-CHARM_HYPER_LIMIT_ID = "charm-hyper:credits"
-
-
-def _charm_hyper_report(report: dict) -> dict:
-    """One credential's balance, as answered. No account identity is exposed."""
-    row: dict = {}
-    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
-    if fetched_at:
-        row["fetched_at"] = fetched_at
-    limits = report.get("limits")
-    if not isinstance(limits, list):
-        return row
-    for limit in limits:
-        if not isinstance(limit, dict) or limit.get("id") != CHARM_HYPER_LIMIT_ID:
-            continue
-        amount = limit.get("amount")
-        remaining = _token_plan_number(amount.get("remaining")) if isinstance(amount, dict) else None
-        if remaining is not None:
-            row["remaining_credits"] = remaining
-    return row
-
-
-def _charm_hyper_low_credits() -> float | None:
-    """Optional warn floor. Unset means only an exhausted balance turns red."""
-    raw = os.environ.get("AI_USAGE_CHARM_HYPER_LOW_CREDITS")
-    if not raw:
-        return None
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return None
-    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
-        return None
-    return value
-
-
-def _empty_charm_hyper(reason: str) -> dict:
-    rec = empty_provider("charm-hyper", "unknown", reason)
-    rec["windows"] = [window("credits", "Credit balance", None)]
-    rec["account_usage"] = []
-    rec["credits"] = {}
-    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
-    return rec
-
-
-def probe_charm_hyper() -> dict:
-    payload, failure = omp_usage_payload("charm-hyper")
-    if payload is None:
-        return _empty_charm_hyper(failure or "bad_payload")
-
-    raw_reports = payload["reports"]
-    reports = [
-        report
-        for report in raw_reports
-        if isinstance(report, dict) and report.get("provider") == "charm-hyper"
-    ]
-    rows = [_charm_hyper_report(report) for report in reports]
-    accounts_without_usage = payload.get("accountsWithoutUsage")
-    disabled_credentials = payload.get("disabledCredentials")
-    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
-    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
-    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
-
-    balances = [row.get("remaining_credits") for row in rows]
-    answered = [balance for balance in balances if balance is not None]
-    complete = bool(rows) and len(answered) == len(rows)
-    declared_accounts = _omp_declared_accounts(payload, "charm-hyper")
-    under_reported = declared_accounts is not None and len(rows) != declared_accounts
-    credits: dict = {}
-    if complete:
-        remaining = sum(float(balance) for balance in answered)
-        credits["remaining"] = int(remaining) if remaining.is_integer() else round(remaining, 2)
-    timestamps = [row.get("fetched_at") for row in rows]
-    timestamps_complete = bool(timestamps) and all(isinstance(stamp, str) for stamp in timestamps)
-    status = "ok" if credits else "unknown"
-    rec = {
-        "id": "charm-hyper",
-        "name": "Charm Hyper",
-        "logo": "H",
-        "status": status,
-        "windows": [
-            window(
-                "credits",
-                "Credit balance",
-                None,
-                extra={"remaining_credits": credits["remaining"]} if credits else None,
-            )
-        ],
-        "account_usage": rows,
-        "credits": credits,
-        "snapshot": {
-            "reports": len(rows),
-            "accounts_without_usage": missing_count,
-            "disabled_credentials": disabled_count,
-        },
-    }
-    if complete and timestamps_complete and not under_reported:
-        rec["measured_at"] = min(timestamps)
-    if status != "ok":
-        rec["reason"] = "partial_balance" if answered else "no_balance"
-    elif not lists_valid or disabled_count > 0 or not timestamps_complete or under_reported:
         rec["reason"] = "partial_usage"
     return rec
 
@@ -1873,7 +1498,7 @@ def _commandcode_balance(limit: dict) -> int | float | None:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
     number = float(raw)
-    if number != number or number in (float("inf"), float("-inf")):
+    if math.isnan(number) or math.isinf(number):
         return None
     number = max(0.0, number)
     return int(number) if number.is_integer() else number
@@ -2523,9 +2148,7 @@ def probe_kimi() -> dict:
             "disabled_credentials": disabled_count,
         },
     }
-    if not lists_valid:
-        rec["reason"] = "partial_usage"
-    elif missing_count or disabled_count or under_reported:
+    if not lists_valid or missing_count or disabled_count or under_reported:
         rec["reason"] = "partial_usage"
     return rec
 
@@ -2673,11 +2296,11 @@ def parse_reset(ts) -> datetime | None:
         if not iso:
             return None
         try:
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(iso)
         except ValueError:
             return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt
 
 
@@ -2686,7 +2309,7 @@ def format_reset_in(ts) -> str:
     dt = parse_reset(ts)
     if dt is None:
         return ""
-    remaining = dt - datetime.now(timezone.utc)
+    remaining = dt - datetime.now(UTC)
     ms = remaining.total_seconds() * 1000
     if not (ms > 0):
         return "now"
@@ -2770,9 +2393,9 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
             extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
             balance = _token_plan_number(extra_bits.get("remaining_credits")) if pct is None else None
             if balance is not None:
-                # A balance has no ceiling, so the number is the meter. Charm
-                # Hyper is prepaid; Command Code's monthly credits refill on a
-                # billing date OMP does not report.
+                # A balance has no ceiling, so the number is the meter:
+                # Command Code's monthly credits refill on a billing date
+                # OMP does not report.
                 lines.append(f"{label:<28} {_credits_label(balance):>4} cr")
                 lines.append(
                     "monthly + purchased + free credits · refill date not reported"
@@ -2873,21 +2496,19 @@ def cmd_tui(dump: bool = False) -> int:
         import curses
 
         return curses.wrapper(_tui_loop)
-    except Exception:
+    except Exception:  # noqa: BLE001 - any curses failure falls back to the dump
         sys.stdout.write(render_dashboard())
         return 0
 
 
 PROBERS = {
     "codex": probe_codex,
-    "token-plan": probe_token_plan,
     "grok": probe_grok,
     "kimi": probe_kimi,
     "cursor": probe_cursor,
     "devin": probe_devin,
     "devin2": probe_devin2,
     "opencode-go": probe_opencode_go,
-    "charm-hyper": probe_charm_hyper,
     "zai": probe_zai,
     "minimax": probe_minimax,
     "google": probe_google,
@@ -2995,7 +2616,7 @@ def cache_age_sec(cache: dict) -> float | None:
     if not stamp:
         return None
     try:
-        dt = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        dt = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
     except ValueError:
         return None
     return max(0.0, time.time() - dt.timestamp())
@@ -3156,112 +2777,6 @@ def _snapshot_section(rec: dict) -> list[str]:
     return [line] if line else []
 
 
-def _token_plan_waybar_payload(rec: dict, logo: str, ident_id: str) -> dict:
-    weekly = window_by_kind(rec, "weekly") or {}
-    hottest = window_by_kind(rec, "special") or {}
-    credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
-    credits_remaining = _token_plan_number(credits.get("remaining"))
-    credits_total = _token_plan_number(credits.get("total"))
-    mark = f"{logo} @{ident_id}" if ident_id else logo
-    text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {meter(hottest.get('used_pct'))}"
-    if credits_remaining is not None:
-        text += f" {pango_escape(_credits_label(credits_remaining))} left"
-    classes = [str(rec.get("status") or "unknown")]
-    account_usage = rec.get("account_usage")
-    account_usage = account_usage if isinstance(account_usage, list) else []
-    ages = [
-        _timestamp_age_sec(item.get("fetched_at"))
-        for item in account_usage
-        if isinstance(item, dict)
-    ]
-    if any(age is not None and age > STALE_AFTER_SEC for age in ages):
-        classes.append("stale")
-    hottest_pct = as_pct(hottest.get("used_pct"))
-    if hottest_pct is not None and hottest_pct >= 95:
-        classes.append("critical")
-    elif hottest_pct is not None and hottest_pct >= 80:
-        classes.append("warn")
-
-    notes = []
-    if report_count(rec) > 1:
-        notes.append(f"{report_count(rec)} account reports")
-    if ident_id:
-        notes.append(f"active route: {ident_id} · routing only")
-    lines = tooltip_header(rec, "Token Plan", notes)
-    lines.append("")
-    lines.extend(
-        window_lines(
-            [
-                weekly or window("weekly", "Account credits", None),
-                hottest or window("special", "Hottest account", None),
-            ],
-            report_count(rec),
-        )
-    )
-    if credits_remaining is not None and credits_total is not None:
-        lines.append(f"{_credits_label(credits_remaining)} of {_credits_label(credits_total)} credits left")
-    lines.extend(_row_section(account_usage))
-    lines.extend(_snapshot_section(rec))
-    return {
-        "text": text,
-        "tooltip": "\n".join(lines),
-        "class": classes,
-        "alt": "token-plan",
-    }
-
-
-def _charm_hyper_waybar_payload(rec: dict, logo: str) -> dict:
-    """Counter, not a meter: a prepaid balance has no ceiling to fill."""
-    credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
-    remaining = _token_plan_number(credits.get("remaining"))
-    counter = f"{_credits_label(remaining)}cr" if remaining is not None else "—"
-    text = f"{pango_escape(logo)} {pango_escape(counter)}"
-    measured_age = _timestamp_age_sec(rec.get("measured_at"))
-    classes = [str(rec.get("status") or "unknown")]
-    if measured_age is not None and measured_age > STALE_AFTER_SEC:
-        classes.append("stale")
-    floor = _charm_hyper_low_credits()
-    if remaining is not None and remaining <= 0:
-        classes.append("critical")
-    elif remaining is not None and floor is not None and remaining <= floor:
-        classes.append("warn")
-
-    rows = [row for row in rec.get("account_usage") or [] if isinstance(row, dict)]
-    notes = [f"total across {len(rows)} credentials"] if len(rows) > 1 else []
-    lines = tooltip_header(rec, "Charm Hyper", notes)
-    lines.append("")
-    if remaining is None:
-        lines.append("— credits left")
-    else:
-        line = f"<b>{pango_escape(_credits_label(remaining))}</b> credits left"
-        if rec.get("last_error") and rec.get("status") == "ok":
-            line += "  " + muted("(last good)")
-        lines.append(line)
-    hint = "prepaid · no reset window"
-    if floor is not None:
-        hint += f" · warns below {_credits_label(floor)}"
-    lines.append(muted(hint))
-    if len(rows) > 1:
-        lines.append("")
-        for index, row in enumerate(rows, 1):
-            line = f"{index:>2}  {pango_escape(_credits_label(row.get('remaining_credits')))} credits"
-            age = _timestamp_age_sec(row.get("fetched_at"))
-            if age is None:
-                line += "  " + muted("fetch time unknown")
-            elif age > STALE_AFTER_SEC:
-                line += "  " + muted(f"fetched {age_text(age)}")
-            lines.append(line)
-    lines.extend(_snapshot_section(rec))
-    if measured_age is not None:
-        lines.append(muted(f"updated {age_text(measured_age)}"))
-    return {
-        "text": text,
-        "tooltip": "\n".join(lines),
-        "class": classes,
-        "alt": "charm-hyper",
-    }
-
-
 def _anthropic_chip_pcts(rec: dict, rows: list[dict]) -> list[float | None]:
     """One reading per stored Claude credential, in OMP's report order.
 
@@ -3284,21 +2799,11 @@ def cmd_waybar() -> int:
     if not isinstance(rec, dict):
         rec = empty_provider(pid if pid in PROVIDER_INDEX else "codex", "unknown", "no_cache")
         rec["logo"] = PROVIDER_INDEX.get(pid, ("?", "?"))[1] if pid in PROVIDER_INDEX else "?"
-    if pid == "token-plan":
-        rec = attach_token_plan_identity(dict(rec))
-    elif pid == "cursor":
+    if pid == "cursor":
         rec = attach_cursor_identity(dict(rec))
     logo = str(rec.get("logo") or PROVIDER_INDEX.get(pid, ("?", "?"))[1])
     ident = rec.get("identity") if isinstance(rec.get("identity"), dict) else {}
     ident_id = str(ident.get("id") or ident.get("label") or "").strip()
-    if pid == "token-plan":
-        payload = _token_plan_waybar_payload(rec, logo, ident_id)
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-        return 0
-    if pid == "charm-hyper":
-        payload = _charm_hyper_waybar_payload(rec, logo)
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-        return 0
     mark = f"{logo} {ident_id}" if ident_id else logo
     rows = [item for item in rec.get("account_usage") or [] if isinstance(item, dict)]
     if pid == "anthropic":
@@ -3411,55 +2916,10 @@ def cmd_cycle(direction: str) -> int:
     return 0
 
 
-def _identity_helper_failed(pid: str, proc: subprocess.CompletedProcess[str] | None, unavailable: bool) -> int:
-    if unavailable:
-        print(f"{pid} swap-failed: helper unavailable", file=sys.stderr)
-        return 1
-    assert proc is not None
-    print(f"{pid} swap-failed: exit {proc.returncode}", file=sys.stderr)
-    return proc.returncode
-
-
 def cmd_identity(direction: str) -> int:
     """Cycle identities for the selected provider via its local swap helper."""
     cache = load_cache()
     selected = pick_selected(cache)
-    action = "toggle" if direction in ("next", "prev") else direction
-    if selected == "token-plan":
-        swap = os.environ.get("AI_USAGE_TOKEN_PLAN_SWAP") or which("token-plan-swap")
-        if swap is None:
-            print("token-plan: token-plan-swap not found", file=sys.stderr)
-            return 1
-        swap_env = child_env()
-        conf = token_plan_conf()
-        if conf.name == "alibaba-token-plan":
-            swap_env["XDG_CONFIG_HOME"] = str(conf.parent)
-        try:
-            proc = subprocess.run(
-                [swap, action],
-                env=swap_env,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return _identity_helper_failed("token-plan", None, True)
-        if proc.returncode != 0:
-            return _identity_helper_failed("token-plan", proc, False)
-        rec = cache.get("providers", {}).get("token-plan")
-        if not isinstance(rec, dict):
-            rec = _empty_token_plan("no_cache")
-        rec = dict(rec)
-        rec["id"] = "token-plan"
-        rec = attach_token_plan_identity(rec)
-        cache.setdefault("providers", {})["token-plan"] = rec
-        path = cache_path()
-        if path.exists():
-            atomic_write(path, json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
-        poke_waybar()
-        print((rec.get("identity") or {}).get("id") or "?")
-        return 0
     if selected == "kimi":
         rec = cache.get("providers", {}).get("kimi")
         rows = rec.get("account_usage") if isinstance(rec, dict) else None
@@ -3549,7 +3009,7 @@ def main(argv: list[str] | None = None) -> int:
     ensure_path()
     try:
         sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - best-effort encoding setup
         pass
     parser = build_parser()
     args = parser.parse_args(argv)
