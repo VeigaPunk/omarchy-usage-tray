@@ -2,17 +2,20 @@
 
 Waybar chip for Omarchy: Codex, Grok, Kimi, Cursor, Devin (both
 accounts), OpenCode Go, Z.ai, MiniMax, Google, Anthropic, Command
-Code, and Inception usage.
+Code, Inception, and OpenDesign usage.
 Left-click or scroll to cycle providers; right-click cycles identities for the
 selected provider when supported.
 
-Current release: **1.12.0** (`ai-usage --version`).
+Current release: **1.13.0** (`ai-usage --version`).
 
-Every usage meter except Inception's comes from
+Every usage meter except Inception's and OpenDesign's comes from
 `omp usage --provider <id> --json` — the native CLIs (codex, grok,
 cursor-agent, devin) are not required, because OMP meters those same
 subscriptions from its auth store. Inception has no usage API, so its meter is
 a ledger of the tokens OMP spent (see [Inception tokens](#inception-tokens)).
+OpenDesign's API keys cannot read their quota, so the chip signs in to each
+OpenDesign account with the official `vela` CLI and reads the Coding Plan from
+the account API (see [OpenDesign Coding Plan](#opendesign-coding-plan)).
 The chip only scopes to authed, metered providers (status ok, a numeric window,
 or a credit balance — see `_provider_usable`): a provider that cannot show a
 real number drops out of the cycle instead of rendering an invented zero.
@@ -22,8 +25,8 @@ real number drops out of the cycle instead of rendering an invented zero.
 ## Providers
 
 Every provider below is metered on every probe, from `omp usage --json` (or,
-for Inception, OMP's transcripts), and the chip renders whichever one is
-selected.
+for Inception, OMP's transcripts, and for OpenDesign, its account API), and the
+chip renders whichever one is selected.
 
 | Logo | Provider | Windows the chip shows | Source |
 |---|---|---|---|
@@ -40,6 +43,7 @@ selected.
 | `A` | Anthropic | One meter per account, filled to its binding window: 5-hour, weekly 7-day, or a per-model weekly cap (e.g. Fable) | `omp usage --provider anthropic --json` |
 | `⌘` | Command Code | Weekly + 5-hour credit windows, hottest account, credit balance across accounts | `omp usage --provider commandcode --json` |
 | `I` | Inception | Fleet tokens used of the 100M-per-key grant, hottest key, tokens left | OMP session transcripts + auth store (no usage API) |
+| `◇` | OpenDesign | One meter per account, filled to its binding Coding Plan window (5-hour or weekly credits); wallet balance | `ai-usage login amr` (`vela login`) + `amr-api.open-design.ai` billing preflight |
 
 Missing data is never invented: a window the provider did not answer renders as
 `—`, and a provider that cannot be reached keeps its last good meters and shows
@@ -127,6 +131,44 @@ only appended or replaced transcripts are read. Override the grant with
 `AI_USAGE_INCEPTION_EXPECTED_KEYS`, and the OMP directory with
 `AI_USAGE_OMP_AGENT_DIR`. Right-click is a no-op.
 
+### OpenDesign Coding Plan
+
+OpenDesign `sk-amr-` API keys have no usage endpoint
+([nexu-io/open-design#8674](https://github.com/nexu-io/open-design/issues/8674)),
+so `omp usage` lists them under `accountsWithoutUsage`. The quota lives on the
+account instead, and the account API needs a sign-in.
+
+Install the official CLI once with `npm install -g @powerformer/vela-cli`, then
+run `ai-usage login amr` once per OpenDesign account. It runs `vela login`,
+which prints a URL and a code and opens the browser; approve while signed in to
+that account. Re-running it for the same account replaces that account's slot.
+The meter is per account, not per key: keys created under one account share
+its plan.
+
+Each sign-in is stored as `~/.config/ai-usage/amr/<n>/config.json` (0600). The
+`vela_ctrl_` control key in it can read workspace and billing data and cannot
+yet be revoked from the console
+([#8870](https://github.com/nexu-io/open-design/issues/8870)). Delete a slot
+directory to drop that account.
+
+The probe reads `/api/v1/workspaces` to pick the personal workspace, then
+`/api/v1/workspaces/{id}/billing/preflight` for each window's used vs. limit
+credits — the same numbers as the console. Go plans have 5-hour and weekly
+windows; Plus, Pro and Max only weekly.
+
+The chip shows one slot per account in slot order, e.g. `◇ ▭ ▭ $4.00 —`: a meter
+for each plan account filled to its binding window, the wallet in dollars for
+a wallet-only account, and `—` for an account whose sign-in expired. The
+tooltip shows the weekly and 5-hour averages, the hottest account, the wallet
+total, and rows numbered by slot with the tier, binding window, and wallet, or
+an error such as `login expired`. If any account fails, the hottest account and
+the wallet total are withheld instead of understated. When at least one account
+still reports, the reason reads `partial_usage`.
+
+The meters refresh with the 5-minute probe. Override the slot directory with
+`AI_USAGE_AMR_DIR`, the `vela` binary with `AI_USAGE_VELA_BIN`, and the API
+base URL with `AI_USAGE_AMR_API_URL`. Right-click is a no-op.
+
 ## Install
 
 Quattro bar:
@@ -150,7 +192,7 @@ cd omarchy-usage-tray
 
 Re-run `./install.sh` from the checkout to update.
 
-Dependencies: Python 3, `omp` on `PATH` for the meters, and either the Omarchy Quattro shell or Waybar. The Waybar install's refresh timer is a systemd user unit; Quattro needs none. No sudo.
+Dependencies: Python 3, `omp` on `PATH` for the meters, and either the Omarchy Quattro shell or Waybar. `vela` is needed only to sign in to OpenDesign. The Waybar install's refresh timer is a systemd user unit; Quattro needs none. No sudo.
 
 ## Remove
 
@@ -159,7 +201,7 @@ Dependencies: Python 3, `omp` on `PATH` for the meters, and either the Omarchy Q
 omarchy plugin remove io.github.veigapunk.usage-tray
 ```
 
-`./uninstall.sh` stops `ai-usage.timer`, deletes the user units, and drops the `custom/ai-usage` Waybar module and Hyprland rule. It leaves `~/.config/ai-usage/env` alone. Delete the `#custom-ai-usage` rules in `~/.config/waybar/style.css` if you still want them gone. `omarchy plugin remove` disables the Quattro widget and its refresh service before deleting the checkout; the cache in `~/.cache/ai-usage/` stays until you delete it.
+`./uninstall.sh` stops `ai-usage.timer`, deletes the user units, and drops the `custom/ai-usage` Waybar module and Hyprland rule. It leaves `~/.config/ai-usage/env` and the OpenDesign sign-ins in `~/.config/ai-usage/amr` alone; delete that directory to remove them. Delete the `#custom-ai-usage` rules in `~/.config/waybar/style.css` if you still want them gone. `omarchy plugin remove` disables the Quattro widget and its refresh service before deleting the checkout; the cache in `~/.cache/ai-usage/` stays until you delete it.
 
 ## What it does
 
@@ -184,9 +226,9 @@ Waybar themselves. The 60s interval is only a safety net, so the chart can
 never sit on a stale provider.
 
 Multi-account providers report one snapshot per stored credential. The chip
-shows an average followed by the hottest account (Anthropic: one meter per
-account). Hover for aligned visual meters, whole percentages, and short reset
-countdowns (`2d 14h`, `45m`).
+shows an average followed by the hottest account (Anthropic and OpenDesign:
+one meter per account). Hover for aligned visual meters, whole percentages,
+and short reset countdowns (`2d 14h`, `45m`).
 Multi-account rows focus on each snapshot's binding window; fetch ages appear
 only when stale, and missing/disabled credentials remain explicit. The account
 count appears once in the header unless a window has fewer reports. OMP exposes
@@ -206,10 +248,11 @@ gateway round-robins new sessions across the stored `kimi-code` credentials and
 retries on the other account after a usage-limit block, so the chip meters the
 fleet and right-click just reports the balanced state. Cursor / Codex / Grok /
 OpenCode Go / Z.ai / MiniMax / Google / Anthropic / Command Code /
-Inception stay no-ops — OpenCode Go keys rotate inside OMP, and Cursor's,
-MiniMax's, Google's, Anthropic's, Command Code's, and Inception's credentials
-live in OMP's auth store, so none has a live file for the chip to
-flip.
+Inception / OpenDesign stay no-ops — OpenCode Go keys rotate inside OMP, and
+Cursor's, MiniMax's, Google's, Anthropic's, Command Code's, and Inception's
+credentials live in OMP's auth store, so none has a live file for the chip to
+flip. OpenDesign's sign-ins live in the tray's own slots and are all metered at
+once, so there is nothing to rotate.
 
 ## Configuration
 
@@ -220,6 +263,7 @@ service environment for the 5-minute probe:
 #AI_USAGE_OMP_BIN=/home/you/.local/bin/omp
 #AI_USAGE_INCEPTION_TOKENS_PER_KEY=100000000
 #AI_USAGE_INCEPTION_EXPECTED_KEYS=4
+#AI_USAGE_AMR_DIR=/home/you/.config/ai-usage/amr
 ```
 
 Values are literal — systemd expands nothing inside the file. The same
@@ -247,7 +291,7 @@ zai
 
 `AI_USAGE_PROVIDERS_FILE` overrides that path (the tests point it at a temp
 file). With neither source set — or with a roster that names no known provider —
-all 13 providers stay active, so the default behaviour is unchanged. An unknown
+all 14 providers stay active, so the default behaviour is unchanged. An unknown
 id prints one warning line to stderr (`ai-usage: unknown provider in roster:
 <id>`, once per run) and is skipped; it never fails a probe.
 
@@ -261,6 +305,8 @@ as a record for it exists.
 To add a provider you have just authed, add a line to
 `~/.config/ai-usage/providers`. The systemd timer picks it up on its next run
 (5 minutes), or run `ai-usage probe` to fetch it immediately.
+An existing `~/.config/ai-usage/providers` must list `amr` for the chip to
+cycle to OpenDesign.
 
 ## Local clone
 

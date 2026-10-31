@@ -245,17 +245,19 @@ if "$BIN" probe bogus-model >/dev/null 2>&1; then
   fail "probe accepted an unknown provider id"
 fi
 
-# No roster probes all 13 providers, as before. Inception reads OMP's auth store
-# and transcripts directly, so 12 of them call `omp usage` (Cursor also asks
-# `omp token cursor` for its usage summary).
+# No roster probes all 14 providers, as before. Inception reads OMP's auth
+# store and transcripts directly, so 12 of them call `omp usage` (Cursor also
+# asks `omp token cursor` for its usage summary). OpenDesign reads its own
+# sign-in slots instead of `omp usage`; this isolated HOME has none, so amr
+# resolves no_login without touching the network.
 unset AI_USAGE_PROVIDERS
 rm -f "$AI_USAGE_CACHE"
 : >"$AI_USAGE_OMP_LOG"
 "$BIN" probe >/dev/null
 [[ "$(grep -c '^usage ' "$AI_USAGE_OMP_LOG")" == 12 ]] ||
   fail "no-roster probe ran $(grep -c '^usage ' "$AI_USAGE_OMP_LOG") omp usage calls, want 12"
-[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 13 ]] ||
-  fail "no-roster probe did not cache 13 providers"
+[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 14 ]] ||
+  fail "no-roster probe did not cache 14 providers"
 
 # --- select stays unrestricted; chip row is roster-scoped --------------------
 

@@ -9,12 +9,16 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +27,7 @@ from pathlib import Path
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
 # User-facing release.
-TOOL_VERSION = "1.12.0"
+TOOL_VERSION = "1.13.0"
 METER_WIDTH = 6
 TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
@@ -46,6 +50,7 @@ PROVIDERS = (
     ("anthropic", "Anthropic", "A"),
     ("commandcode", "Command Code", "⌘"),
     ("inception", "Inception", "I"),
+    ("amr", "OpenDesign", "◇"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
 
@@ -361,7 +366,10 @@ def _has_meter(rec: dict) -> bool:
     Percent windows are the common case; a prepaid credit balance has no
     ceiling to meter, so an observed credit count is a meter too.
     """
-    if any("used_pct" in w for w in rec.get("windows") or [] if isinstance(w, dict)):
+    windows = [w for w in rec.get("windows") or [] if isinstance(w, dict)]
+    if any("used_pct" in w for w in windows):
+        return True
+    if any(isinstance(w.get("extra"), dict) and w["extra"].get("remaining_usd") is not None for w in windows):
         return True
     credits = rec.get("credits")
     return isinstance(credits, dict) and credits.get("remaining") is not None
@@ -1989,6 +1997,388 @@ def probe_inception() -> dict:
     return rec
 
 
+# --- OpenDesign (AMR) ----------------------------------------------------------
+
+# OpenDesign (AMR) API keys cannot read their own quota: the link host has no
+# usage endpoint (nexu-io/open-design#8674) and the account API rejects them,
+# so each account signs in with the official `vela login` device flow, which
+# writes a control key into a per-account slot dir under AI_USAGE_AMR_DIR. The
+# probe reads each account's Coding Plan windows and wallet from
+# /api/v1/workspaces and /billing/preflight with that control key. Cloudflare
+# 1010-blocks Python's default urllib User-Agent, so every request sends
+# ai-usage/<version>. Rows carry no identity: a slot number only, never an
+# email, user id, or workspace name.
+AMR_PROVIDER = "amr"
+AMR_DEFAULT_API_URL = "https://amr-api.open-design.ai"
+AMR_PROFILE = "prod"
+AMR_REQUEST_TIMEOUT = 15
+_AMR_CREDITS_RE = re.compile(r"^\d+$")
+_AMR_BALANCE_RE = re.compile(r"^-?\d+(\.\d+)?$")
+_AMR_ISO_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def amr_slots_root() -> Path:
+    return Path(os.environ.get("AI_USAGE_AMR_DIR", Path.home() / ".config/ai-usage/amr"))
+
+
+def _amr_slot_dirs(root: Path) -> list[tuple[int, Path]]:
+    """Numeric slot directories, sorted; config validity is checked per use."""
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return []
+    slots = [
+        (int(entry.name), entry)
+        for entry in entries
+        if entry.is_dir() and re.fullmatch(r"[1-9][0-9]*", entry.name)
+    ]
+    return sorted(slots)
+
+
+def _amr_slot_config(slot_dir: Path) -> dict | None:
+    """The `profiles.prod` block when the slot holds a usable control key."""
+    try:
+        data = json.loads((slot_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict):
+        return None
+    prod = profiles.get(AMR_PROFILE)
+    if not isinstance(prod, dict):
+        return None
+    control_key = prod.get("controlKey")
+    if not isinstance(control_key, str) or not control_key:
+        return None
+    return prod
+
+
+def _amr_slots(root: Path) -> list[tuple[int, Path, dict]]:
+    """Slots whose config parses with a usable control key, in slot order."""
+    out = []
+    for slot, slot_dir in _amr_slot_dirs(root):
+        prod = _amr_slot_config(slot_dir)
+        if prod is not None:
+            out.append((slot, slot_dir, prod))
+    return out
+
+
+def _amr_api_url(prod: dict) -> str:
+    """Slot API endpoint: env override wins, then the login's own apiUrl."""
+    override = os.environ.get("AI_USAGE_AMR_API_URL")
+    if override:
+        return override
+    api = prod.get("apiUrl")
+    if isinstance(api, str) and api.startswith(("http://", "https://")):
+        return api
+    return AMR_DEFAULT_API_URL
+
+
+def _amr_get(url: str, control_key: str, workspace_id: str | None = None):
+    """GET one account API path, or a bounded error code.
+
+    Cloudflare blocks the urllib default UA (error 1010), so the request
+    announces this tool. Reasons stay short and secret-free because they land
+    in the cache and the chip tooltip.
+    """
+    headers = {
+        "User-Agent": f"ai-usage/{TOOL_VERSION}",
+        "Authorization": f"Bearer {control_key}",
+        "Accept": "application/json",
+    }
+    if workspace_id is not None:
+        headers["x-vela-workspace-id"] = workspace_id
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=AMR_REQUEST_TIMEOUT) as response:
+            body = response.read()
+    except urllib.error.HTTPError as err:
+        if err.code == 401:
+            return None, "login_expired"
+        if err.code == 403:
+            return None, "forbidden"
+        return None, f"http_{err.code}"
+    except (socket.timeout, TimeoutError):
+        return None, "timeout"
+    except urllib.error.URLError as err:
+        if isinstance(getattr(err, "reason", None), (socket.timeout, TimeoutError)):
+            return None, "timeout"
+        return None, "network"
+    except OSError:
+        return None, "network"
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None, "bad_payload"
+    if not isinstance(data, dict):
+        return None, "bad_payload"
+    return data, None
+
+
+def _amr_iso(value) -> str | None:
+    """ISO time with up to 9 fractional digits and Z/offset, normalised to UTC."""
+    if not isinstance(value, str):
+        return None
+    match = _AMR_ISO_RE.match(value.strip())
+    if not match:
+        return None
+    date, hour, minute, second, frac, zone = match.groups()
+    text = f"{date}T{hour}:{minute}:{second}"
+    if frac:
+        # datetime keeps microseconds only; the fraction is dropped in output.
+        text += "." + frac[:6]
+    if zone is None or zone == "Z":
+        text += "+00:00"
+    elif len(zone) == 5:
+        text += zone[:3] + ":" + zone[3:]
+    else:
+        text += zone
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _amr_window_kind(duration_seconds) -> tuple[str, str, str] | None:
+    """(kind, short label, long label) for a window duration, or None."""
+    if not isinstance(duration_seconds, int) or isinstance(duration_seconds, bool) or duration_seconds <= 0:
+        return None
+    if duration_seconds == 18000:
+        return "session", "5h", "5 Hour limit"
+    if duration_seconds == 604800:
+        return "weekly", "7d", "Weekly limit"
+    if duration_seconds % 86400 == 0:
+        short = f"{duration_seconds // 86400}d"
+    elif duration_seconds % 3600 == 0:
+        short = f"{duration_seconds // 3600}h"
+    else:
+        short = f"{duration_seconds // 60}m"
+    return f"window-{duration_seconds}", short, f"{short} limit"
+
+
+def _amr_kind_order(kind: str) -> int:
+    if kind == "session":
+        return 18000
+    if kind == "weekly":
+        return 604800
+    if kind.startswith("window-") and kind[len("window-"):].isdigit():
+        return int(kind[len("window-"):])
+    return 1 << 62
+
+
+def _amr_kind_name(kind: str) -> str:
+    if kind == "weekly":
+        return "Weekly"
+    if kind == "session":
+        return "5 Hour"
+    info = _amr_window_kind(_amr_kind_order(kind)) if kind.startswith("window-") else None
+    return info[1] if info is not None else kind
+
+
+def _amr_slot_row(slot: int, prod: dict) -> tuple[dict | None, str | None, str | None]:
+    """One account's snapshot row, or a bounded error code.
+
+    Only the slot number, the window readouts, and the wallet reach the row:
+    the control key, account identity, and workspace id/name stay here.
+    """
+    control_key = prod["controlKey"]
+    api = _amr_api_url(prod)
+    workspaces, failure = _amr_get(f"{api}/api/v1/workspaces", control_key)
+    if failure is not None:
+        return None, failure, None
+    items = workspaces.get("items")
+    if not isinstance(items, list):
+        return None, "bad_payload", None
+    candidates = [
+        item
+        for item in items
+        if isinstance(item, dict) and item.get("memberStatus") == "active" and item.get("lifecycleState") == "active"
+    ]
+    workspace = next((item for item in candidates if item.get("workspaceType") == "personal"), None)
+    if workspace is None:
+        workspace = candidates[0] if candidates else None
+    if workspace is None:
+        return None, "no_workspace", None
+    workspace_id = workspace.get("workspaceId")
+    if not isinstance(workspace_id, str) or not workspace_id:
+        return None, "bad_payload", None
+    quoted = urllib.parse.quote(workspace_id, safe="")
+    preflight, failure = _amr_get(
+        f"{api}/api/v1/workspaces/{quoted}/billing/preflight", control_key, workspace_id=workspace_id
+    )
+    if failure is not None:
+        return None, failure, workspace_id
+    wrapped = preflight.get("preflight")
+    if isinstance(wrapped, dict):
+        preflight = wrapped
+    coding_plan = preflight.get("codingPlan")
+    if not isinstance(coding_plan, dict):
+        return None, "bad_payload", workspace_id
+    plan_windows = coding_plan.get("windows")
+    if not isinstance(plan_windows, list):
+        return None, "bad_payload", workspace_id
+
+    row: dict = {
+        "slot": slot,
+        "fetched_at": _amr_iso(preflight.get("generatedAt"))
+        or _amr_iso(coding_plan.get("generatedAt"))
+        or iso_now(),
+    }
+    tier = coding_plan.get("tier")
+    if isinstance(tier, str):
+        cleaned = tier.strip()
+        if cleaned and cleaned.lower() != "unknown":
+            row["plan"] = cleaned.title()
+
+    row_windows: dict = {}
+    for entry in plan_windows:
+        if not isinstance(entry, dict):
+            continue
+        used = entry.get("usedCredits")
+        limit = entry.get("limitCredits")
+        if not (isinstance(used, str) and _AMR_CREDITS_RE.match(used)):
+            continue
+        if not (isinstance(limit, str) and _AMR_CREDITS_RE.match(limit)):
+            continue
+        if int(limit) <= 0:
+            continue
+        pct = ratio(int(used), int(limit))
+        if pct is None:
+            continue
+        kind_info = _amr_window_kind(entry.get("durationSeconds"))
+        if kind_info is None:
+            continue
+        kind, _short, long_label = kind_info
+        candidate = {"label": _short, "kind_label": long_label, "used_pct": pct}
+        resets_at = _amr_iso(entry.get("resetsAt"))
+        if resets_at:
+            candidate["resets_at"] = resets_at
+        current = row_windows.get(kind)
+        if current is None or pct > current["used_pct"]:
+            row_windows[kind] = candidate
+    if row_windows:
+        row["windows"] = row_windows
+        binding = max(row_windows.values(), key=lambda w: w["used_pct"])
+        row["label"] = binding["kind_label"]
+        row["used_pct"] = binding["used_pct"]
+        if binding.get("resets_at"):
+            row["resets_at"] = binding["resets_at"]
+
+    balance = preflight.get("balanceUsd")
+    if isinstance(balance, str) and _AMR_BALANCE_RE.match(balance):
+        row["remaining_usd"] = round(max(0.0, float(balance)), 2)
+    return row, None, workspace_id
+
+
+def _empty_amr() -> dict:
+    rec = empty_provider("amr", "unauth", "no_login")
+    rec["windows"] = [
+        window("weekly", "Weekly", None),
+        window("special", "Hottest account", None),
+    ]
+    rec["account_usage"] = []
+    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
+    return rec
+
+
+def probe_amr() -> dict:
+    slots = _amr_slots(amr_slots_root())
+    if not slots:
+        return _empty_amr()
+    rows: list[dict] = []
+    ok_rows: list[dict] = []
+    seen_workspaces: set[str] = set()
+    unreachable: str | None = None
+    for slot, _slot_dir, prod in slots:
+        if unreachable is not None:
+            # The host is unreachable; later slots would fail the same way.
+            rows.append({"slot": slot, "error": unreachable})
+            continue
+        row, failure, workspace_id = _amr_slot_row(slot, prod)
+        if failure is not None:
+            rows.append({"slot": slot, "error": failure})
+            if failure in ("network", "timeout"):
+                unreachable = failure
+            continue
+        if workspace_id is not None:
+            if workspace_id in seen_workspaces:
+                continue
+            seen_workspaces.add(workspace_id)
+        rows.append(row)
+        ok_rows.append(row)
+    failed_rows = [row for row in rows if "error" in row]
+
+    windows = []
+    kinds_present: list[str] = []
+    for row in ok_rows:
+        for kind in row.get("windows") or {}:
+            if kind not in kinds_present:
+                kinds_present.append(kind)
+    ordered_kinds = [kind for kind in ("weekly", "session") if kind in kinds_present]
+    ordered_kinds += sorted((k for k in kinds_present if k not in ("weekly", "session")), key=_amr_kind_order)
+    for kind in ordered_kinds:
+        pct, count, resets_at = _omp_window_average(ok_rows, kind)
+        name = _amr_kind_name(kind)
+        windows.append(window(kind, f"{count}-account {name}" if count > 0 else name, pct, resets_at))
+    if not windows:
+        windows.append(window("weekly", "Weekly", None))
+    if not failed_rows:
+        hottest = max((row for row in ok_rows if row.get("used_pct") is not None), key=lambda r: r["used_pct"], default=None)
+    else:
+        # A partial fleet cannot name its hottest account: the placeholder
+        # stays so the tooltip keeps its shape.
+        hottest = None
+    windows.append(
+        window(
+            "special",
+            "Hottest account",
+            hottest["used_pct"] if hottest is not None else None,
+            hottest.get("resets_at") if hottest is not None else None,
+        )
+    )
+    if not failed_rows and ok_rows and all("remaining_usd" in row for row in ok_rows):
+        total = round(sum(row["remaining_usd"] for row in ok_rows), 2)
+        windows.append(window("credits", "Wallet", None, extra={"remaining_usd": total}))
+
+    rec = {
+        "id": "amr",
+        "name": "OpenDesign",
+        "logo": "◇",
+        "windows": windows,
+        "account_usage": rows,
+        "snapshot": {
+            "reports": len(ok_rows),
+            "accounts_without_usage": len(failed_rows),
+            "disabled_credentials": 0,
+        },
+    }
+    plans = []
+    for row in ok_rows:
+        plan = row.get("plan")
+        if plan and plan not in plans:
+            plans.append(plan)
+    if plans:
+        rec["plan"] = " · ".join(plans)
+    if any(row.get("used_pct") is not None or "remaining_usd" in row for row in ok_rows):
+        rec["status"] = "ok"
+        if failed_rows:
+            rec["reason"] = "partial_usage"
+    elif failed_rows and len(failed_rows) == len(rows) and all(row["error"] == "login_expired" for row in failed_rows):
+        rec["status"] = "unauth"
+        rec["reason"] = "login_expired"
+    else:
+        rec["status"] = "unknown"
+        rec["reason"] = failed_rows[0]["error"] if failed_rows else "no_used_pct"
+    if not failed_rows and ok_rows:
+        rec["measured_at"] = min(row["fetched_at"] for row in ok_rows)
+    return rec
+
+
 # --- Grok --------------------------------------------------------------------
 
 
@@ -2404,6 +2794,13 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
                 )
                 lines.append("")
                 continue
+            wallet = _token_plan_number(extra_bits.get("remaining_usd")) if pct is None else None
+            if wallet is not None:
+                lines.append(f"{label:<28} ${float(extra_bits['remaining_usd']):.2f}")
+                if rec.get("id") == "amr":
+                    lines.append("wallet balance · spent after the Coding Plan windows")
+                lines.append("")
+                continue
             lines.append(f"{label:<28} {_pct_label(pct):>4}")
             lines.append(tui_meter(pct))
             reset = format_reset_in(w.get("resets_at"))
@@ -2515,6 +2912,7 @@ PROBERS = {
     "anthropic": probe_anthropic,
     "commandcode": probe_commandcode,
     "inception": probe_inception,
+    "amr": probe_amr,
 }
 
 
@@ -2532,6 +2930,10 @@ def summarize(rec: dict) -> str:
     for w in rec.get("windows") or []:
         if isinstance(w, dict) and "used_pct" in w:
             bits.append(f"{w.get('kind')}={w['used_pct']}")
+        if isinstance(w, dict):
+            extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
+            if _token_plan_number(extra_bits.get("remaining_usd")) is not None:
+                bits.append(f"wallet=${float(extra_bits['remaining_usd']):.2f}")
     credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
     remaining = _token_plan_number(credits.get("remaining"))
     if remaining is not None:
@@ -2555,6 +2957,61 @@ def cmd_probe(ids: list[str]) -> int:
     write_selected(cache["selected"])
     save_cache(cache)
     return 0
+
+
+def cmd_login(pid: str) -> int:
+    """Sign a provider account in; only OpenDesign (AMR) supports it so far."""
+    override = os.environ.get("AI_USAGE_VELA_BIN")
+    vela = override if override else which("vela")
+    if not vela or not Path(vela).is_file() or not os.access(vela, os.X_OK):
+        print(
+            "ai-usage: vela CLI not found; install it with: npm install -g @powerformer/vela-cli",
+            file=sys.stderr,
+        )
+        return 1
+    root = amr_slots_root()
+    existing = [slot for slot, _dir in _amr_slot_dirs(root)]
+    slot = (max(existing) if existing else 0) + 1
+    slot_dir = root / str(slot)
+    ensure_dir(root, 0o700)
+    ensure_dir(slot_dir, 0o700)
+    env = child_env()
+    env["AMR_HOME"] = str(slot_dir)
+    env["VELA_PROFILE"] = "prod"
+    for key in ("VELA_CONTROL_KEY", "VELA_RUNTIME_KEY", "OPEN_DESIGN_AMR_PROFILE"):
+        env.pop(key, None)
+    try:
+        result = subprocess.run([vela, "login"], env=env)
+    except KeyboardInterrupt:
+        shutil.rmtree(slot_dir, ignore_errors=True)
+        return 130
+    except OSError:
+        result = None
+    if result is None or result.returncode != 0 or _amr_slot_config(slot_dir) is None:
+        shutil.rmtree(slot_dir, ignore_errors=True)
+        print("ai-usage: OpenDesign sign-in did not complete", file=sys.stderr)
+        return 1
+    try:
+        os.chmod(slot_dir / "config.json", 0o600)
+    except OSError:
+        pass
+    prod = _amr_slot_config(slot_dir) or {}
+    user = prod.get("user") if isinstance(prod.get("user"), dict) else {}
+    new_user_id = user.get("id")
+    for other_slot, other_dir in _amr_slot_dirs(root):
+        if other_slot == slot or not new_user_id:
+            continue
+        other_prod = _amr_slot_config(other_dir)
+        if other_prod is None:
+            continue
+        other_user = other_prod.get("user") if isinstance(other_prod.get("user"), dict) else {}
+        if other_user.get("id") == new_user_id:
+            shutil.rmtree(other_dir)
+            print(f"ai-usage: replaced slot {other_slot} (same OpenDesign account)")
+    email = user.get("email")
+    who = email if isinstance(email, str) and email.strip() else "account"
+    print(f"ai-usage: OpenDesign {who} signed in as slot {slot}")
+    return cmd_probe(["amr"])
 
 
 # --- Renderer ----------------------------------------------------------------
@@ -2696,6 +3153,10 @@ def window_lines(windows: list[dict], accounts: int) -> list[str]:
             amount = pango_escape(_credits_label(balance))
             out.append(f"{pango_escape(label.ljust(width))}  {amount} credits left")
             continue
+        wallet = _token_plan_number(extra_bits.get("remaining_usd")) if pct is None else None
+        if wallet is not None:
+            out.append(f"{pango_escape(label.ljust(width))}  ${float(extra_bits['remaining_usd']):.2f} left")
+            continue
         bar = tooltip_meter(pct)
         line = f"{pango_escape(label.ljust(width))}  {bar} {pango_escape(_pct_label(pct).rjust(4))}"
         tail = []
@@ -2714,29 +3175,42 @@ def usage_row_line(index: int, row: dict) -> str:
     """One stored snapshot: meter, percent, what binds it, when it resets.
 
     The fetch time shows only once a row has gone stale; fresh rows need no
-    timestamp. OMP exposes no account identity, so rows are numbered.
+    timestamp. OMP exposes no account identity, so rows are numbered; AMR rows
+    carry their slot number instead.
     """
+    number = row.get("slot")
+    if not (isinstance(number, int) and not isinstance(number, bool)):
+        number = index
     pct = row.get("used_pct")
     bar = tooltip_meter(pct, METER_WIDTH)
-    line = f"{index:>2}  {bar} {pango_escape(_pct_label(pct).rjust(4))}"
+    line = f"{number:>2}  {bar} {pango_escape(_pct_label(pct).rjust(4))}"
     detail = []
-    account = str(row.get("account") or "").strip()
-    if account:
-        detail.append(account[:8])
-    label = re.sub(r"\s+limit$", "", str(row.get("label") or "").strip(), flags=re.IGNORECASE)
-    if label:
-        detail.append(label)
-    remaining = _token_plan_number(row.get("credits_remaining"))
-    total = _token_plan_number(row.get("credits_total"))
-    if remaining is not None and total is not None:
-        detail.append(f"{_credits_label(remaining)} of {_credits_label(total)} left")
-    tokens_left = _token_plan_number(row.get("tokens_remaining"))
-    tokens_total = _token_plan_number(row.get("tokens_total"))
-    if tokens_left is not None and tokens_total is not None:
-        detail.append(f"{_tokens_label(tokens_left)} of {_tokens_label(tokens_total)} tokens left")
-    balance = _token_plan_number(row.get("remaining_credits"))
-    if balance is not None:
-        detail.append(f"{_credits_label(balance)} credits left")
+    error = row.get("error")
+    if isinstance(error, str) and error.strip():
+        detail.append(error.replace("_", " "))
+    else:
+        plan = str(row.get("plan") or "").strip()
+        if plan:
+            detail.append(plan)
+        account = str(row.get("account") or "").strip()
+        if account:
+            detail.append(account[:8])
+        label = re.sub(r"\s+limit$", "", str(row.get("label") or "").strip(), flags=re.IGNORECASE)
+        if label:
+            detail.append(label)
+        remaining = _token_plan_number(row.get("credits_remaining"))
+        total = _token_plan_number(row.get("credits_total"))
+        if remaining is not None and total is not None:
+            detail.append(f"{_credits_label(remaining)} of {_credits_label(total)} left")
+        tokens_left = _token_plan_number(row.get("tokens_remaining"))
+        tokens_total = _token_plan_number(row.get("tokens_total"))
+        if tokens_left is not None and tokens_total is not None:
+            detail.append(f"{_tokens_label(tokens_left)} of {_tokens_label(tokens_total)} tokens left")
+        balance = _token_plan_number(row.get("remaining_credits"))
+        if balance is not None:
+            detail.append(f"{_credits_label(balance)} credits left")
+        if _token_plan_number(row.get("remaining_usd")) is not None:
+            detail.append(f"${float(row['remaining_usd']):.2f} wallet")
     if detail:
         line += "  " + pango_escape(" · ".join(detail))
     tail = []
@@ -2811,6 +3285,23 @@ def cmd_waybar() -> int:
         # with an idle one would hide which credential still has headroom.
         pcts = _anthropic_chip_pcts(rec, rows)
         text = " ".join([pango_escape(mark), *(meter(pct) for pct in pcts)])
+    elif pid == "amr":
+        # One readout per signed-in account, in slot order: the window that
+        # binds it, the wallet when no window meters, a dash when neither.
+        bits = []
+        for row in rows:
+            pct = as_pct(row.get("used_pct"))
+            if pct is not None:
+                bits.append(meter(pct))
+            elif _token_plan_number(row.get("remaining_usd")) is not None:
+                usd = float(row["remaining_usd"])
+                bits.append(f"${usd:.0f}" if usd >= 10 else f"${usd:.2f}")
+            else:
+                bits.append(meter(None))
+        if not bits:
+            bits = [meter(None)]
+        text = " ".join([pango_escape(mark), *bits])
+        pcts = [as_pct(row.get("used_pct")) for row in rows]
     else:
         weekly = window_by_kind(rec, "weekly") or window_by_kind(rec, "monthly") or {}
         extra = extra_window(rec)
@@ -3002,6 +3493,8 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--dump", action="store_true", help="print dashboard and exit")
     sel = sub.add_parser("select", help="set selected provider")
     sel.add_argument("id")
+    login = sub.add_parser("login", help="sign in to a provider account")
+    login.add_argument("id", choices=("amr",))
     return p
 
 
@@ -3030,6 +3523,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_tui(dump=args.dump)
     if args.cmd == "select":
         return cmd_select(args.id)
+    if args.cmd == "login":
+        return cmd_login(args.id)
     parser.print_help()
     return 2
 
