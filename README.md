@@ -149,9 +149,11 @@ a key is wired into OMP (`MISTRAL_API_KEY`, a `providers.mistral.apiKey` entry
 in `models.yml`, or a stored `mistral` credential) without reading the key.
 
 The chip renders `ⓜ $1.50`: spend so far this month. Set
-`AI_USAGE_MISTRAL_MONTHLY_BUDGET` (USD) to add a meter against that budget,
-e.g. `ⓜ ▬ $1.50`. The tooltip lists the month's totals (spend, tokens,
-replies, today's spend) and spend per model, costliest first.
+`AI_USAGE_MISTRAL_MONTHLY_BUDGET` to your workspace's monthly spend limit (USD;
+e.g. `165` for a $165/month limit) to add a meter against it, e.g.
+`ⓜ ▬ $1.50`, with `$1.50 of $165 · resets in …` in the tooltip. The limit
+resets with each calendar month. The tooltip lists the month's totals (spend,
+tokens, replies, today's spend) and spend per model, costliest first.
 
 Limits: requests made outside OMP, or in transcripts you deleted, are not seen,
 and the cost is OMP's price estimate, not Mistral's invoice. Right-click is a
@@ -289,7 +291,7 @@ service environment for the 5-minute probe:
 #AI_USAGE_OMP_BIN=/home/you/.local/bin/omp
 #AI_USAGE_INCEPTION_TOKENS_PER_KEY=100000000
 #AI_USAGE_INCEPTION_EXPECTED_KEYS=4
-#AI_USAGE_MISTRAL_MONTHLY_BUDGET=20
+#AI_USAGE_MISTRAL_MONTHLY_BUDGET=165
 #AI_USAGE_AMR_DIR=/home/you/.config/ai-usage/amr
 ```
 

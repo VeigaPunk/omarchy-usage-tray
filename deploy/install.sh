@@ -50,6 +50,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
 #AI_USAGE_OMP_BIN=$HOME/.local/bin/omp
 #AI_USAGE_INCEPTION_TOKENS_PER_KEY=100000000
 #AI_USAGE_INCEPTION_EXPECTED_KEYS=4
+# Mistral monthly spend limit in USD; resets each calendar month (UTC).
+#AI_USAGE_MISTRAL_MONTHLY_BUDGET=165
 #AI_USAGE_AMR_DIR=$HOME/.config/ai-usage/amr
 EOF
   chmod 600 "$ENV_FILE"
