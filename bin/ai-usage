@@ -27,7 +27,7 @@ from pathlib import Path
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
 # User-facing release.
-TOOL_VERSION = "1.13.0"
+TOOL_VERSION = "1.14.0"
 METER_WIDTH = 6
 TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
@@ -50,6 +50,7 @@ PROVIDERS = (
     ("anthropic", "Anthropic", "A"),
     ("commandcode", "Command Code", "⌘"),
     ("inception", "Inception", "I"),
+    ("mistral", "Mistral", "ⓜ"),
     ("amr", "OpenDesign", "◇"),
 )
 PROVIDER_INDEX = {pid: (name, logo) for pid, name, logo in PROVIDERS}
@@ -363,13 +364,17 @@ def child_env() -> dict:
 def _has_meter(rec: dict) -> bool:
     """Is this record worth retaining across a failed probe?
 
-    Percent windows are the common case; a prepaid credit balance has no
-    ceiling to meter, so an observed credit count is a meter too.
+    Percent windows are the common case; a prepaid credit balance or an
+    observed spend has no ceiling to meter, so its number is a meter too.
     """
     windows = [w for w in rec.get("windows") or [] if isinstance(w, dict)]
     if any("used_pct" in w for w in windows):
         return True
-    if any(isinstance(w.get("extra"), dict) and w["extra"].get("remaining_usd") is not None for w in windows):
+    if any(
+        isinstance(w.get("extra"), dict)
+        and (w["extra"].get("remaining_usd") is not None or w["extra"].get("spent_usd") is not None)
+        for w in windows
+    ):
         return True
     credits = rec.get("credits")
     return isinstance(credits, dict) and credits.get("remaining") is not None
@@ -1727,10 +1732,10 @@ def probe_commandcode() -> dict:
 INCEPTION_PROVIDER = "inception"
 INCEPTION_TOKENS_PER_KEY = 100_000_000
 INCEPTION_LEDGER_VERSION = 1
-# Transcripts are read in chunks and only lines naming the provider are
-# parsed: the corpus runs to gigabytes and almost none of it is Inception.
+# Transcripts are read in chunks and only lines carrying the provider's needle
+# are parsed: the corpus runs to gigabytes and almost none of it is one provider.
 INCEPTION_NEEDLE = b"inception"
-INCEPTION_CHUNK = 8 << 20
+TRANSCRIPT_CHUNK = 8 << 20
 
 
 def omp_agent_dir() -> Path:
@@ -1821,11 +1826,11 @@ def _inception_entry(line: bytes) -> list | None:
     return [key, cred, int(tokens)]
 
 
-def _inception_scan(path: Path, offset: int) -> tuple[list, int]:
-    """Inception replies in complete lines from `offset`, and where they end.
+def _transcript_scan(path: Path, offset: int, needle: bytes, parse) -> tuple[list, int]:
+    """`parse(line)` items for complete lines from `offset`, and where they end.
 
-    A trailing partial line is left for the next probe, so an append in
-    progress is never half-counted.
+    Only lines containing `needle` are parsed. A trailing partial line is left
+    for the next probe, so an append in progress is never half-counted.
     """
     entries: list = []
     consumed = offset
@@ -1833,7 +1838,7 @@ def _inception_scan(path: Path, offset: int) -> tuple[list, int]:
     with path.open("rb") as fh:
         fh.seek(offset)
         while True:
-            chunk = fh.read(INCEPTION_CHUNK)
+            chunk = fh.read(TRANSCRIPT_CHUNK)
             if not chunk:
                 break
             data = carry + chunk
@@ -1843,30 +1848,31 @@ def _inception_scan(path: Path, offset: int) -> tuple[list, int]:
                 continue
             body, carry = data[: cut + 1], data[cut + 1 :]
             consumed += len(body)
-            if INCEPTION_NEEDLE not in body:
+            if needle not in body:
                 continue
             for line in body.split(b"\n"):
-                if INCEPTION_NEEDLE in line:
-                    item = _inception_entry(line)
+                if needle in line:
+                    item = parse(line)
                     if item is not None:
                         entries.append(item)
     return entries, consumed
 
 
-def _inception_ledger() -> dict:
-    """Tokens per credential id across every OMP transcript, read incrementally.
+def _transcript_ledger(ledger_path: Path, version: int, needle: bytes, parse) -> list:
+    """Every `parse` item across OMP transcripts, read incrementally, deduplicated.
 
-    `inception-ledger.json` remembers each transcript's inode, size, mtime,
-    and read offset: unchanged files are skipped, appended ones are read from
-    the offset, and replaced or truncated ones are read again.
+    The ledger file remembers each transcript's inode, size, mtime, and read
+    offset: unchanged files are skipped, appended ones are read from the
+    offset, and replaced or truncated ones are read again. Items are lists
+    whose first element is a dedupe key (a forked or resumed session copies
+    earlier replies into a new file), so each reply is returned once.
     """
     root = omp_agent_dir() / "sessions"
-    ledger_path = inception_ledger_path()
     try:
         saved = json.loads(ledger_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         saved = {}
-    if not isinstance(saved, dict) or saved.get("version") != INCEPTION_LEDGER_VERSION:
+    if not isinstance(saved, dict) or saved.get("version") != version:
         saved = {}
     known = saved.get("files") if isinstance(saved.get("files"), dict) else {}
     files: dict = {}
@@ -1888,26 +1894,36 @@ def _inception_ledger() -> dict:
         offset = int(prev["offset"]) if resume else 0
         entries = list(prev.get("entries") or []) if resume else []
         try:
-            found, offset = _inception_scan(path, offset)
+            found, offset = _transcript_scan(path, offset, needle, parse)
         except OSError:
             continue
         entries.extend(found)
         files[name] = {"ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "offset": offset, "entries": entries}
     if changed or len(files) != len(known):
-        atomic_write(ledger_path, json.dumps({"version": INCEPTION_LEDGER_VERSION, "files": files}, separators=(",", ":")) + "\n")
+        atomic_write(ledger_path, json.dumps({"version": version, "files": files}, separators=(",", ":")) + "\n")
 
     seen: set = set()
+    items: list = []
+    for item in files.values():
+        for entry in item.get("entries") or []:
+            if entry[0] in seen:
+                continue
+            seen.add(entry[0])
+            items.append(entry)
+    return items
+
+
+def _inception_ledger() -> dict:
+    """Tokens per credential id across every OMP transcript."""
     by_credential: dict[int, int] = {}
     unattributed = 0
-    for item in files.values():
-        for key, cred, tokens in item.get("entries") or []:
-            if key in seen:
-                continue
-            seen.add(key)
-            if cred is None:
-                unattributed += tokens
-            else:
-                by_credential[cred] = by_credential.get(cred, 0) + tokens
+    for _key, cred, tokens in _transcript_ledger(
+        inception_ledger_path(), INCEPTION_LEDGER_VERSION, INCEPTION_NEEDLE, _inception_entry
+    ):
+        if cred is None:
+            unattributed += tokens
+        else:
+            by_credential[cred] = by_credential.get(cred, 0) + tokens
     return {"by_credential": by_credential, "unattributed": unattributed}
 
 
@@ -1995,6 +2011,198 @@ def probe_inception() -> dict:
     if disabled_count or unmetered_keys:
         rec["reason"] = "partial_usage"
     return rec
+
+
+# --- Mistral -------------------------------------------------------------------
+
+# Mistral API keys cannot read their own spend or limits: /v1 has no usage or
+# billing route, chat responses carry only per-minute rate-limit headers, and
+# the console's monthly usage sits behind a browser session. Mistral bills per
+# calendar month, so the meter is a ledger of what OMP spent this UTC month:
+# `usage.cost.total` (OMP's catalog price estimate, in USD) and tokens of every
+# `provider: mistral` reply in the session transcripts. With
+# AI_USAGE_MISTRAL_MONTHLY_BUDGET set (USD), the month window meters spend
+# against it; without one the chip shows the spend alone. Usage outside OMP,
+# or in deleted transcripts, is invisible, so the figure is a floor.
+MISTRAL_PROVIDER = "mistral"
+MISTRAL_LEDGER_VERSION = 1
+# OMP writes transcripts as compact JSON; a model name alone ("mistral-large")
+# must not pull a line from another provider into the parser.
+MISTRAL_NEEDLE = b'"provider":"mistral"'
+
+
+def mistral_ledger_path() -> Path:
+    return cache_path().parent / "mistral-ledger.json"
+
+
+def _mistral_budget() -> float | None:
+    raw = os.environ.get("AI_USAGE_MISTRAL_MONTHLY_BUDGET", "").strip().lstrip("$")
+    try:
+        budget = float(raw)
+    except ValueError:
+        return None
+    return budget if math.isfinite(budget) and budget > 0 else None
+
+
+def _mistral_key_configured() -> bool:
+    """Is a Mistral key wired into OMP? Presence only; key material is never read.
+
+    OMP takes the key from MISTRAL_API_KEY, a `providers.mistral.apiKey` entry
+    in models.yml (literal, env name, or `!command`), or a credential stored by
+    `omp login mistral`.
+    """
+    if os.environ.get("MISTRAL_API_KEY", "").strip():
+        return True
+    models_yml = omp_agent_dir() / "models.yml"
+    try:
+        text = models_yml.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    block = re.search(r"(?m)^(?P<indent>[ \t]+)mistral:[ \t]*\n(?P<body>(?:(?P=indent)[ \t]+.*\n?|[ \t]*\n)*)", text)
+    if block and re.search(r"(?m)^[ \t]+apiKey:[ \t]*\S", block.group("body")):
+        return True
+    import sqlite3
+
+    db = omp_agent_dir() / "agent.db"
+    if not db.is_file():
+        return False
+    try:
+        con = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT 1 FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL LIMIT 1",
+                (MISTRAL_PROVIDER,),
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def _mistral_entry(line: bytes) -> list | None:
+    """[dedupe key, UTC day, model, tokens, cost USD] for one Mistral reply."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    if not isinstance(msg, dict) or msg.get("role") != "assistant" or msg.get("provider") != MISTRAL_PROVIDER:
+        return None
+    stamp = msg.get("timestamp")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or stamp <= 0:
+        return None
+    day = datetime.fromtimestamp(stamp / 1000, UTC).strftime("%Y-%m-%d")
+    usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+    tokens = _token_plan_number(usage.get("totalTokens"))
+    if tokens is None:
+        parts = [_token_plan_number(usage.get(k)) for k in ("input", "output", "cacheRead", "cacheWrite")]
+        tokens = sum(p for p in parts if p is not None)
+    cost = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
+    usd = _token_plan_number(cost.get("total"))
+    if not tokens and not usd:
+        return None
+    rid = msg.get("responseId")
+    key = rid if isinstance(rid, str) and rid else f"{stamp}:{msg.get('model')}:{tokens}"
+    return [key, day, str(msg.get("model") or "?"), int(tokens or 0), float(usd or 0)]
+
+
+def _mistral_month_bounds(now: datetime) -> tuple[str, str]:
+    """('YYYY-MM' of `now`, ISO start of the next UTC month)."""
+    year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+    return now.strftime("%Y-%m"), datetime(year, month, 1, tzinfo=UTC).isoformat().replace("+00:00", "Z")
+
+
+def _usd_label(value: float) -> str:
+    return f"${value:.0f}" if value >= 100 else f"${value:.2f}"
+
+
+def _empty_mistral(status: str, reason: str) -> dict:
+    rec = empty_provider(MISTRAL_PROVIDER, status, reason, plan="OMP ledger")
+    rec["windows"] = [window("monthly", "Month spend", None)]
+    rec["spend"] = {}
+    return rec
+
+
+def probe_mistral() -> dict:
+    if not _mistral_key_configured():
+        return _empty_mistral("unauth", "no_credentials")
+    try:
+        items = _transcript_ledger(mistral_ledger_path(), MISTRAL_LEDGER_VERSION, MISTRAL_NEEDLE, _mistral_entry)
+    except OSError:
+        return _empty_mistral("unknown", "ledger_unreadable")
+
+    now_dt = datetime.now(UTC)
+    month, resets_at = _mistral_month_bounds(now_dt)
+    today = now_dt.strftime("%Y-%m-%d")
+    usd = today_usd = 0.0
+    tokens = replies = 0
+    by_model: dict[str, dict] = {}
+    for _key, day, model, reply_tokens, reply_usd in items:
+        if not day.startswith(month):
+            continue
+        usd += reply_usd
+        tokens += reply_tokens
+        replies += 1
+        if day == today:
+            today_usd += reply_usd
+        row = by_model.setdefault(model, {"model": model, "usd": 0.0, "tokens": 0, "replies": 0})
+        row["usd"] += reply_usd
+        row["tokens"] += reply_tokens
+        row["replies"] += 1
+    budget = _mistral_budget()
+    extra: dict = {"spent_usd": round(usd, 4)}
+    if budget is not None:
+        extra["budget_usd"] = budget
+    models = sorted(by_model.values(), key=lambda r: (-r["usd"], -r["tokens"], r["model"]))
+    for row in models:
+        row["usd"] = round(row["usd"], 4)
+    return {
+        "id": MISTRAL_PROVIDER,
+        "name": "Mistral",
+        "logo": PROVIDER_INDEX[MISTRAL_PROVIDER][1],
+        "plan": "OMP ledger",
+        "status": "ok",
+        "windows": [
+            window(
+                "monthly",
+                "Month budget" if budget is not None else "Month spend",
+                min(usd / budget * 100, 100.0) if budget is not None else None,
+                resets_at,
+                extra=extra,
+            )
+        ],
+        "spend": {
+            "month": month,
+            "usd": round(usd, 4),
+            "today_usd": round(today_usd, 4),
+            "tokens": tokens,
+            "replies": replies,
+            "by_model": models,
+        },
+        "account_usage": [],
+        "measured_at": iso_now(),
+    }
+
+
+def mistral_spend_lines(rec: dict) -> list[str]:
+    """Plain-text month breakdown: totals, then spend per model, costliest first."""
+    spend = rec.get("spend") if isinstance(rec.get("spend"), dict) else {}
+    if not spend.get("month"):
+        return []
+    lines = [
+        f"{spend['month']}: {_usd_label(float(spend.get('usd') or 0))} · "
+        f"{_tokens_label(spend.get('tokens') or 0)} tokens · {spend.get('replies') or 0} replies · "
+        f"today {_usd_label(float(spend.get('today_usd') or 0))}"
+    ]
+    for row in spend.get("by_model") or []:
+        if isinstance(row, dict):
+            lines.append(
+                f"  {str(row.get('model'))[:30]:<30} {_usd_label(float(row.get('usd') or 0)):>7}  "
+                f"{_tokens_label(row.get('tokens') or 0)} tok"
+            )
+    lines.append("OMP catalog prices · replies OMP recorded, not usage elsewhere")
+    return lines
 
 
 # --- OpenDesign (AMR) ----------------------------------------------------------
@@ -2801,6 +3009,14 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
                     lines.append("wallet balance · spent after the Coding Plan windows")
                 lines.append("")
                 continue
+            spent = _token_plan_number(extra_bits.get("spent_usd")) if pct is None else None
+            if spent is not None:
+                lines.append(f"{label:<28} {_usd_label(float(spent))}")
+                reset = format_reset_in(w.get("resets_at"))
+                if reset:
+                    lines.append(("Resets in " if reset != "now" else "Resets ") + reset)
+                lines.append("")
+                continue
             lines.append(f"{label:<28} {_pct_label(pct):>4}")
             lines.append(tui_meter(pct))
             reset = format_reset_in(w.get("resets_at"))
@@ -2820,6 +3036,10 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
     elif unmetered_keys and tokens_total is not None:
         lines.append(f"{'Grant capacity':<28} {_tokens_label(tokens_total)} across {tokens.get('key_count')} keys")
         lines.append(f"{unmetered_keys} key(s) not in OMP; usage unknown")
+        lines.append("")
+    spend_lines = mistral_spend_lines(rec)
+    if spend_lines:
+        lines.extend(spend_lines)
         lines.append("")
     lines.append("h/l or 1-9 switch · r refresh · q quit")
     return "\n".join(lines) + "\n"
@@ -2912,6 +3132,7 @@ PROBERS = {
     "anthropic": probe_anthropic,
     "commandcode": probe_commandcode,
     "inception": probe_inception,
+    "mistral": probe_mistral,
     "amr": probe_amr,
 }
 
@@ -2934,6 +3155,8 @@ def summarize(rec: dict) -> str:
             extra_bits = w.get("extra") if isinstance(w.get("extra"), dict) else {}
             if _token_plan_number(extra_bits.get("remaining_usd")) is not None:
                 bits.append(f"wallet=${float(extra_bits['remaining_usd']):.2f}")
+            if _token_plan_number(extra_bits.get("spent_usd")) is not None:
+                bits.append(f"spent=${float(extra_bits['spent_usd']):.2f}")
     credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
     remaining = _token_plan_number(credits.get("remaining"))
     if remaining is not None:
@@ -3157,11 +3380,19 @@ def window_lines(windows: list[dict], accounts: int) -> list[str]:
         if wallet is not None:
             out.append(f"{pango_escape(label.ljust(width))}  ${float(extra_bits['remaining_usd']):.2f} left")
             continue
+        spent = _token_plan_number(extra_bits.get("spent_usd")) if pct is None else None
+        if spent is not None:
+            reset = reset_phrase(w.get("resets_at"))
+            line = f"{pango_escape(label.ljust(width))}  {_usd_label(float(spent))} spent"
+            out.append(line + ("  " + muted(reset) if reset else ""))
+            continue
         bar = tooltip_meter(pct)
         line = f"{pango_escape(label.ljust(width))}  {bar} {pango_escape(_pct_label(pct).rjust(4))}"
         tail = []
         if extra_bits.get("remaining_usd") is not None:
             tail.append(f"${float(extra_bits['remaining_usd']):.2f} left")
+        if extra_bits.get("spent_usd") is not None and extra_bits.get("budget_usd") is not None:
+            tail.append(f"{_usd_label(float(extra_bits['spent_usd']))} of {_usd_label(float(extra_bits['budget_usd']))}")
         reset = reset_phrase(w.get("resets_at"))
         if reset:
             tail.append(reset)
@@ -3285,6 +3516,16 @@ def cmd_waybar() -> int:
         # with an idle one would hide which credential still has headroom.
         pcts = _anthropic_chip_pcts(rec, rows)
         text = " ".join([pango_escape(mark), *(meter(pct) for pct in pcts)])
+    elif pid == "mistral":
+        # Month-to-date spend is the readout; a budget adds a meter before it.
+        month = window_by_kind(rec, "monthly") or {}
+        month_bits = month.get("extra") if isinstance(month.get("extra"), dict) else {}
+        spent = _token_plan_number(month_bits.get("spent_usd"))
+        pct = as_pct(month.get("used_pct"))
+        bits = [meter(pct)] if pct is not None else []
+        bits.append(_usd_label(float(spent)) if spent is not None else meter(None))
+        text = " ".join([pango_escape(mark), *bits])
+        pcts = [pct]
     elif pid == "amr":
         # One readout per signed-in account, in slot order: the window that
         # binds it, the wallet when no window meters, a dash when neither.
@@ -3369,6 +3610,11 @@ def cmd_waybar() -> int:
     # there are several to compare.
     if len(rows) > 1:
         lines.extend(_row_section(rows))
+    spend_lines = mistral_spend_lines(rec)
+    if spend_lines:
+        lines.append("")
+        lines.extend(pango_escape(line) for line in spend_lines[:-1])
+        lines.append(muted(spend_lines[-1]))
     lines.extend(_snapshot_section(rec))
     if age is not None:
         lines.append(muted(f"updated {age_text(age)}"))

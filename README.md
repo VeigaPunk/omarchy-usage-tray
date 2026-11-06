@@ -2,17 +2,18 @@
 
 Waybar chip for Omarchy: Codex, Grok, Kimi, Cursor, Devin (both
 accounts), OpenCode Go, Z.ai, MiniMax, Google, Anthropic, Command
-Code, Inception, and OpenDesign usage.
+Code, Inception, Mistral, and OpenDesign usage.
 Left-click or scroll to cycle providers; right-click cycles identities for the
 selected provider when supported.
 
-Current release: **1.13.0** (`ai-usage --version`).
+Current release: **1.14.0** (`ai-usage --version`).
 
-Every usage meter except Inception's and OpenDesign's comes from
+Every usage meter except Inception's, Mistral's, and OpenDesign's comes from
 `omp usage --provider <id> --json` — the native CLIs (codex, grok,
 cursor-agent, devin) are not required, because OMP meters those same
-subscriptions from its auth store. Inception has no usage API, so its meter is
-a ledger of the tokens OMP spent (see [Inception tokens](#inception-tokens)).
+subscriptions from its auth store. Inception and Mistral have no usage API, so
+their meters are ledgers of what OMP spent (see [Inception tokens](#inception-tokens)
+and [Mistral spend](#mistral-spend)).
 OpenDesign's API keys cannot read their quota, so the chip signs in to each
 OpenDesign account with the official `vela` CLI and reads the Coding Plan from
 the account API (see [OpenDesign Coding Plan](#opendesign-coding-plan)).
@@ -25,8 +26,8 @@ real number drops out of the cycle instead of rendering an invented zero.
 ## Providers
 
 Every provider below is metered on every probe, from `omp usage --json` (or,
-for Inception, OMP's transcripts, and for OpenDesign, its account API), and the
-chip renders whichever one is selected.
+for Inception and Mistral, OMP's transcripts, and for OpenDesign, its account
+API), and the chip renders whichever one is selected.
 
 | Logo | Provider | Windows the chip shows | Source |
 |---|---|---|---|
@@ -43,6 +44,7 @@ chip renders whichever one is selected.
 | `A` | Anthropic | One meter per account, filled to its binding window: 5-hour, weekly 7-day, or a per-model weekly cap (e.g. Fable) | `omp usage --provider anthropic --json` |
 | `⌘` | Command Code | Weekly + 5-hour credit windows, hottest account, credit balance across accounts | `omp usage --provider commandcode --json` |
 | `I` | Inception | Fleet tokens used of the 100M-per-key grant, hottest key, tokens left | OMP session transcripts + auth store (no usage API) |
+| `ⓜ` | Mistral | Month-to-date spend (USD, OMP catalog prices); optional monthly budget meter | OMP session transcripts + `models.yml` / auth store (no usage API) |
 | `◇` | OpenDesign | One meter per account, filled to its binding Coding Plan window (5-hour or weekly credits); wallet balance | `ai-usage login amr` (`vela login`) + `amr-api.open-design.ai` billing preflight |
 
 Missing data is never invented: a window the provider did not answer renders as
@@ -130,6 +132,30 @@ only appended or replaced transcripts are read. Override the grant with
 `AI_USAGE_INCEPTION_TOKENS_PER_KEY`, the expected key count with
 `AI_USAGE_INCEPTION_EXPECTED_KEYS`, and the OMP directory with
 `AI_USAGE_OMP_AGENT_DIR`. Right-click is a no-op.
+
+### Mistral spend
+
+Mistral API keys cannot read their own spend or limits: `/v1` has no usage or
+billing route, chat responses carry only per-minute rate-limit headers, and the
+console's monthly usage sits behind a browser session.
+
+Mistral bills per calendar month, so the chip meters what OMP spent this UTC
+month: the probe sums `usage.cost.total` (OMP's catalog price estimate, in USD)
+and tokens of every `provider: mistral` reply in
+`~/.omp/agent/sessions/**/*.jsonl`. It reads the transcripts incrementally
+through `~/.cache/ai-usage/mistral-ledger.json`, the same way the Inception
+ledger does, and counts each reply once by response id. The probe checks that
+a key is wired into OMP (`MISTRAL_API_KEY`, a `providers.mistral.apiKey` entry
+in `models.yml`, or a stored `mistral` credential) without reading the key.
+
+The chip renders `ⓜ $1.50`: spend so far this month. Set
+`AI_USAGE_MISTRAL_MONTHLY_BUDGET` (USD) to add a meter against that budget,
+e.g. `ⓜ ▬ $1.50`. The tooltip lists the month's totals (spend, tokens,
+replies, today's spend) and spend per model, costliest first.
+
+Limits: requests made outside OMP, or in transcripts you deleted, are not seen,
+and the cost is OMP's price estimate, not Mistral's invoice. Right-click is a
+no-op.
 
 ### OpenDesign Coding Plan
 
@@ -248,11 +274,11 @@ gateway round-robins new sessions across the stored `kimi-code` credentials and
 retries on the other account after a usage-limit block, so the chip meters the
 fleet and right-click just reports the balanced state. Cursor / Codex / Grok /
 OpenCode Go / Z.ai / MiniMax / Google / Anthropic / Command Code /
-Inception / OpenDesign stay no-ops — OpenCode Go keys rotate inside OMP, and
-Cursor's, MiniMax's, Google's, Anthropic's, Command Code's, and Inception's
-credentials live in OMP's auth store, so none has a live file for the chip to
-flip. OpenDesign's sign-ins live in the tray's own slots and are all metered at
-once, so there is nothing to rotate.
+Inception / Mistral / OpenDesign stay no-ops — OpenCode Go keys rotate inside
+OMP, and Cursor's, MiniMax's, Google's, Anthropic's, Command Code's,
+Inception's, and Mistral's credentials live in OMP, so none has a live file for
+the chip to flip. OpenDesign's sign-ins live in the tray's own slots and are
+all metered at once, so there is nothing to rotate.
 
 ## Configuration
 
@@ -263,6 +289,7 @@ service environment for the 5-minute probe:
 #AI_USAGE_OMP_BIN=/home/you/.local/bin/omp
 #AI_USAGE_INCEPTION_TOKENS_PER_KEY=100000000
 #AI_USAGE_INCEPTION_EXPECTED_KEYS=4
+#AI_USAGE_MISTRAL_MONTHLY_BUDGET=20
 #AI_USAGE_AMR_DIR=/home/you/.config/ai-usage/amr
 ```
 
