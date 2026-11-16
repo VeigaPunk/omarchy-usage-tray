@@ -19,10 +19,10 @@ scan_hits() {
   fi
 }
 
-note "== secret material in repo (fixtures/bin/deploy/systemd/tests) =="
+note "== secret material in repo (bin/deploy/systemd/tests) =="
 # Require token-shaped values, not denylist documentation (`sk-sp-|Bearer |eyJ`).
 SECRET_RE='sk-sp-[A-Za-z0-9]{8,}|sk-proj-[A-Za-z0-9]{8,}|sk-[A-Za-z0-9]{20,}|Bearer [A-Za-z0-9._-]{16,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.'
-for dir in fixtures bin deploy systemd tests; do
+for dir in bin deploy systemd tests; do
   [[ -d "$ROOT/$dir" ]] || continue
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
@@ -33,15 +33,13 @@ done
 
 note "== banned invocations in ship paths =="
 # omarchy refresh waybar copies stock config over ~/.config/waybar.
-# bl --verbose / grok --debug dump HTTP auth material to stderr.
+# bl --verbose dumps HTTP auth material to stderr.
 # Comments that document the ban do not count.
 BANNED=(
   'omarchy refresh waybar'
   'omarchy-refresh-waybar'
   'bl --verbose'
-  'grok --debug'
   'jq . ~/.codex/auth.json'
-  'jq . ~/.grok/auth.json'
 )
 strip_c_and_hash_comments() {
   python3 - "$1" <<'PY'
@@ -96,7 +94,7 @@ if [[ -f "$snippet" ]]; then
   else
     # path+line only
     printf 'exec at %s\n' "$(printf '%s\n' "$exec_line" | sed 's/:.*//')"
-    if printf '%s\n' "$exec_line" | grep -Eq 'probe|refresh|bl |grok |kimi |codex '; then
+    if printf '%s\n' "$exec_line" | grep -Eq 'probe|refresh|bl |codex '; then
       fail "waybar exec is not cache-only (PATH: deploy/waybar-ai-usage.jsonc)"
     fi
     if ! printf '%s\n' "$exec_line" | grep -Eq 'ai-usage waybar|usage\.py'; then

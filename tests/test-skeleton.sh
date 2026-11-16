@@ -112,12 +112,12 @@ print("PERCENT_BOUNDARIES_OK")
 # The chip is scoped to authed+metered providers, so the unauth provider only
 # renders once it is the sole remaining row in the cache.
 data = json.loads(cache_path.read_text())
-data["selected"] = "kimi"
+data["selected"] = "opencode-go"
 del data["providers"]["codex"]
-data["providers"]["kimi"] = {
-    "id": "kimi",
-    "name": "Kimi",
-    "logo": "K",
+data["providers"]["opencode-go"] = {
+    "id": "opencode-go",
+    "name": "OpenCode Go",
+    "logo": "O",
     "status": "unauth",
     "reason": "need_login",
     "windows": [
@@ -127,7 +127,7 @@ data["providers"]["kimi"] = {
 }
 cache_path.write_text(json.dumps(data))
 sel = Path(os.environ["AI_USAGE_SELECTED"])
-sel.write_text("kimi\n")
+sel.write_text("opencode-go\n")
 out = subprocess.check_output([bin_path, "waybar"], env=env, text=True)
 payload = json.loads(out)
 text = payload["text"]

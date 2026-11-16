@@ -38,7 +38,7 @@ mkdir -p "$UNIT_DIR"
 install -m 644 "$ROOT/systemd/ai-usage.service" "$UNIT_DIR/ai-usage.service"
 install -m 644 "$ROOT/systemd/ai-usage.timer" "$UNIT_DIR/ai-usage.timer"
 
-# Machine-local knobs (AI_USAGE_OMP_BIN, pool sizes, …) live outside the unit
+# Machine-local knobs (AI_USAGE_OMP_BIN, the Mistral budget, …) live outside the unit
 # so re-running this installer never clobbers them. systemd expands neither
 # variables nor %h inside the file, so the template carries literal paths.
 ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ai-usage/env"
@@ -48,8 +48,6 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # Local environment for ai-usage.service (optional; the unit tolerates it
 # being absent). Values are literal: no shell expansion happens here.
 #AI_USAGE_OMP_BIN=$HOME/.local/bin/omp
-#AI_USAGE_INCEPTION_TOKENS_PER_KEY=100000000
-#AI_USAGE_INCEPTION_EXPECTED_KEYS=4
 # Mistral monthly spend limit in USD; resets each calendar month (UTC).
 #AI_USAGE_MISTRAL_MONTHLY_BUDGET=165
 #AI_USAGE_AMR_DIR=$HOME/.config/ai-usage/amr
@@ -88,6 +86,6 @@ fi
 
 echo "omarchy-usage-tray installed"
 echo "  binary  $HOME/.local/bin/ai-usage -> $BIN"
-echo "  waybar  custom/ai-usage  (left/scroll = providers; right-click = identity)"
+echo "  waybar  custom/ai-usage  (left/scroll = providers)"
 echo "  timer   systemd --user ai-usage.timer (5 min)"
 echo "  backup  $CFG.bak.$STAMP"

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import math
 import os
@@ -27,7 +26,7 @@ from pathlib import Path
 # (`credits` + per-snapshot `credits_*`), so a v1 record must be re-probed.
 VERSION = 2
 # User-facing release.
-TOOL_VERSION = "1.14.0"
+TOOL_VERSION = "1.15.0"
 METER_WIDTH = 6
 TOOLTIP_METER_WIDTH = 10
 METER_FILL = "#f2f2f2"
@@ -38,18 +37,11 @@ STALE_AFTER_SEC = 20 * 60
 
 PROVIDERS = (
     ("codex", "Codex", "C"),
-    ("grok", "Grok", "G"),
-    ("kimi", "Kimi", "K"),
-    ("cursor", "Cursor", "R"),
-    ("devin", "Devin", "D"),
-    ("devin2", "Devin 2", "d"),
     ("opencode-go", "OpenCode Go", "O"),
-    ("zai", "Z.ai", "Z"),
     ("minimax", "MiniMax", "M"),
     ("google", "Google", "g"),
     ("anthropic", "Anthropic", "A"),
     ("commandcode", "Command Code", "⌘"),
-    ("inception", "Inception", "I"),
     ("mistral", "Mistral", "ⓜ"),
     ("amr", "OpenDesign", "◇"),
 )
@@ -268,7 +260,6 @@ def empty_provider(pid: str, status: str, reason: str | None = None, plan: str |
 def redact(text: str) -> str:
     text = re.sub(r"(?i)Bearer\s+\S+", "[redacted]", text)
     text = re.sub(r"eyJ[A-Za-z0-9_\-]+=*\.[A-Za-z0-9_\-\.]+", "[redacted]", text)
-    text = re.sub(r"devin-[A-Za-z0-9_\-]{8,}", "[redacted]", text)
     text = re.sub(r"sk-[A-Za-z0-9]{8,}", "[redacted]", text)
     text = re.sub(r"(?i)Bearer\s*", "", text)
     return text
@@ -310,9 +301,14 @@ def load_cache() -> dict:
     if not isinstance(data, dict):
         return {"version": VERSION, "updated_at": None, "selected": None, "providers": {}}
     data.setdefault("version", VERSION)
-    data.setdefault("providers", {})
-    if not isinstance(data["providers"], dict):
-        data["providers"] = {}
+    providers = data.get("providers")
+    # An id outside PROVIDERS (written by an older release) drops out here, so
+    # no reader renders, selects, or validates it.
+    data["providers"] = (
+        {pid: rec for pid, rec in providers.items() if pid in PROVIDER_INDEX} if isinstance(providers, dict) else {}
+    )
+    if data.get("selected") not in PROVIDER_INDEX:
+        data["selected"] = None
     return data
 
 
@@ -349,16 +345,6 @@ def which(name: str) -> str | None:
         if cand.is_file() and os.access(cand, os.X_OK):
             return str(cand)
     return None
-
-
-def child_env() -> dict:
-    env = os.environ.copy()
-    for key in (
-        "XAI_API_KEY",
-        "GROK_API_KEY",
-    ):
-        env.pop(key, None)
-    return env
 
 
 def _has_meter(rec: dict) -> bool:
@@ -419,33 +405,15 @@ def pick_selected(cache: dict) -> str:
 
 
 # --- OMP-metered providers ---------------------------------------------------
-# Every usage meter comes from `omp usage --provider ... --json`; the native
-# CLIs (codex, grok, cursor-agent, devin) are not required because OMP meters
-# those same subscriptions from its auth store. Cursor alone also reads its
-# usage summary, signed with OMP's Cursor login, for the Included total that
-# `omp usage` drops. PROVIDERS is scoped to
-# providers OMP actually answers for, so no auth is ever guessed.
+# Codex, OpenCode Go, MiniMax, Google, Anthropic, and Command Code meter from
+# `omp usage --provider ... --json`: OMP reads those subscriptions from its own
+# auth store, so no native CLI is needed and no auth is ever guessed. Mistral
+# and OpenDesign have no OMP meter and read their own sources.
 
 # provider id -> (omp provider, ((limit id, kind, short label, long label, primary), ...))
 OMP_FALLBACK_SPECS = {
     "codex": ("openai-codex", (
         ("openai-codex:primary", "weekly", "7d", "7 days", True),
-    )),
-    "grok": ("xai-oauth", (
-        ("xai-oauth:credits:1w", "weekly", "credits", "SuperGrok Weekly Credits", True),
-        ("xai-oauth:product:grokbuild:1w", "component", "build", "Grok Build (Weekly)", False),
-        ("xai-oauth:product:grokchat:1w", "component", "chat", "GrokChat (Weekly)", False),
-    )),
-    "cursor": ("cursor", (
-        ("cursor:usd:individual-auto", "monthly", "auto", "Auto", True),
-        ("cursor:usd:individual-api", "monthly", "api", "API", True),
-    )),
-    "devin": ("devin", (
-        ("devin:quota:weekly", "weekly", "7d", "Weekly Quota", True),
-    )),
-    # Same OMP provider as devin; probe_devin2 pins the second account row.
-    "devin2": ("devin", (
-        ("devin:quota:weekly", "weekly", "7d", "Weekly Quota", True),
     )),
     # MiniMax Token Plan: one shared "general" pool per credential, metered on
     # a rolling 5-hour and a 7-day window.
@@ -456,12 +424,9 @@ OMP_FALLBACK_SPECS = {
 }
 
 
-def _omp_fallback_rec(pid: str, report_index: int | None = None) -> dict | None:
-    """Build a provider record from `omp usage`.
-
-    report_index pins one account out of a multi-account provider (devin2);
-    None folds every report the provider answered into one record.
-    """
+def _omp_fallback_rec(pid: str) -> dict | None:
+    """Build a provider record from `omp usage`, folding every report the
+    provider answered into one record."""
     spec = OMP_FALLBACK_SPECS.get(pid)
     if spec is None:
         return None
@@ -474,10 +439,6 @@ def _omp_fallback_rec(pid: str, report_index: int | None = None) -> dict | None:
         for report in payload.get("reports") or []
         if isinstance(report, dict) and report.get("provider") == omp_provider
     ]
-    if report_index is not None:
-        if len(reports) <= report_index:
-            return None
-        reports = [reports[report_index]]
     if not reports:
         return None
 
@@ -568,9 +529,6 @@ def _provider_usable(rec) -> bool:
     for w in rec.get("windows") or []:
         if isinstance(w, dict) and w.get("used_pct") is not None:
             return True
-    burst = rec.get("burst")
-    if isinstance(burst, dict) and burst.get("used_pct") is not None:
-        return True
     credits = rec.get("credits")
     return bool(isinstance(credits, dict) and credits.get("remaining") is not None)
 
@@ -580,86 +538,6 @@ def _provider_usable(rec) -> bool:
 
 def probe_codex() -> dict:
     return _omp_fallback_rec("codex") or empty_provider("codex", "unauth", "no_omp_usage")
-
-
-def cursor_oauth_conf() -> Path:
-    return Path(
-        os.environ.get(
-            "AI_USAGE_CURSOR_OAUTH_CONF",
-            Path.home() / ".config" / "cursor-oauth",
-        )
-    )
-
-
-def cursor_oauth_identities() -> list[dict]:
-    path = cursor_oauth_conf() / "slots"
-    out: list[dict] = []
-    if not path.is_file():
-        return out
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("|")
-        sid = parts[0].strip()
-        if not sid:
-            continue
-        title = parts[2].strip() if len(parts) > 2 else sid
-        ident = parts[3].strip() if len(parts) > 3 else ""
-        out.append({"id": sid, "label": sid, "title": title or sid, "ident": ident})
-    return out
-
-
-def cursor_oauth_active_id() -> str | None:
-    path = cursor_oauth_conf() / "active"
-    if not path.is_file():
-        return None
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return value or None
-
-
-def cursor_oauth_slot_file(sid: str) -> Path:
-    return cursor_oauth_conf() / "identities" / sid / "auth.json"
-
-
-def cursor_parked_identities() -> list[dict]:
-    return [s for s in cursor_oauth_identities() if cursor_oauth_slot_file(s["id"]).is_file()]
-
-
-def attach_cursor_identity(rec: dict) -> dict:
-    parked = cursor_parked_identities()
-    if not parked:
-        return rec
-    rec = dict(rec)
-    active = cursor_oauth_active_id() or parked[0]["id"]
-    match = next((s for s in parked if s["id"] == active), parked[0])
-    rec["identity"] = {
-        "id": match["id"],
-        "label": match["id"],
-        "title": match.get("title") or match["id"],
-    }
-    rec["identities"] = [{"id": s["id"], "label": s["id"]} for s in parked]
-    return rec
-
-
-# Positive-integer override for pool sizes (Inception's per-key grant).
-def _token_plan_pool(env_name: str, default: int) -> int:
-    raw = os.environ.get(env_name)
-    if raw:
-        try:
-            value = int(float(raw))
-        except (TypeError, ValueError):
-            value = 0
-        if value > 0:
-            return value
-    return default
 
 
 def _credits_label(value) -> str:
@@ -717,7 +595,6 @@ def omp_usage_payload(provider: str) -> tuple[dict | None, str | None]:
             text=True,
             timeout=20,
             check=False,
-            env=child_env(),
         )
     except subprocess.TimeoutExpired:
         return None, "timeout"
@@ -946,148 +823,6 @@ def probe_opencode_go() -> dict:
     return rec
 
 
-# --- Z.ai ---------------------------------------------------------------------
-
-# Z.ai coding plan: OMP meters two credit pools per credential — a rolling 5
-# hour quota and the weekly quota — each answered as usedFraction plus an
-# absolute credit amount. Only the fraction is kept: the two pools are separate
-# ceilings, so a single credit counter on the chip would be ambiguous.
-ZAI_WINDOWS = (
-    ("zai:credits:5h", "session", "5h", "5 Hour limit"),
-    ("zai:credits:1w", "weekly", "7d", "Weekly limit"),
-)
-ZAI_KINDS = {wid: (kind, short, label) for wid, kind, short, label in ZAI_WINDOWS}
-
-
-def _zai_report(report: dict) -> dict:
-    """One credential snapshot, in percent, shaped like the OpenCode Go row."""
-    row: dict = {}
-    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
-    if fetched_at:
-        row["fetched_at"] = fetched_at
-    found: dict[str, tuple[float, str | None]] = {}
-    limits = report.get("limits")
-    for limit in limits if isinstance(limits, list) else []:
-        if not isinstance(limit, dict):
-            continue
-        if limit.get("id") not in ZAI_KINDS:
-            continue
-        amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
-        frac = _opencode_go_fraction(amount.get("usedFraction"))
-        if frac is None:
-            continue
-        win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
-        found[str(limit["id"])] = (frac, iso_from_unix(win.get("resetsAt") or limit.get("resetsAt")))
-    measured: dict[str, dict] = {}
-    for wid, kind, short, label in ZAI_WINDOWS:
-        if wid not in found:
-            continue
-        frac, resets_at = found[wid]
-        entry: dict = {"label": short, "kind_label": label, "used_pct": as_pct(frac * 100.0)}
-        if resets_at:
-            entry["resets_at"] = resets_at
-        measured[kind] = entry
-    if not measured:
-        return row
-    binding = max(measured.items(), key=lambda item: item[1].get("used_pct") or 0.0)[1]
-    row["windows"] = measured
-    row["label"] = binding["kind_label"]
-    row["used_pct"] = binding["used_pct"]
-    if binding.get("resets_at"):
-        row["resets_at"] = binding["resets_at"]
-    return row
-
-
-def _empty_zai(reason: str) -> dict:
-    rec = empty_provider("zai", "unknown", reason)
-    rec["windows"] = [
-        window("weekly", "Weekly", None),
-        window("session", "5 Hour", None),
-        window("special", "Hottest account", None),
-    ]
-    rec["account_usage"] = []
-    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
-    return rec
-
-
-def probe_zai() -> dict:
-    payload, failure = omp_usage_payload("zai")
-    if payload is None:
-        return _empty_zai(failure or "bad_payload")
-
-    raw_reports = payload["reports"]
-    reports = [
-        report
-        for report in raw_reports
-        if isinstance(report, dict) and report.get("provider") == "zai"
-    ]
-    rows = [_zai_report(report) for report in reports]
-    accounts_without_usage = payload.get("accountsWithoutUsage")
-    disabled_credentials = payload.get("disabledCredentials")
-    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
-    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
-    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
-
-    weekly, weekly_accounts, weekly_reset = _omp_window_average(rows, "weekly")
-    session, session_accounts, session_reset = _omp_window_average(rows, "session")
-
-    row_pcts = [row.get("used_pct") for row in rows]
-    complete_reports = (
-        bool(rows)
-        and len(raw_reports) == len(rows)
-        and isinstance(accounts_without_usage, list)
-        and missing_count == 0
-        and all(pct is not None for pct in row_pcts)
-        and all(isinstance(row.get("fetched_at"), str) for row in rows)
-    )
-    declared_accounts = _omp_declared_accounts(payload, "zai")
-    under_reported = declared_accounts is not None and len(rows) != declared_accounts
-    complete_coverage = complete_reports and not under_reported
-    hottest = max(row_pcts) if complete_coverage and row_pcts else None
-    hottest_reset = None
-    if hottest is not None:
-        hottest_reset = next(
-            (row.get("resets_at") for row in rows if row.get("used_pct") == hottest and row.get("resets_at")),
-            None,
-        )
-    status = "ok" if weekly is not None else "unknown"
-    windows = [
-        window(
-            "weekly",
-            f"{weekly_accounts}-account weekly" if weekly_accounts else "Weekly",
-            weekly,
-            weekly_reset,
-        ),
-        window(
-            "session",
-            f"{session_accounts}-account 5 Hour" if session_accounts else "5 Hour",
-            session,
-            session_reset,
-        ),
-        window("special", "Hottest account", hottest, hottest_reset),
-    ]
-    rec = {
-        "id": "zai",
-        "name": "Z.ai",
-        "logo": "Z",
-        "status": status,
-        "windows": windows,
-        "account_usage": rows,
-        "snapshot": {
-            "reports": len(rows),
-            "accounts_without_usage": missing_count,
-            "disabled_credentials": disabled_count,
-        },
-    }
-    timestamps = [row.get("fetched_at") for row in rows]
-    if complete_reports and all(isinstance(stamp, str) for stamp in timestamps):
-        rec["measured_at"] = min(timestamps)
-    if status != "ok":
-        rec["reason"] = "no_used_pct"
-    elif not complete_coverage or disabled_count > 0 or not lists_valid:
-        rec["reason"] = "partial_usage"
-    return rec
-
 # --- Google -------------------------------------------------------------------
 
 # OMP meters the Google Antigravity account as `google-antigravity`: one report
@@ -1106,7 +841,7 @@ GOOGLE_KINDS = {pool: (kind, short, label) for pool, kind, short, label in GOOGL
 
 
 def _google_report(report: dict) -> dict:
-    """One credential snapshot, in percent, shaped like the Z.ai row."""
+    """One credential snapshot, in percent, shaped like the OpenCode Go row."""
     row: dict = {}
     fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
     if fetched_at:
@@ -1719,300 +1454,6 @@ def probe_commandcode() -> dict:
     return rec
 
 
-# --- Inception ---------------------------------------------------------------
-
-# Inception (Mercury) API keys carry a one-time 100M-token grant per account,
-# but the API answers no quota (its OpenAPI spec lists only completions and
-# models) and the console balance sits behind a session cookie. OMP stores
-# each key as an `inception` api_key credential and stamps every assistant
-# message it records with that credential's id, so the meter is a ledger: the
-# tokens OMP spent per key, summed from its session transcripts, against the
-# per-key grant. Usage made outside OMP, or in deleted transcripts, is
-# invisible to it, and the record says so.
-INCEPTION_PROVIDER = "inception"
-INCEPTION_TOKENS_PER_KEY = 100_000_000
-INCEPTION_LEDGER_VERSION = 1
-# Transcripts are read in chunks and only lines carrying the provider's needle
-# are parsed: the corpus runs to gigabytes and almost none of it is one provider.
-INCEPTION_NEEDLE = b"inception"
-TRANSCRIPT_CHUNK = 8 << 20
-
-
-def omp_agent_dir() -> Path:
-    return Path(os.environ.get("AI_USAGE_OMP_AGENT_DIR", Path.home() / ".omp/agent"))
-
-
-def inception_ledger_path() -> Path:
-    return cache_path().parent / "inception-ledger.json"
-
-
-def _inception_tokens_per_key() -> int:
-    return _token_plan_pool("AI_USAGE_INCEPTION_TOKENS_PER_KEY", INCEPTION_TOKENS_PER_KEY)
-
-def _inception_expected_key_count(default: int) -> int:
-    """Expected live keys, allowing an explicit slot for a key outside OMP."""
-    raw = os.environ.get("AI_USAGE_INCEPTION_EXPECTED_KEYS")
-    if not raw:
-        return default
-    try:
-        expected = int(raw)
-    except ValueError:
-        return default
-    return max(default, expected) if expected > 0 else default
-
-
-def _tokens_label(value) -> str:
-    """Compact token readout: 400000000 -> 400M, 99876543 -> 99.9M, 12345 -> 12k."""
-    number = _token_plan_number(value)
-    if number is None:
-        return "—"
-    amount = float(number)
-    if amount >= 1_000_000:
-        millions = amount / 1_000_000
-        if millions >= 100:
-            return f"{round_half_up(millions)}M"
-        return f"{millions:.1f}".rstrip("0").rstrip(".") + "M"
-    return _credits_label(amount)
-
-
-def _inception_credentials() -> tuple[list[tuple[int, bool]] | None, str | None]:
-    """(credential id, disabled) per stored key, from OMP's auth store.
-
-    Only the id and the disabled cause are selected: key material never
-    leaves the database.
-    """
-    import sqlite3
-
-    db = omp_agent_dir() / "agent.db"
-    if not db.is_file():
-        return None, "no_auth_store"
-    try:
-        con = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=5)
-        try:
-            rows = con.execute(
-                "SELECT id, disabled_cause FROM auth_credentials WHERE provider = ? ORDER BY id",
-                (INCEPTION_PROVIDER,),
-            ).fetchall()
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return None, "auth_store_unreadable"
-    return [(int(cid), cause is not None) for cid, cause in rows], None
-
-
-def _inception_entry(line: bytes) -> list | None:
-    """[dedupe key, credential id or None, tokens] for one Inception reply."""
-    try:
-        entry = json.loads(line)
-    except ValueError:
-        return None
-    msg = entry.get("message") if isinstance(entry, dict) else None
-    if not isinstance(msg, dict) or msg.get("role") != "assistant" or msg.get("provider") != INCEPTION_PROVIDER:
-        return None
-    usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
-    tokens = _token_plan_number(usage.get("totalTokens"))
-    if tokens is None:
-        parts = [_token_plan_number(usage.get(k)) for k in ("input", "output", "cacheRead", "cacheWrite")]
-        tokens = sum(p for p in parts if p is not None)
-    if not tokens:
-        return None
-    cred = msg.get("credentialId")
-    if isinstance(cred, bool) or not isinstance(cred, int):
-        cred = None
-    # A forked or resumed session copies earlier replies into a new file;
-    # the response id counts each reply once.
-    rid = msg.get("responseId")
-    key = rid if isinstance(rid, str) and rid else f"{msg.get('timestamp')}:{cred}:{tokens}"
-    return [key, cred, int(tokens)]
-
-
-def _transcript_scan(path: Path, offset: int, needle: bytes, parse) -> tuple[list, int]:
-    """`parse(line)` items for complete lines from `offset`, and where they end.
-
-    Only lines containing `needle` are parsed. A trailing partial line is left
-    for the next probe, so an append in progress is never half-counted.
-    """
-    entries: list = []
-    consumed = offset
-    carry = b""
-    with path.open("rb") as fh:
-        fh.seek(offset)
-        while True:
-            chunk = fh.read(TRANSCRIPT_CHUNK)
-            if not chunk:
-                break
-            data = carry + chunk
-            cut = data.rfind(b"\n")
-            if cut < 0:
-                carry = data
-                continue
-            body, carry = data[: cut + 1], data[cut + 1 :]
-            consumed += len(body)
-            if needle not in body:
-                continue
-            for line in body.split(b"\n"):
-                if needle in line:
-                    item = parse(line)
-                    if item is not None:
-                        entries.append(item)
-    return entries, consumed
-
-
-def _transcript_ledger(ledger_path: Path, version: int, needle: bytes, parse) -> list:
-    """Every `parse` item across OMP transcripts, read incrementally, deduplicated.
-
-    The ledger file remembers each transcript's inode, size, mtime, and read
-    offset: unchanged files are skipped, appended ones are read from the
-    offset, and replaced or truncated ones are read again. Items are lists
-    whose first element is a dedupe key (a forked or resumed session copies
-    earlier replies into a new file), so each reply is returned once.
-    """
-    root = omp_agent_dir() / "sessions"
-    try:
-        saved = json.loads(ledger_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        saved = {}
-    if not isinstance(saved, dict) or saved.get("version") != version:
-        saved = {}
-    known = saved.get("files") if isinstance(saved.get("files"), dict) else {}
-    files: dict = {}
-    changed = len(known) == 0
-    paths = sorted(root.rglob("*.jsonl")) if root.is_dir() else []
-    for path in paths:
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        name = str(path)
-        prev = known.get(name)
-        prev = prev if isinstance(prev, dict) else None
-        if prev and prev.get("ino") == st.st_ino and prev.get("mtime_ns") == st.st_mtime_ns and prev.get("size") == st.st_size:
-            files[name] = prev
-            continue
-        changed = True
-        resume = prev is not None and prev.get("ino") == st.st_ino and st.st_size >= int(prev.get("offset") or 0)
-        offset = int(prev["offset"]) if resume else 0
-        entries = list(prev.get("entries") or []) if resume else []
-        try:
-            found, offset = _transcript_scan(path, offset, needle, parse)
-        except OSError:
-            continue
-        entries.extend(found)
-        files[name] = {"ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "offset": offset, "entries": entries}
-    if changed or len(files) != len(known):
-        atomic_write(ledger_path, json.dumps({"version": version, "files": files}, separators=(",", ":")) + "\n")
-
-    seen: set = set()
-    items: list = []
-    for item in files.values():
-        for entry in item.get("entries") or []:
-            if entry[0] in seen:
-                continue
-            seen.add(entry[0])
-            items.append(entry)
-    return items
-
-
-def _inception_ledger() -> dict:
-    """Tokens per credential id across every OMP transcript."""
-    by_credential: dict[int, int] = {}
-    unattributed = 0
-    for _key, cred, tokens in _transcript_ledger(
-        inception_ledger_path(), INCEPTION_LEDGER_VERSION, INCEPTION_NEEDLE, _inception_entry
-    ):
-        if cred is None:
-            unattributed += tokens
-        else:
-            by_credential[cred] = by_credential.get(cred, 0) + tokens
-    return {"by_credential": by_credential, "unattributed": unattributed}
-
-
-def _empty_inception(status: str, reason: str) -> dict:
-    rec = empty_provider("inception", status, reason, plan="OMP ledger")
-    rec["windows"] = [window("weekly", "Fleet tokens", None), window("special", "Hottest key", None)]
-    rec["account_usage"] = []
-    rec["tokens"] = {}
-    return rec
-
-
-def probe_inception() -> dict:
-    creds, failure = _inception_credentials()
-    if creds is None:
-        return _empty_inception("unauth", failure or "no_auth_store")
-    enabled = [cid for cid, disabled in creds if not disabled]
-    if not enabled:
-        return _empty_inception("unauth", "no_credentials")
-    try:
-        ledger = _inception_ledger()
-    except OSError:
-        return _empty_inception("unknown", "ledger_unreadable")
-
-    grant = _inception_tokens_per_key()
-    expected_keys = _inception_expected_key_count(len(enabled))
-    unmetered_keys = expected_keys - len(enabled)
-    now = iso_now()
-    rows = []
-    for cid in enabled:
-        used = min(ledger["by_credential"].get(cid, 0), grant)
-        rows.append(
-            {
-                "label": f"key {cid}",
-                "used_pct": ratio(used, grant),
-                "tokens_used": used,
-                "tokens_total": grant,
-                "tokens_remaining": grant - used,
-                "fetched_at": now,
-            }
-        )
-    for index in range(unmetered_keys):
-        rows.append(
-            {
-                "label": f"key not in OMP {index + 1}",
-                "used_pct": None,
-                "tokens_used": None,
-                "tokens_total": grant,
-                "tokens_remaining": None,
-                "fetched_at": now,
-            }
-        )
-    total = grant * expected_keys
-    # Replies OMP recorded without a credential id still drew on some key.
-    used = min(sum(row["tokens_used"] or 0 for row in rows) + ledger["unattributed"], total)
-    tokens = {
-        "used": used,
-        "total": total,
-        "remaining": None if unmetered_keys else total - used,
-    }
-    if unmetered_keys:
-        tokens["key_count"] = expected_keys
-        tokens["unmetered_keys"] = unmetered_keys
-    if ledger["unattributed"]:
-        tokens["unattributed"] = ledger["unattributed"]
-    disabled_count = len(creds) - len(enabled)
-    rec = {
-        "id": "inception",
-        "name": "Inception",
-        "logo": "I",
-        "plan": "OMP ledger",
-        "status": "ok",
-        "windows": [
-            window("weekly", "OMP-metered fleet" if unmetered_keys else "Fleet tokens", ratio(used, total)),
-            window(
-                "special",
-                "Hottest metered key" if unmetered_keys else "Hottest key",
-                max((row["used_pct"] for row in rows if row["used_pct"] is not None), default=None),
-            ),
-        ],
-        "account_usage": rows,
-        "tokens": tokens,
-        "snapshot": {"reports": len(enabled), "accounts_without_usage": 0, "disabled_credentials": disabled_count},
-        "measured_at": now,
-    }
-    if disabled_count or unmetered_keys:
-        rec["reason"] = "partial_usage"
-    return rec
-
-
 # --- Mistral -------------------------------------------------------------------
 
 # Mistral API keys cannot read their own spend or limits: /v1 has no usage or
@@ -2022,13 +1463,22 @@ def probe_inception() -> dict:
 # `usage.cost.total` (OMP's catalog price estimate, in USD) and tokens of every
 # `provider: mistral` reply in the session transcripts. With
 # AI_USAGE_MISTRAL_MONTHLY_BUDGET set (USD), the month window meters spend
-# against it; without one the chip shows the spend alone. Usage outside OMP,
-# or in deleted transcripts, is invisible, so the figure is a floor.
+# against it; without one the chip shows the spend alone. When Mistral refuses
+# the key in use because its budget is spent (HTTP 402), the window reads full
+# either way. Replies from transcripts OMP has since deleted stay counted until
+# their month ends; usage outside OMP is invisible, so the figure is a floor.
 MISTRAL_PROVIDER = "mistral"
-MISTRAL_LEDGER_VERSION = 1
+MISTRAL_LEDGER_VERSION = 2
 # OMP writes transcripts as compact JSON; a model name alone ("mistral-large")
 # must not pull a line from another provider into the parser.
 MISTRAL_NEEDLE = b'"provider":"mistral"'
+# Transcripts are read in chunks and only lines carrying the needle are parsed:
+# the corpus runs to gigabytes and almost none of it is Mistral.
+TRANSCRIPT_CHUNK = 8 << 20
+
+
+def omp_agent_dir() -> Path:
+    return Path(os.environ.get("AI_USAGE_OMP_AGENT_DIR", Path.home() / ".omp/agent"))
 
 
 def mistral_ledger_path() -> Path:
@@ -2080,6 +1530,58 @@ def _mistral_key_configured() -> bool:
     return row is not None
 
 
+# OMP resolves the Mistral key through omp-mistral-key, which walks an ordered
+# key file (primary first) and skips keys Mistral rejects. Its --check probes
+# every key and records slot, role, key suffix, and HTTP status; ai-usage only
+# reads that record, never key material. A key Mistral accepts but refuses to
+# serve because its budget is spent (`exhausted`, HTTP 402) is not skipped, so
+# it can be the key in use.
+MISTRAL_KEY_RESOLVER = Path(os.environ.get("AI_USAGE_MISTRAL_KEY_RESOLVER", Path.home() / ".local/bin/omp-mistral-key"))
+MISTRAL_KEY_STATUS = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omp-mistral-key/status.json"
+
+
+def _mistral_key_rows() -> tuple[list[dict], int, bool]:
+    """(one row per configured key in priority order, count of rejected keys,
+    whether the key in use is out of budget)."""
+    if os.access(MISTRAL_KEY_RESOLVER, os.X_OK):
+        try:
+            subprocess.run([str(MISTRAL_KEY_RESOLVER), "--check"], capture_output=True, timeout=15, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    try:
+        state = json.loads(MISTRAL_KEY_STATUS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [], 0, False
+    active = state.get("active_slot") if isinstance(state, dict) else None
+    rows: list[dict] = []
+    rejected = 0
+    in_use_exhausted = False
+    for key in (state.get("keys") if isinstance(state, dict) else None) or []:
+        if not isinstance(key, dict) or not isinstance(key.get("slot"), int):
+            continue
+        status = str(key.get("status") or "unchecked")
+        checked = key.get("checked_at")
+        row = {
+            "slot": key["slot"],
+            "plan": str(key.get("role") or ""),
+            "account": f"…{key.get('suffix') or '????'}",
+            "label": f"{status} · in use" if key["slot"] == active else status,
+            "used_pct": None,
+            "fetched_at": datetime.fromtimestamp(checked, UTC).isoformat().replace("+00:00", "Z")
+            if isinstance(checked, (int, float)) and not isinstance(checked, bool)
+            else None,
+        }
+        if status == "rejected":
+            rejected += 1
+            row["error"] = f"{key.get('role') or 'key'} …{key.get('suffix')} rejected (HTTP {key.get('http')})"
+        elif status == "exhausted":
+            row["used_pct"] = 100
+            if key["slot"] == active:
+                in_use_exhausted = True
+        rows.append(row)
+    return rows, rejected, in_use_exhausted
+
+
 def _mistral_entry(line: bytes) -> list | None:
     """[dedupe key, UTC day, model, tokens, cost USD] for one Mistral reply."""
     try:
@@ -2107,6 +1609,119 @@ def _mistral_entry(line: bytes) -> list | None:
     return [key, day, str(msg.get("model") or "?"), int(tokens or 0), float(usd or 0)]
 
 
+def _mistral_scan(path: Path, offset: int) -> tuple[list, int]:
+    """Mistral replies in the complete lines of `path` from `offset`, and where they end.
+
+    Only lines containing the needle are parsed. A trailing partial line is
+    left for the next probe, so an append in progress is never half-counted.
+    """
+    entries: list = []
+    consumed = offset
+    carry = b""
+    with path.open("rb") as fh:
+        fh.seek(offset)
+        while True:
+            chunk = fh.read(TRANSCRIPT_CHUNK)
+            if not chunk:
+                break
+            data = carry + chunk
+            cut = data.rfind(b"\n")
+            if cut < 0:
+                carry = data
+                continue
+            body, carry = data[: cut + 1], data[cut + 1 :]
+            consumed += len(body)
+            if MISTRAL_NEEDLE not in body:
+                continue
+            for line in body.split(b"\n"):
+                if MISTRAL_NEEDLE in line:
+                    item = _mistral_entry(line)
+                    if item is not None:
+                        entries.append(item)
+    return entries, consumed
+
+
+def _mistral_ledger(month: str) -> list:
+    """Every Mistral reply OMP recorded in `month` ('YYYY-MM'), each once.
+
+    The ledger file remembers each transcript's inode, size, mtime, read
+    offset, and the replies read from it: unchanged files are skipped,
+    appended ones are read from the offset, and replaced or truncated ones are
+    read again. OMP deletes old transcripts, so the replies of a transcript
+    that has disappeared move to `deleted` and keep counting. Replies outside
+    `month` are dropped from both, so nothing outlives its month. A reply's
+    first element is its dedupe key (a forked or resumed session copies
+    earlier replies into a new file).
+    """
+    ledger_path = mistral_ledger_path()
+    root = omp_agent_dir() / "sessions"
+    try:
+        saved = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict) or saved.get("version") != MISTRAL_LEDGER_VERSION:
+        saved = {}
+    known = saved.get("files") if isinstance(saved.get("files"), dict) else {}
+
+    def this_month(entries) -> list:
+        return [entry for entry in entries or [] if entry[1].startswith(month)]
+
+    files: dict = {}
+    paths = sorted(root.rglob("*.jsonl")) if root.is_dir() else []
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        name = str(path)
+        prev = known.get(name)
+        prev = prev if isinstance(prev, dict) else None
+        if prev and prev.get("ino") == st.st_ino and prev.get("mtime_ns") == st.st_mtime_ns and prev.get("size") == st.st_size:
+            files[name] = dict(prev, entries=this_month(prev.get("entries")))
+            continue
+        resume = prev is not None and prev.get("ino") == st.st_ino and st.st_size >= int(prev.get("offset") or 0)
+        offset = int(prev["offset"]) if resume else 0
+        entries = list(prev.get("entries") or []) if resume else []
+        try:
+            found, offset = _mistral_scan(path, offset)
+        except OSError:
+            # Unreadable this time, not gone: keep what it held and retry.
+            if prev is not None:
+                files[name] = dict(prev, entries=this_month(prev.get("entries")))
+            continue
+        entries.extend(found)
+        files[name] = {
+            "ino": st.st_ino,
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "offset": offset,
+            "entries": this_month(entries),
+        }
+
+    seen: set = set()
+    items: list = []
+    for item in files.values():
+        for entry in item["entries"]:
+            if entry[0] not in seen:
+                seen.add(entry[0])
+                items.append(entry)
+    gone = this_month(saved.get("deleted") if isinstance(saved.get("deleted"), list) else [])
+    for name, prev in known.items():
+        if name not in files and isinstance(prev, dict):
+            gone.extend(this_month(prev.get("entries")))
+    deleted: list = []
+    for entry in gone:
+        if entry[0] not in seen:
+            seen.add(entry[0])
+            deleted.append(entry)
+    items.extend(deleted)
+
+    state = {"version": MISTRAL_LEDGER_VERSION, "files": files, "deleted": deleted}
+    if state != saved:
+        atomic_write(ledger_path, json.dumps(state, separators=(",", ":")) + "\n")
+    return items
+
+
 def _mistral_month_bounds(now: datetime) -> tuple[str, str]:
     """('YYYY-MM' of `now`, ISO start of the next UTC month)."""
     year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
@@ -2115,6 +1730,20 @@ def _mistral_month_bounds(now: datetime) -> tuple[str, str]:
 
 def _usd_label(value: float) -> str:
     return f"${value:.0f}" if value >= 100 else f"${value:.2f}"
+
+
+def _tokens_label(value) -> str:
+    """Compact token readout: 400000000 -> 400M, 99876543 -> 99.9M, 12345 -> 12k."""
+    number = _token_plan_number(value)
+    if number is None:
+        return "—"
+    amount = float(number)
+    if amount >= 1_000_000:
+        millions = amount / 1_000_000
+        if millions >= 100:
+            return f"{round_half_up(millions)}M"
+        return f"{millions:.1f}".rstrip("0").rstrip(".") + "M"
+    return _credits_label(amount)
 
 
 def _empty_mistral(status: str, reason: str) -> dict:
@@ -2127,20 +1756,18 @@ def _empty_mistral(status: str, reason: str) -> dict:
 def probe_mistral() -> dict:
     if not _mistral_key_configured():
         return _empty_mistral("unauth", "no_credentials")
+    now_dt = datetime.now(UTC)
+    month, resets_at = _mistral_month_bounds(now_dt)
     try:
-        items = _transcript_ledger(mistral_ledger_path(), MISTRAL_LEDGER_VERSION, MISTRAL_NEEDLE, _mistral_entry)
+        items = _mistral_ledger(month)
     except OSError:
         return _empty_mistral("unknown", "ledger_unreadable")
 
-    now_dt = datetime.now(UTC)
-    month, resets_at = _mistral_month_bounds(now_dt)
     today = now_dt.strftime("%Y-%m-%d")
     usd = today_usd = 0.0
     tokens = replies = 0
     by_model: dict[str, dict] = {}
     for _key, day, model, reply_tokens, reply_usd in items:
-        if not day.startswith(month):
-            continue
         usd += reply_usd
         tokens += reply_tokens
         replies += 1
@@ -2157,7 +1784,16 @@ def probe_mistral() -> dict:
     models = sorted(by_model.values(), key=lambda r: (-r["usd"], -r["tokens"], r["model"]))
     for row in models:
         row["usd"] = round(row["usd"], 4)
-    return {
+    key_rows, rejected, exhausted = _mistral_key_rows()
+    # Mistral's own refusal outranks the ledger estimate: the key in use has
+    # nothing left, whatever the transcripts add up to.
+    if exhausted:
+        pct = 100.0
+    elif budget is not None:
+        pct = min(usd / budget * 100, 100.0)
+    else:
+        pct = None
+    rec = {
         "id": MISTRAL_PROVIDER,
         "name": "Mistral",
         "logo": PROVIDER_INDEX[MISTRAL_PROVIDER][1],
@@ -2166,8 +1802,8 @@ def probe_mistral() -> dict:
         "windows": [
             window(
                 "monthly",
-                "Month budget" if budget is not None else "Month spend",
-                min(usd / budget * 100, 100.0) if budget is not None else None,
+                "Month budget" if budget is not None or exhausted else "Month spend",
+                pct,
                 resets_at,
                 extra=extra,
             )
@@ -2180,9 +1816,15 @@ def probe_mistral() -> dict:
             "replies": replies,
             "by_model": models,
         },
-        "account_usage": [],
+        "account_usage": key_rows,
+        "snapshot": {"reports": len(key_rows), "accounts_without_usage": 0, "disabled_credentials": rejected},
         "measured_at": iso_now(),
     }
+    if exhausted:
+        rec["reason"] = "budget_exhausted"
+    elif rejected:
+        rec["reason"] = "partial_usage"
+    return rec
 
 
 def mistral_spend_lines(rec: dict) -> list[str]:
@@ -2203,6 +1845,13 @@ def mistral_spend_lines(rec: dict) -> list[str]:
             )
     lines.append("OMP catalog prices · replies OMP recorded, not usage elsewhere")
     return lines
+
+
+def mistral_alert(rec: dict) -> str | None:
+    """Plain-words reading of a refusal reason, for the tooltip and dashboard."""
+    if rec.get("reason") == "budget_exhausted":
+        return "Mistral is refusing requests: the budget of the key in use is exhausted (HTTP 402)"
+    return None
 
 
 # --- OpenDesign (AMR) ----------------------------------------------------------
@@ -2587,288 +2236,7 @@ def probe_amr() -> dict:
     return rec
 
 
-# --- Grok --------------------------------------------------------------------
-
-
-def probe_grok() -> dict:
-    return _omp_fallback_rec("grok") or empty_provider("grok", "unauth", "no_omp_usage")
-
-
-# --- Kimi --------------------------------------------------------------------
-
-# OMP window id -> (kind, short label, long label). Kimi Code reports a rolling
-# 5-hour window plus two monthly meters (total + code-only) per OAuth account;
-# the auth-gateway balances requests across every stored account, so the chip
-# meters the fleet: per-window account averages plus the single hottest row.
-KIMI_WINDOWS = (
-    ("5h", "session", "5h", "5 Hour limit"),
-    ("limit_month_total", "weekly", "monthly", "Monthly total"),
-    ("limit_month_code", "monthly", "code", "Monthly code"),
-)
-KIMI_KINDS = {wid: (kind, short, label) for wid, kind, short, label in KIMI_WINDOWS}
-
-
-def _kimi_report(report: dict) -> dict:
-    """One OAuth account's usage snapshot, in percent."""
-    row: dict = {}
-    fetched_at = _token_plan_timestamp(report.get("fetchedAt"))
-    if fetched_at:
-        row["fetched_at"] = fetched_at
-    meta = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
-    account = str(meta.get("accountId") or "")
-    if account:
-        row["account"] = account
-    found: dict[str, tuple[float, str | None]] = {}
-    limits = report.get("limits")
-    for limit in limits if isinstance(limits, list) else []:
-        if not isinstance(limit, dict):
-            continue
-        scope = limit.get("scope") if isinstance(limit.get("scope"), dict) else {}
-        win = limit.get("window") if isinstance(limit.get("window"), dict) else {}
-        wid = str(scope.get("windowId") or win.get("id") or "")
-        if wid not in KIMI_KINDS:
-            continue
-        if account:
-            scope_account = str(scope.get("accountId") or "")
-            if scope_account and scope_account != account:
-                continue
-        amount = limit.get("amount") if isinstance(limit.get("amount"), dict) else {}
-        frac = _opencode_go_fraction(amount.get("usedFraction"))
-        if frac is None:
-            continue
-        found[wid] = (frac, iso_from_unix(win.get("resetsAt") or limit.get("resetsAt")))
-    measured: dict[str, dict] = {}
-    for wid, kind, short, label in KIMI_WINDOWS:
-        if wid not in found:
-            continue
-        frac, resets_at = found[wid]
-        entry: dict = {"label": short, "kind_label": label, "used_pct": as_pct(frac * 100.0)}
-        if resets_at:
-            entry["resets_at"] = resets_at
-        measured[kind] = entry
-    if not measured:
-        return row
-    binding = max(measured.items(), key=lambda item: item[1].get("used_pct") or 0.0)[1]
-    row["windows"] = measured
-    row["label"] = binding["kind_label"]
-    row["used_pct"] = binding["used_pct"]
-    if binding.get("resets_at"):
-        row["resets_at"] = binding["resets_at"]
-    return row
-
-
-def _empty_kimi(reason: str) -> dict:
-    rec = empty_provider("kimi", "unknown", reason)
-    rec["windows"] = [
-        window("weekly", "Monthly total", None),
-        window("session", "5 Hour", None),
-        window("monthly", "Monthly code", None),
-        window("special", "Hottest account", None),
-    ]
-    rec["account_usage"] = []
-    rec["snapshot"] = {"reports": 0, "accounts_without_usage": 0, "disabled_credentials": 0}
-    return rec
-
-
-def probe_kimi() -> dict:
-    payload, failure = omp_usage_payload("kimi-code")
-    if payload is None:
-        return _empty_kimi(failure or "bad_payload")
-
-    raw_reports = payload["reports"]
-    reports = [
-        report
-        for report in raw_reports
-        if isinstance(report, dict) and report.get("provider") == "kimi-code"
-    ]
-    rows = [_kimi_report(report) for report in reports]
-    accounts_without_usage = payload.get("accountsWithoutUsage")
-    disabled_credentials = payload.get("disabledCredentials")
-    lists_valid = isinstance(accounts_without_usage, list) and isinstance(disabled_credentials, list)
-    missing_count = len(accounts_without_usage) if isinstance(accounts_without_usage, list) else 0
-    disabled_count = len(disabled_credentials) if isinstance(disabled_credentials, list) else 0
-
-    weekly, weekly_accounts, weekly_reset = _omp_window_average(rows, "weekly")
-    session, session_accounts, session_reset = _omp_window_average(rows, "session")
-    monthly, monthly_accounts, monthly_reset = _omp_window_average(rows, "monthly")
-
-    row_pcts = [row.get("used_pct") for row in rows]
-    complete_reports = (
-        bool(rows)
-        and len(raw_reports) == len(rows)
-        and isinstance(accounts_without_usage, list)
-        and missing_count == 0
-        and all(pct is not None for pct in row_pcts)
-        and all(isinstance(row.get("fetched_at"), str) for row in rows)
-    )
-    declared_accounts = _omp_declared_accounts(payload, "kimi-code")
-    under_reported = declared_accounts is not None and len(rows) != declared_accounts
-    complete_coverage = complete_reports and not under_reported
-    hottest = max(row_pcts) if complete_coverage and row_pcts else None
-    hottest_reset = None
-    if hottest is not None:
-        hottest_reset = next(
-            (row.get("resets_at") for row in rows if row.get("used_pct") == hottest and row.get("resets_at")),
-            None,
-        )
-    status = "ok" if weekly is not None or session is not None else "unknown"
-    windows = [
-        window(
-            "weekly",
-            f"{weekly_accounts}-account monthly" if weekly_accounts else "Monthly total",
-            weekly,
-            weekly_reset,
-        ),
-        window(
-            "session",
-            f"{session_accounts}-account 5h" if session_accounts else "5 Hour",
-            session,
-            session_reset,
-        ),
-        window(
-            "monthly",
-            f"{monthly_accounts}-account code" if monthly_accounts else "Monthly code",
-            monthly,
-            monthly_reset,
-        ),
-        window("special", "Hottest account", hottest, hottest_reset),
-    ]
-    rec = {
-        "id": "kimi",
-        "name": "Kimi",
-        "logo": "K",
-        "status": status,
-        "windows": windows,
-        "account_usage": rows,
-        "snapshot": {
-            "reports": len(rows),
-            "accounts_without_usage": missing_count,
-            "disabled_credentials": disabled_count,
-        },
-    }
-    if not lists_valid or missing_count or disabled_count or under_reported:
-        rec["reason"] = "partial_usage"
-    return rec
-
-# --- Cursor ------------------------------------------------------------------
-
-
-CURSOR_USAGE_SUMMARY_URL = "https://cursor.com/api/usage-summary"
-
-
-def _cursor_usage_summary() -> dict | None:
-    """Cursor's dashboard usage summary, signed with OMP's Cursor login.
-
-    `omp usage` keeps the Auto and API percentages but drops the Included
-    total that Auto draws from; this is the summary cursor-agent's /usage
-    reads. The token never leaves this function, and every failure is None.
-    """
-    omp = os.environ.get("AI_USAGE_OMP_BIN") or which("omp")
-    if not omp:
-        return None
-    try:
-        proc = subprocess.run(
-            [omp, "token", "cursor"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-            env=child_env(),
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    lines = proc.stdout.strip().splitlines() if proc.returncode == 0 and proc.stdout else []
-    token = lines[-1].strip() if lines else ""
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
-    except (ValueError, json.JSONDecodeError):
-        return None
-    user = str(claims.get("sub") or "").split("|")[-1] if isinstance(claims, dict) else ""
-    if not user:
-        return None
-    url = os.environ.get("AI_USAGE_CURSOR_SUMMARY_URL") or CURSOR_USAGE_SUMMARY_URL
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "Cookie": f"WorkosCursorSessionToken={user}%3A%3A{token}"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=20) as resp:
-            data = json.load(resp)
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _apply_cursor_summary(rec: dict, summary: dict) -> dict:
-    """Included / Auto / API meters as cursor-agent shows them.
-
-    Auto-selected requests draw on the Included total; named models draw on
-    the API pool. Auto is a share of Included, so only Included and API feed
-    Hottest.
-    """
-    usage = summary.get("individualUsage") if isinstance(summary.get("individualUsage"), dict) else {}
-    plan = usage.get("plan") if isinstance(usage.get("plan"), dict) else {}
-    total = as_pct(plan.get("totalPercentUsed"))
-    auto = as_pct(plan.get("autoPercentUsed"))
-    api = as_pct(plan.get("apiPercentUsed"))
-    if total is None:
-        return rec
-    reset = iso_from_unix(summary.get("billingCycleEnd"))
-    meters = [("Included", total), ("Auto", auto), ("API", api)]
-    hottest = max(pct for pct in (total, api) if pct is not None)
-    rec = dict(rec)
-    rec["status"] = "ok"
-    rec.pop("reason", None)
-    rec["windows"] = [
-        *(window("monthly", label, pct, reset) for label, pct in meters if pct is not None),
-        window("special", "Hottest", hottest, reset),
-    ]
-    account = next(
-        (row.get("account") for row in rec.get("account_usage") or [] if isinstance(row, dict) and row.get("account")),
-        None,
-    )
-    now = iso_now()
-    rows = []
-    for label, pct in meters:
-        if pct is None:
-            continue
-        row: dict = {"label": label, "used_pct": pct}
-        if account:
-            row["account"] = account
-        if reset:
-            row["resets_at"] = reset
-        row["fetched_at"] = now
-        rows.append(row)
-    rec["account_usage"] = rows
-    rec["measured_at"] = now
-    membership = str(summary.get("membershipType") or "").strip()
-    if membership:
-        rec["plan"] = membership.capitalize()
-    return rec
-
-
-def probe_cursor() -> dict:
-    rec = _omp_fallback_rec("cursor") or empty_provider("cursor", "unauth", "no_omp_usage")
-    # One login signs the summary, so it only describes a single-account fleet.
-    if (rec.get("snapshot") or {}).get("reports", 1) <= 1:
-        summary = _cursor_usage_summary()
-        if summary is not None:
-            rec = _apply_cursor_summary(rec, summary)
-    return attach_cursor_identity(rec)
-
-# --- Devin -------------------------------------------------------------------
-
-
-def probe_devin() -> dict:
-    return _omp_fallback_rec("devin") or empty_provider("devin", "unauth", "no_omp_usage")
-
-
-def probe_devin2() -> dict:
-    """Secondary Devin account: the second report row of OMP's devin provider."""
-    return _omp_fallback_rec("devin2", report_index=1) or empty_provider("devin2", "unauth", "no_omp_usage")
+# --- MiniMax -------------------------------------------------------------------
 
 
 def probe_minimax() -> dict:
@@ -2959,6 +2327,9 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
         if rec.get("reason"):
             bit += f"  {rec['reason']}"
         lines.append(bit)
+        alert = mistral_alert(rec)
+        if alert:
+            lines.append(alert)
     lines.append("")
 
     chips = []
@@ -2979,9 +2350,6 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
     for w in rec.get("windows") or []:
         if isinstance(w, dict):
             limit_rows.append(w)
-    burst = rec.get("burst")
-    if isinstance(burst, dict):
-        limit_rows.append(burst)
     if not limit_rows:
         lines.append("  —")
     else:
@@ -3025,18 +2393,6 @@ def render_dashboard(cache: dict | None = None, selected: str | None = None) -> 
                 lines.append(prefix + reset)
             lines.append("")
 
-    tokens = rec.get("tokens") if isinstance(rec.get("tokens"), dict) else {}
-    tokens_left = _token_plan_number(tokens.get("remaining"))
-    tokens_total = _token_plan_number(tokens.get("total"))
-    unmetered_keys = _token_plan_number(tokens.get("unmetered_keys")) or 0
-    if tokens_left is not None:
-        lines.append(f"{'Tokens left':<28} {_tokens_label(tokens_left)} of {_tokens_label(tokens_total)}")
-        lines.append("one-time grant · tokens OMP spent, not usage elsewhere")
-        lines.append("")
-    elif unmetered_keys and tokens_total is not None:
-        lines.append(f"{'Grant capacity':<28} {_tokens_label(tokens_total)} across {tokens.get('key_count')} keys")
-        lines.append(f"{unmetered_keys} key(s) not in OMP; usage unknown")
-        lines.append("")
     spend_lines = mistral_spend_lines(rec)
     if spend_lines:
         lines.extend(spend_lines)
@@ -3120,18 +2476,11 @@ def cmd_tui(dump: bool = False) -> int:
 
 PROBERS = {
     "codex": probe_codex,
-    "grok": probe_grok,
-    "kimi": probe_kimi,
-    "cursor": probe_cursor,
-    "devin": probe_devin,
-    "devin2": probe_devin2,
     "opencode-go": probe_opencode_go,
-    "zai": probe_zai,
     "minimax": probe_minimax,
     "google": probe_google,
     "anthropic": probe_anthropic,
     "commandcode": probe_commandcode,
-    "inception": probe_inception,
     "mistral": probe_mistral,
     "amr": probe_amr,
 }
@@ -3161,11 +2510,6 @@ def summarize(rec: dict) -> str:
     remaining = _token_plan_number(credits.get("remaining"))
     if remaining is not None:
         bits.append(f"credits={_credits_label(remaining)}")
-    tokens = rec.get("tokens") if isinstance(rec.get("tokens"), dict) else {}
-    if _token_plan_number(tokens.get("remaining")) is not None:
-        bits.append(f"tokens_left={_tokens_label(tokens['remaining'])}")
-    elif _token_plan_number(tokens.get("unmetered_keys")):
-        bits.append(f"keys={tokens.get('key_count')}")
     return " ".join(bits)
 
 
@@ -3198,7 +2542,7 @@ def cmd_login(pid: str) -> int:
     slot_dir = root / str(slot)
     ensure_dir(root, 0o700)
     ensure_dir(slot_dir, 0o700)
-    env = child_env()
+    env = os.environ.copy()
     env["AMR_HOME"] = str(slot_dir)
     env["VELA_PROFILE"] = "prod"
     for key in ("VELA_CONTROL_KEY", "VELA_RUNTIME_KEY", "OPEN_DESIGN_AMR_PROFILE"):
@@ -3391,8 +2735,12 @@ def window_lines(windows: list[dict], accounts: int) -> list[str]:
         tail = []
         if extra_bits.get("remaining_usd") is not None:
             tail.append(f"${float(extra_bits['remaining_usd']):.2f} left")
-        if extra_bits.get("spent_usd") is not None and extra_bits.get("budget_usd") is not None:
-            tail.append(f"{_usd_label(float(extra_bits['spent_usd']))} of {_usd_label(float(extra_bits['budget_usd']))}")
+        if extra_bits.get("spent_usd") is not None:
+            spent_text = _usd_label(float(extra_bits["spent_usd"]))
+            if extra_bits.get("budget_usd") is not None:
+                tail.append(f"{spent_text} of {_usd_label(float(extra_bits['budget_usd']))}")
+            else:
+                tail.append(f"{spent_text} spent")
         reset = reset_phrase(w.get("resets_at"))
         if reset:
             tail.append(reset)
@@ -3429,14 +2777,6 @@ def usage_row_line(index: int, row: dict) -> str:
         label = re.sub(r"\s+limit$", "", str(row.get("label") or "").strip(), flags=re.IGNORECASE)
         if label:
             detail.append(label)
-        remaining = _token_plan_number(row.get("credits_remaining"))
-        total = _token_plan_number(row.get("credits_total"))
-        if remaining is not None and total is not None:
-            detail.append(f"{_credits_label(remaining)} of {_credits_label(total)} left")
-        tokens_left = _token_plan_number(row.get("tokens_remaining"))
-        tokens_total = _token_plan_number(row.get("tokens_total"))
-        if tokens_left is not None and tokens_total is not None:
-            detail.append(f"{_tokens_label(tokens_left)} of {_tokens_label(tokens_total)} tokens left")
         balance = _token_plan_number(row.get("remaining_credits"))
         if balance is not None:
             detail.append(f"{_credits_label(balance)} credits left")
@@ -3504,27 +2844,23 @@ def cmd_waybar() -> int:
     if not isinstance(rec, dict):
         rec = empty_provider(pid if pid in PROVIDER_INDEX else "codex", "unknown", "no_cache")
         rec["logo"] = PROVIDER_INDEX.get(pid, ("?", "?"))[1] if pid in PROVIDER_INDEX else "?"
-    if pid == "cursor":
-        rec = attach_cursor_identity(dict(rec))
     logo = str(rec.get("logo") or PROVIDER_INDEX.get(pid, ("?", "?"))[1])
-    ident = rec.get("identity") if isinstance(rec.get("identity"), dict) else {}
-    ident_id = str(ident.get("id") or ident.get("label") or "").strip()
-    mark = f"{logo} {ident_id}" if ident_id else logo
     rows = [item for item in rec.get("account_usage") or [] if isinstance(item, dict)]
     if pid == "anthropic":
         # Each Claude account is its own meter: averaging an exhausted account
         # with an idle one would hide which credential still has headroom.
         pcts = _anthropic_chip_pcts(rec, rows)
-        text = " ".join([pango_escape(mark), *(meter(pct) for pct in pcts)])
+        text = " ".join([pango_escape(logo), *(meter(pct) for pct in pcts)])
     elif pid == "mistral":
-        # Month-to-date spend is the readout; a budget adds a meter before it.
+        # Month-to-date spend is the readout; a budget, or a key Mistral
+        # refuses for its spent budget, adds a meter before it.
         month = window_by_kind(rec, "monthly") or {}
         month_bits = month.get("extra") if isinstance(month.get("extra"), dict) else {}
         spent = _token_plan_number(month_bits.get("spent_usd"))
         pct = as_pct(month.get("used_pct"))
         bits = [meter(pct)] if pct is not None else []
         bits.append(_usd_label(float(spent)) if spent is not None else meter(None))
-        text = " ".join([pango_escape(mark), *bits])
+        text = " ".join([pango_escape(logo), *bits])
         pcts = [pct]
     elif pid == "amr":
         # One readout per signed-in account, in slot order: the window that
@@ -3541,7 +2877,7 @@ def cmd_waybar() -> int:
                 bits.append(meter(None))
         if not bits:
             bits = [meter(None)]
-        text = " ".join([pango_escape(mark), *bits])
+        text = " ".join([pango_escape(logo), *bits])
         pcts = [as_pct(row.get("used_pct")) for row in rows]
     else:
         weekly = window_by_kind(rec, "weekly") or window_by_kind(rec, "monthly") or {}
@@ -3552,20 +2888,12 @@ def cmd_waybar() -> int:
             extra_txt = f"${usd:.0f}" if usd >= 10 else f"${usd:.2f}"
         else:
             extra_txt = meter(extra.get("used_pct"))
-        text = f"{pango_escape(mark)} {meter(weekly.get('used_pct'))} {extra_txt}"
+        text = f"{pango_escape(logo)} {meter(weekly.get('used_pct'))} {extra_txt}"
         pcts = [as_pct(weekly.get("used_pct")), as_pct(extra.get("used_pct"))]
     credits = rec.get("credits") if isinstance(rec.get("credits"), dict) else {}
     remaining = _token_plan_number(credits.get("remaining"))
     if remaining is not None:
         text += f" {pango_escape(_credits_label(remaining))}cr"
-    tokens = rec.get("tokens") if isinstance(rec.get("tokens"), dict) else {}
-    tokens_left = _token_plan_number(tokens.get("remaining"))
-    tokens_total = _token_plan_number(tokens.get("total"))
-    unmetered_keys = _token_plan_number(tokens.get("unmetered_keys")) or 0
-    if tokens_left is not None:
-        text += f" {pango_escape(_tokens_label(tokens_left))} left"
-    elif unmetered_keys:
-        text += f" {pango_escape(str(tokens.get('key_count')))} keys"
     status = rec.get("status") or "unknown"
     classes = [status]
     age = cache_age_sec(cache)
@@ -3582,30 +2910,16 @@ def cmd_waybar() -> int:
     notes = []
     if report_count(rec) > 1:
         notes.append(f"{report_count(rec)} account reports")
-    if ident_id:
-        title = str(ident.get("title") or ident_id)
-        notes.append(f"identity: {ident_id}" + (f" · {title}" if title and title != ident_id else ""))
-    elif len(rows) == 1 and str(rows[0].get("account") or "").strip():
+    if len(rows) == 1 and str(rows[0].get("account") or "").strip():
         notes.append(f"account: {str(rows[0]['account']).strip()[:8]}")
     lines = tooltip_header(rec, pid, notes)
+    alert = mistral_alert(rec)
+    if alert:
+        lines.append(pango_escape(alert))
     limits = [w for w in rec.get("windows") or [] if isinstance(w, dict)]
-    burst = rec.get("burst")
-    if isinstance(burst, dict) and "used_pct" in burst:
-        limits.append(burst)
     if limits:
         lines.append("")
         lines.extend(window_lines(limits, report_count(rec)))
-    if tokens_total is not None:
-        if tokens_left is not None:
-            lines.append(f"{_tokens_label(tokens_left)} of {_tokens_label(tokens_total)} tokens left")
-            hint = "one-time grant · tokens OMP spent, not usage elsewhere"
-        else:
-            lines.append(f"{_tokens_label(tokens_total)} grant across {tokens.get('key_count')} keys")
-            hint = f"{unmetered_keys} key(s) not in OMP; usage unknown"
-        unattributed = _token_plan_number(tokens.get("unattributed"))
-        if unattributed:
-            hint += f" · {_tokens_label(unattributed)} without a key id"
-        lines.append(muted(hint))
     # A single snapshot repeats the limits above; rows only earn space when
     # there are several to compare.
     if len(rows) > 1:
@@ -3653,17 +2967,10 @@ def cmd_cycle(direction: str) -> int:
     return 0
 
 
-def cmd_identity(direction: str) -> int:
-    """Cycle identities for the selected provider via its local swap helper."""
-    cache = load_cache()
-    selected = pick_selected(cache)
-    if selected == "kimi":
-        rec = cache.get("providers", {}).get("kimi")
-        rows = rec.get("account_usage") if isinstance(rec, dict) else None
-        n = len(rows) if isinstance(rows, list) else 0
-        print(f"kimi: {n or '?'} accounts balanced by omp auth-gateway (no manual cycle)")
-        return 0
-    print(f"{selected}: no identity cycle configured")
+def cmd_identity() -> int:
+    """Waybar's right-click hook. No provider cycles identities, so it only
+    names the selected provider; installed configs still call it."""
+    print(f"{pick_selected(load_cache())}: no identity cycle configured")
     return 0
 
 
@@ -3731,7 +3038,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("waybar", help="print Waybar JSON from cache only")
     cyc = sub.add_parser("cycle", help="rotate selected provider")
     cyc.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
-    ident = sub.add_parser("identity", help="rotate identity inside the selected provider")
+    ident = sub.add_parser("identity", help="Waybar right-click hook; no provider cycles identities")
     ident.add_argument("direction", nargs="?", default="next", choices=("next", "prev"))
     sub.add_parser("validate", help="schema-check cache")
     sub.add_parser("refresh", help="probe the active roster")
@@ -3762,7 +3069,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "cycle":
         return cmd_cycle(args.direction)
     if args.cmd == "identity":
-        return cmd_identity(args.direction)
+        return cmd_identity()
     if args.cmd == "validate":
         return cmd_validate()
     if args.cmd == "tui":

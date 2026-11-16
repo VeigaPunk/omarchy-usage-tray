@@ -1,19 +1,16 @@
 # omarchy-usage-tray
 
-Waybar chip for Omarchy: Codex, Grok, Kimi, Cursor, Devin (both
-accounts), OpenCode Go, Z.ai, MiniMax, Google, Anthropic, Command
-Code, Inception, Mistral, and OpenDesign usage.
-Left-click or scroll to cycle providers; right-click cycles identities for the
-selected provider when supported.
+Waybar chip for Omarchy: Codex, OpenCode Go, MiniMax, Google, Anthropic,
+Command Code, Mistral, and OpenDesign usage.
+Left-click or scroll to cycle providers; right-click is a no-op.
 
-Current release: **1.14.0** (`ai-usage --version`).
+Current release: **1.15.0** (`ai-usage --version`).
 
-Every usage meter except Inception's, Mistral's, and OpenDesign's comes from
-`omp usage --provider <id> --json` — the native CLIs (codex, grok,
-cursor-agent, devin) are not required, because OMP meters those same
-subscriptions from its auth store. Inception and Mistral have no usage API, so
-their meters are ledgers of what OMP spent (see [Inception tokens](#inception-tokens)
-and [Mistral spend](#mistral-spend)).
+Every usage meter except Mistral's and OpenDesign's comes from
+`omp usage --provider <id> --json` — the native CLIs (such as codex) are not
+required, because OMP meters those same subscriptions from its auth store.
+Mistral has no usage API, so its meter is a ledger of what OMP spent (see
+[Mistral spend](#mistral-spend)).
 OpenDesign's API keys cannot read their quota, so the chip signs in to each
 OpenDesign account with the official `vela` CLI and reads the Coding Plan from
 the account API (see [OpenDesign Coding Plan](#opendesign-coding-plan)).
@@ -26,25 +23,17 @@ real number drops out of the cycle instead of rendering an invented zero.
 ## Providers
 
 Every provider below is metered on every probe, from `omp usage --json` (or,
-for Inception and Mistral, OMP's transcripts, and for OpenDesign, its account
-API), and the chip renders whichever one is selected.
+for Mistral, OMP's transcripts, and for OpenDesign, its account API), and the chip renders whichever one is selected.
 
 | Logo | Provider | Windows the chip shows | Source |
 |---|---|---|---|
 | `C` | Codex | Weekly 7-day, hottest account | `omp usage --provider openai-codex --json` |
-| `G` | Grok | Weekly credits, hottest account | `omp usage --provider xai-oauth --json` |
-| `K` | Kimi | Monthly total, 5-hour, monthly code — per OAuth account, averaged + hottest | `omp usage --provider kimi-code --json` |
-| `R` | Cursor | Monthly Included + Auto + API, hottest | `omp usage --provider cursor --json` + Cursor's usage summary (signed with `omp token cursor`) |
-| `D` | Devin | Weekly quota, hottest account | `omp usage --provider devin --json` |
-| `d` | Devin 2 | Weekly quota, second account | `omp usage --provider devin --json` (second report row) |
 | `O` | OpenCode Go | Rolling 5-hour, weekly, monthly, per key | `omp usage --provider opencode-go --json` |
-| `Z` | Z.ai | 5-hour, weekly, hottest account | `omp usage --provider zai --json` |
 | `M` | MiniMax | 7-day, 5-hour, hottest account | `omp usage --provider minimax-code --json` |
 | `g` | Google | Gemini weekly + 5-hour, shared Claude & GPT pools, hottest account | `omp usage --provider google-antigravity --json` |
 | `A` | Anthropic | One meter per account, filled to its binding window: 5-hour, weekly 7-day, or a per-model weekly cap (e.g. Fable) | `omp usage --provider anthropic --json` |
 | `⌘` | Command Code | Weekly + 5-hour credit windows, hottest account, credit balance across accounts | `omp usage --provider commandcode --json` |
-| `I` | Inception | Fleet tokens used of the 100M-per-key grant, hottest key, tokens left | OMP session transcripts + auth store (no usage API) |
-| `ⓜ` | Mistral | Month-to-date spend (USD, OMP catalog prices); optional monthly budget meter | OMP session transcripts + `models.yml` / auth store (no usage API) |
+| `ⓜ` | Mistral | Month-to-date spend (USD, OMP catalog prices); optional monthly budget meter, full when the key OMP uses is exhausted | OMP session transcripts + `models.yml` / auth store (no usage API); key verdicts from `omp-mistral-key --check` |
 | `◇` | OpenDesign | One meter per account, filled to its binding Coding Plan window (5-hour or weekly credits); wallet balance | `ai-usage login amr` (`vela login`) + `amr-api.open-design.ai` billing preflight |
 
 Missing data is never invented: a window the provider did not answer renders as
@@ -97,56 +86,26 @@ and one numbered row per account with its binding window and balance.
 Pay-as-you-go accounts report only the balance. `⌘` is the logo; right-click
 is a no-op because the credentials live in OMP's auth store.
 
-### Inception tokens
-
-Each Inception (Mercury) account gets a one-time grant of 100M tokens, shared
-across models and without expiry. The API answers no quota: its OpenAPI spec
-lists only completions and models, and the console balance sits behind a
-browser session. `omp usage` therefore lists Inception keys under
-`accountsWithoutUsage`.
-
-The chip meters tokens OMP spent instead. OMP stores each Inception key you
-add as an `inception` credential and stamps each assistant reply it records
-with that credential's id, so the probe sums `usage.totalTokens` of every
-`provider: inception` reply in `~/.omp/agent/sessions/**/*.jsonl` per key and
-compares it with the grant. Key ids come from OMP's `agent.db` (`id` and
-`disabled_cause` only; key material is never read). A key you add with OMP
-appears on the next probe; disabled or unregistered keys are not assigned
-invented usage.
-
-When all keys are in OMP, the chip renders `I ▭ ▭ 312M left`: fleet usage, the
-hottest key, and the tokens left across live keys. If a key is outside OMP,
-set `AI_USAGE_INCEPTION_EXPECTED_KEYS` to include it: the chip shows an unknown
-slot and total grant capacity (not a fabricated balance), e.g. `I ▭ ▭ 4 keys`.
-The tooltip lists each metered key (`key 37 · 99.9M of 100M tokens left`) and
-marks unregistered keys as unknown. Replies are counted once by response id,
-so a forked session does not double-count. Replies OMP recorded without a
-credential id still count against the fleet and are shown as `… without a key
-id`.
-
-Limits: tokens spent outside OMP, or in transcripts you deleted, are not seen,
-so the meter is a floor on usage, not the console balance. The first probe reads
-every transcript once (seconds for several GB). After that,
-`~/.cache/ai-usage/inception-ledger.json` stores each file's read offset, and
-only appended or replaced transcripts are read. Override the grant with
-`AI_USAGE_INCEPTION_TOKENS_PER_KEY`, the expected key count with
-`AI_USAGE_INCEPTION_EXPECTED_KEYS`, and the OMP directory with
-`AI_USAGE_OMP_AGENT_DIR`. Right-click is a no-op.
-
 ### Mistral spend
 
 Mistral API keys cannot read their own spend or limits: `/v1` has no usage or
-billing route, chat responses carry only per-minute rate-limit headers, and the
-console's monthly usage sits behind a browser session.
+billing route (`/v1/usage`, `/v1/billing`, … answer 404), chat responses carry
+only per-minute rate-limit headers, and the console's monthly usage sits behind
+a browser session. Spend is therefore a ledger of what OMP spent.
 
 Mistral bills per calendar month, so the chip meters what OMP spent this UTC
 month: the probe sums `usage.cost.total` (OMP's catalog price estimate, in USD)
 and tokens of every `provider: mistral` reply in
 `~/.omp/agent/sessions/**/*.jsonl`. It reads the transcripts incrementally
-through `~/.cache/ai-usage/mistral-ledger.json`, the same way the Inception
-ledger does, and counts each reply once by response id. The probe checks that
-a key is wired into OMP (`MISTRAL_API_KEY`, a `providers.mistral.apiKey` entry
-in `models.yml`, or a stored `mistral` credential) without reading the key.
+through `~/.cache/ai-usage/mistral-ledger.json`, which stores each file's read
+offset so only appended or replaced transcripts are read, and counts each reply
+once by response id. A reply read from a transcript that OMP later deletes or
+garbage-collects stays counted until its UTC month ends, so pruning sessions
+does not lower the month's spend. Spend forgotten that way before 1.15.0 cannot
+be recovered. The probe checks that a key is wired into OMP (`MISTRAL_API_KEY`,
+a `providers.mistral.apiKey` entry in `models.yml`, or a stored `mistral`
+credential) without reading the key. Override the OMP directory with
+`AI_USAGE_OMP_AGENT_DIR`.
 
 The chip renders `ⓜ $1.50`: spend so far this month. Set
 `AI_USAGE_MISTRAL_MONTHLY_BUDGET` to your workspace's monthly spend limit (USD;
@@ -155,9 +114,29 @@ e.g. `165` for a $165/month limit) to add a meter against it, e.g.
 resets with each calendar month. The tooltip lists the month's totals (spend,
 tokens, replies, today's spend) and spend per model, costliest first.
 
-Limits: requests made outside OMP, or in transcripts you deleted, are not seen,
-and the cost is OMP's price estimate, not Mistral's invoice. Right-click is a
-no-op.
+The only authoritative sign of a spent budget is Mistral refusing requests: an
+exhausted key answers chat requests with HTTP 402
+`billing_vibe_budget_exhausted` ("Vibe budget exhausted.") while
+`GET /v1/models` still answers 200, which is why a key check based on
+`/v1/models` alone reported the key as valid. The host's key resolver,
+`omp-mistral-key` (optional; `~/.local/bin/omp-mistral-key`, overridable with
+`AI_USAGE_MISTRAL_KEY_RESOLVER`), runs as `omp-mistral-key --check` on each
+probe and records one verdict per key in
+`$XDG_STATE_HOME/omp-mistral-key/status.json` (default
+`~/.local/state/omp-mistral-key/status.json`): `valid`, `exhausted` (402),
+`rejected` (401/403), `unverified`, `unreachable`, or `unchecked`, plus the
+slot OMP uses — the first key Mistral does not reject, so an exhausted key can
+still be the one in use. The chip reads only that record, never the keys.
+
+When the key OMP uses is exhausted, the meter reads full and critical
+regardless of the ledger figure, with or without a budget set, the reason reads
+`budget_exhausted`, and the tooltip says the budget is exhausted. The tooltip
+lists each key by slot, role (primary or fallback), and last four characters
+with its verdict; an exhausted key reads 100%. Without the resolver or its
+record the meter is the ledger alone.
+
+Limits: requests made outside OMP are not seen, and the cost is OMP's price
+estimate, not Mistral's invoice. Right-click is a no-op.
 
 ### OpenDesign Coding Plan
 
@@ -246,11 +225,11 @@ omarchy plugin remove io.github.veigapunk.usage-tray
 | Gesture | Action |
 |---|---|
 | Left-click | Next provider |
-| Right-click | Next identity where one exists (Kimi reports its balanced state) |
+| Right-click | No-op |
 | Scroll | Cycle providers |
 
-Click and scroll change the chip immediately: `cycle` / `identity` signal
-Waybar themselves. The 60s interval is only a safety net, so the chart can
+Click and scroll change the chip immediately: `cycle` signals Waybar
+itself. The 60s interval is only a safety net, so the chart can
 never sit on a stale provider.
 
 Multi-account providers report one snapshot per stored credential. The chip
@@ -271,16 +250,11 @@ the next probe; run `ai-usage probe opencode-go` to refresh immediately.
 `O` is the logo; right-click there is a no-op because OMP already rotates
 those keys per request.
 
-Kimi runs both OAuth accounts through `omp auth-gateway` (127.0.0.1:8791): the
-gateway round-robins new sessions across the stored `kimi-code` credentials and
-retries on the other account after a usage-limit block, so the chip meters the
-fleet and right-click just reports the balanced state. Cursor / Codex / Grok /
-OpenCode Go / Z.ai / MiniMax / Google / Anthropic / Command Code /
-Inception / Mistral / OpenDesign stay no-ops — OpenCode Go keys rotate inside
-OMP, and Cursor's, MiniMax's, Google's, Anthropic's, Command Code's,
-Inception's, and Mistral's credentials live in OMP, so none has a live file for
-the chip to flip. OpenDesign's sign-ins live in the tray's own slots and are
-all metered at once, so there is nothing to rotate.
+Right-click is a no-op for every provider: OMP owns the credentials (and
+rotates OpenCode Go keys per request), and OpenDesign's sign-ins live in the
+tray's own slots and are all metered at once, so there is no identity for the
+chip to flip. Right-click stays wired to `ai-usage identity next`, which prints
+`<provider>: no identity cycle configured`.
 
 ## Configuration
 
@@ -289,8 +263,6 @@ service environment for the 5-minute probe:
 
 ```ini
 #AI_USAGE_OMP_BIN=/home/you/.local/bin/omp
-#AI_USAGE_INCEPTION_TOKENS_PER_KEY=100000000
-#AI_USAGE_INCEPTION_EXPECTED_KEYS=4
 #AI_USAGE_MISTRAL_MONTHLY_BUDGET=165
 #AI_USAGE_AMR_DIR=/home/you/.config/ai-usage/amr
 ```
@@ -306,7 +278,7 @@ subscriptions nobody uses and the chip cycles only through providers that can
 show a number.
 
 `AI_USAGE_PROVIDERS` takes a comma and/or whitespace separated id list
-(`AI_USAGE_PROVIDERS="codex kimi"`) and wins when set, so a shell can narrow a
+(`AI_USAGE_PROVIDERS="codex opencode-go"`) and wins when set, so a shell can narrow a
 one-off run; it also works from `~/.config/ai-usage/env` to scope the timer.
 Otherwise the roster comes from `~/.config/ai-usage/providers`, one id per line,
 with `#` comments and blank lines skipped:
@@ -314,21 +286,21 @@ with `#` comments and blank lines skipped:
 ```
 # authed on this machine
 codex
-kimi
-zai
+opencode-go
+google
 ```
 
 `AI_USAGE_PROVIDERS_FILE` overrides that path (the tests point it at a temp
 file). With neither source set — or with a roster that names no known provider —
-all 14 providers stay active, so the default behaviour is unchanged. An unknown
+all 8 providers stay active, so the default behaviour is unchanged. An unknown
 id prints one warning line to stderr (`ai-usage: unknown provider in roster:
 <id>`, once per run) and is skipped; it never fails a probe.
 
 The roster scopes the defaults: `probe` / `refresh` with no id, the click and
 scroll cycle, the TUI chip row and its number keys, and the provider the chip
 falls back to when the selected one has no usable record. Nothing named
-explicitly is restricted — `ai-usage probe zai` and `ai-usage select zai` both
-work while `zai` is off the roster, and the chip renders that selection as soon
+explicitly is restricted — `ai-usage probe google` and `ai-usage select google`
+both work while `google` is off the roster, and the chip renders that selection as soon
 as a record for it exists.
 
 To add a provider you have just authed, add a line to

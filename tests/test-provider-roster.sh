@@ -29,6 +29,9 @@ export AI_USAGE_OMP_BIN="$TMP/bin/fake-omp"
 export AI_USAGE_OMP_LOG="$TMP/omp.log"
 export AI_USAGE_WAYBAR_CONFIG="$TMP/waybar-absent.jsonc"
 export AI_USAGE_PGREP_LOG="$TMP/pgrep.log"
+# Mistral reads the host key resolver's status record under XDG_STATE_HOME
+# (isolated above); the resolver path must not exist either.
+export AI_USAGE_MISTRAL_KEY_RESOLVER="$TMP/no-resolver"
 export PATH="$TMP/bin:$PATH"
 mkdir -p "$TMP/bin" "$HOME/.local/bin" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
 
@@ -65,11 +68,10 @@ from datetime import datetime, timezone
 
 cache_path, selected_path, selected, specs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 names = {
-    "codex": ("Codex", "C"), "grok": ("Grok", "G"),
-    "kimi": ("Kimi", "K"), "cursor": ("Cursor", "R"), "devin": ("Devin", "D"),
-    "devin2": ("Devin 2", "d"), "opencode-go": ("OpenCode Go", "O"),
-    "zai": ("Z.ai", "Z"), "google": ("Google", "g"),
+    "codex": ("Codex", "C"), "opencode-go": ("OpenCode Go", "O"),
+    "minimax": ("MiniMax", "M"), "google": ("Google", "g"),
     "anthropic": ("Anthropic", "A"), "commandcode": ("Command Code", "⌘"),
+    "mistral": ("Mistral", "ⓜ"), "amr": ("OpenDesign", "◇"),
 }
 providers = {}
 for step, spec in enumerate(specs, start=1):
@@ -113,8 +115,8 @@ cycle_walk() {
 
 # --- env roster scopes cycle -------------------------------------------------
 
-seed_cache kimi codex kimi zai google devin
-export AI_USAGE_PROVIDERS="kimi zai"
+seed_cache opencode-go codex opencode-go google anthropic minimax
+export AI_USAGE_PROVIDERS="opencode-go google"
 export AI_USAGE_PROVIDERS_FILE="$ABSENT_ROSTER"
 
 err="$TMP/err-env-cycle"
@@ -125,37 +127,37 @@ visited="$(
   } 2>"$err"
 )"
 [[ ! -s "$err" ]] || fail "clean env roster warned: $(cat "$err")"
-# codex, google, and devin are usable in the cache but off-roster: the cycle
-# must stay inside kimi <-> zai and wrap both ways.
-[[ "$visited" == "$(printf 'zai\nkimi\nzai')" ]] ||
-  fail "env roster cycle visited $(printf '%s' "$visited" | tr '\n' ' ')want 'zai kimi zai'"
-[[ "$(cat "$AI_USAGE_SELECTED")" == zai ]] || fail "selected file not roster-scoped"
+# codex, anthropic, and minimax are usable in the cache but off-roster: the
+# cycle must stay inside opencode-go <-> google and wrap both ways.
+[[ "$visited" == "$(printf 'google\nopencode-go\ngoogle')" ]] ||
+  fail "env roster cycle visited $(printf '%s' "$visited" | tr '\n' ' ')want 'google opencode-go google'"
+[[ "$(cat "$AI_USAGE_SELECTED")" == google ]] || fail "selected file not roster-scoped"
 alt="$("$BIN" waybar | jq -r .alt)"
-[[ "$alt" == zai ]] || fail "waybar alt=$alt want zai"
+[[ "$alt" == google ]] || fail "waybar alt=$alt want google"
 
 # The roster filters PROVIDERS, it does not reorder them: written backwards, the
 # cycle still walks canonical order.
-export AI_USAGE_PROVIDERS="zai kimi codex"
-seed_cache kimi codex kimi zai google
+export AI_USAGE_PROVIDERS="google opencode-go codex"
+seed_cache opencode-go codex opencode-go google anthropic
 err="$TMP/err-order"
 visited="$(cycle_walk next 3 2>"$err")"
 [[ ! -s "$err" ]] || fail "reordered roster warned: $(cat "$err")"
-[[ "$visited" == "$(printf 'zai\ncodex\nkimi')" ]] ||
-  fail "reordered roster cycled $(printf '%s' "$visited" | tr '\n' ' ')want 'zai codex kimi'"
+[[ "$visited" == "$(printf 'google\ncodex\nopencode-go')" ]] ||
+  fail "reordered roster cycled $(printf '%s' "$visited" | tr '\n' ' ')want 'google codex opencode-go'"
 
 # --- file roster scopes cycle ------------------------------------------------
 
 cat >"$TMP/roster" <<'EOF'
 # only the models authed on this machine
 codex
-kimi   # inline comment is skipped
+opencode-go   # inline comment is skipped
 
-zai
+google
 EOF
 unset AI_USAGE_PROVIDERS
 export AI_USAGE_PROVIDERS_FILE="$TMP/roster"
 
-seed_cache codex codex kimi zai google devin
+seed_cache codex codex opencode-go google anthropic minimax
 err="$TMP/err-file-cycle"
 visited="$(
   {
@@ -164,64 +166,64 @@ visited="$(
   } 2>"$err"
 )"
 [[ ! -s "$err" ]] || fail "clean file roster warned: $(cat "$err")"
-[[ "$visited" == "$(printf 'kimi\nzai\ncodex\nzai')" ]] ||
-  fail "file roster cycle visited $(printf '%s' "$visited" | tr '\n' ' ')want 'kimi zai codex zai'"
+[[ "$visited" == "$(printf 'opencode-go\ngoogle\ncodex\ngoogle')" ]] ||
+  fail "file roster cycle visited $(printf '%s' "$visited" | tr '\n' ' ')want 'opencode-go google codex google'"
 
 # --- no roster: every usable provider cycles ---------------------------------
 
 export AI_USAGE_PROVIDERS_FILE="$ABSENT_ROSTER"
-seed_cache codex codex kimi zai google devin
+seed_cache codex codex opencode-go google anthropic minimax
 err="$TMP/err-no-roster"
 visited="$(cycle_walk next 5 2>"$err")"
 [[ ! -s "$err" ]] || fail "no roster warned: $(cat "$err")"
 # PROVIDERS order over the five usable records, wrapping back to the start.
-[[ "$visited" == "$(printf 'kimi\ndevin\nzai\ngoogle\ncodex')" ]] ||
-  fail "no-roster cycle visited $(printf '%s' "$visited" | tr '\n' ' ')want 'kimi devin zai google codex'"
+[[ "$visited" == "$(printf 'opencode-go\nminimax\ngoogle\nanthropic\ncodex')" ]] ||
+  fail "no-roster cycle visited $(printf '%s' "$visited" | tr '\n' ' ')want 'opencode-go minimax google anthropic codex'"
 
 # --- unknown id warns once and is skipped ------------------------------------
 
-export AI_USAGE_PROVIDERS="codex bogus-model kimi"
-seed_cache codex codex kimi zai
+export AI_USAGE_PROVIDERS="codex bogus-model opencode-go"
+seed_cache codex codex opencode-go google
 err="$TMP/err-unknown"
 out="$("$BIN" cycle next 2>"$err")"
-[[ "$out" == kimi ]] || fail "unknown id changed the cycle: got '$out' want 'kimi'"
+[[ "$out" == opencode-go ]] || fail "unknown id changed the cycle: got '$out' want 'opencode-go'"
 [[ "$(grep -c 'bogus-model' "$err")" == 1 ]] ||
   fail "want exactly one warning naming bogus-model, got: $(cat "$err")"
 [[ "$(wc -l <"$err")" == 1 ]] || fail "warning is not one line: $(cat "$err")"
 
 # Same roster, but now the selection is unusable too, so cmd_cycle and
 # pick_selected each resolve the roster: still one warning per bad id per run.
-seed_cache codex '!codex' kimi zai
+seed_cache codex '!codex' opencode-go google
 err="$TMP/err-unknown-twice"
 out="$("$BIN" cycle next 2>"$err")"
-[[ "$out" == kimi ]] || fail "unusable selection with a bad id in the roster: got '$out' want 'kimi'"
+[[ "$out" == opencode-go ]] || fail "unusable selection with a bad id in the roster: got '$out' want 'opencode-go'"
 [[ "$(wc -l <"$err")" == 1 ]] || fail "warning repeated per roster read: $(cat "$err")"
 
 # A roster of nothing but unknown ids falls back to every provider instead of
 # blanking the chip.
 export AI_USAGE_PROVIDERS="bogus-model,nope-2"
-seed_cache codex codex kimi zai
+seed_cache codex codex opencode-go google
 err="$TMP/err-all-unknown"
 out="$("$BIN" cycle next 2>"$err")"
-[[ "$out" == kimi ]] || fail "all-unknown roster did not fall back: got '$out' want 'kimi'"
+[[ "$out" == opencode-go ]] || fail "all-unknown roster did not fall back: got '$out' want 'opencode-go'"
 grep -q 'bogus-model' "$err" || fail "all-unknown roster stayed silent"
 grep -q 'nope-2' "$err" || fail "all-unknown roster named only one bad id"
 
 # --- unusable selection falls back in the roster -----------------------------
 
 # codex is selected but unauth, so the chip must land on the first *rostered*
-# usable provider (zai) and never on an off-roster one (kimi).
-export AI_USAGE_PROVIDERS="zai google"
+# usable provider (google) and never on an off-roster one (opencode-go).
+export AI_USAGE_PROVIDERS="google anthropic"
 export AI_USAGE_PROVIDERS_FILE="$ABSENT_ROSTER"
-seed_cache codex '!codex' kimi zai google
+seed_cache codex '!codex' opencode-go google anthropic
 alt="$("$BIN" waybar | jq -r .alt)"
-[[ "$alt" == zai ]] || fail "unusable selection fell back off-roster: alt=$alt want zai"
+[[ "$alt" == google ]] || fail "unusable selection fell back off-roster: alt=$alt want google"
 nxt="$("$BIN" cycle next)"
-[[ "$nxt" == google ]] || fail "cycle from a rostered fallback: got '$nxt' want 'google'"
+[[ "$nxt" == anthropic ]] || fail "cycle from a rostered fallback: got '$nxt' want 'anthropic'"
 
 # --- probe: default targets are the roster, explicit ids are not -------------
 
-export AI_USAGE_PROVIDERS="codex kimi"
+export AI_USAGE_PROVIDERS="codex opencode-go"
 export AI_USAGE_PROVIDERS_FILE="$ABSENT_ROSTER"
 rm -f "$AI_USAGE_CACHE"
 : >"$AI_USAGE_OMP_LOG"
@@ -229,59 +231,60 @@ err="$TMP/err-probe"
 out="$("$BIN" probe 2>"$err")"
 [[ ! -s "$err" ]] || fail "clean roster probe warned: $(cat "$err")"
 probed="$(printf '%s\n' "$out" | awk '{print $1}' | tr '\n' ' ')"
-[[ "$probed" == "codex kimi " ]] || fail "roster probe printed: $probed"
+[[ "$probed" == "codex opencode-go " ]] || fail "roster probe printed: $probed"
 [[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 2 ]] ||
   fail "roster probe ran $(wc -l <"$AI_USAGE_OMP_LOG") omp calls, want 2"
 cached="$(jq -r '.providers | keys | join(" ")' "$AI_USAGE_CACHE")"
-[[ "$cached" == "codex kimi" ]] || fail "roster probe cached: $cached"
+[[ "$cached" == "codex opencode-go" ]] || fail "roster probe cached: $cached"
 
-# An explicit id is unrestricted: zai is off-roster but still probed on demand.
+# An explicit id is unrestricted: google is off-roster but still probed on demand.
 : >"$AI_USAGE_OMP_LOG"
-out="$("$BIN" probe zai)"
-[[ "$out" == zai* ]] || fail "explicit off-roster probe printed: $out"
-[[ "$(cat "$AI_USAGE_OMP_LOG")" == 'usage --provider zai --json' ]] ||
+out="$("$BIN" probe google)"
+[[ "$out" == google* ]] || fail "explicit off-roster probe printed: $out"
+[[ "$(cat "$AI_USAGE_OMP_LOG")" == 'usage --provider google-antigravity --json' ]] ||
   fail "explicit off-roster probe queried omp with: $(cat "$AI_USAGE_OMP_LOG")"
 if "$BIN" probe bogus-model >/dev/null 2>&1; then
   fail "probe accepted an unknown provider id"
 fi
 
-# No roster probes all 15 providers, as before. Inception and Mistral read
-# OMP's auth store, models.yml, and transcripts directly, so 12 of them call
-# `omp usage` (Cursor also asks `omp token cursor` for its usage summary).
-# OpenDesign reads its own sign-in slots instead of `omp usage`; this isolated
-# HOME has none, so amr resolves no_login without touching the network.
+# No roster probes all 8 providers. Mistral reads OMP's models.yml and
+# transcripts directly, and OpenDesign reads its own sign-in slots (none in this
+# isolated HOME, so amr resolves no_login without touching the network): the
+# other 6 make exactly one `omp usage` call each, and nothing else calls omp.
 unset AI_USAGE_PROVIDERS
 rm -f "$AI_USAGE_CACHE"
 : >"$AI_USAGE_OMP_LOG"
 "$BIN" probe >/dev/null
-[[ "$(grep -c '^usage ' "$AI_USAGE_OMP_LOG")" == 12 ]] ||
-  fail "no-roster probe ran $(grep -c '^usage ' "$AI_USAGE_OMP_LOG") omp usage calls, want 12"
-[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 15 ]] ||
-  fail "no-roster probe did not cache 15 providers"
+[[ "$(grep -c '^usage ' "$AI_USAGE_OMP_LOG")" == 6 ]] ||
+  fail "no-roster probe ran $(grep -c '^usage ' "$AI_USAGE_OMP_LOG") omp usage calls, want 6"
+[[ "$(wc -l <"$AI_USAGE_OMP_LOG")" == 6 ]] ||
+  fail "no-roster probe ran omp for more than usage: $(cat "$AI_USAGE_OMP_LOG")"
+[[ "$(jq -r '.providers | length' "$AI_USAGE_CACHE")" == 8 ]] ||
+  fail "no-roster probe did not cache 8 providers"
 
 # --- select stays unrestricted; chip row is roster-scoped --------------------
 
-export AI_USAGE_PROVIDERS="codex kimi"
-seed_cache codex codex kimi zai google
-"$BIN" select zai >/dev/null
-[[ "$(cat "$AI_USAGE_SELECTED")" == zai ]] || fail "select refused an off-roster provider"
+export AI_USAGE_PROVIDERS="codex opencode-go"
+seed_cache codex codex opencode-go google anthropic
+"$BIN" select google >/dev/null
+[[ "$(cat "$AI_USAGE_SELECTED")" == google ]] || fail "select refused an off-roster provider"
 alt="$("$BIN" waybar | jq -r .alt)"
-[[ "$alt" == zai ]] || fail "off-roster selection not honored: alt=$alt want zai"
+[[ "$alt" == google ]] || fail "off-roster selection not honored: alt=$alt want google"
 if "$BIN" select bogus-model >/dev/null 2>&1; then
   fail "select accepted an unknown provider id"
 fi
 
-"$BIN" select kimi >/dev/null
+"$BIN" select opencode-go >/dev/null
 dump="$("$BIN" tui --dump)"
 chips="$(printf '%s\n' "$dump" | awk 'NR>1 && $0=="" {getline; print; exit}')"
-[[ "$chips" == *"[Kimi]"* ]] || fail "chip row lost the selected marker: '$chips'"
+[[ "$chips" == *"[OpenCode Go]"* ]] || fail "chip row lost the selected marker: '$chips'"
 [[ "$chips" == *Codex* ]] || fail "chip row dropped a rostered provider: '$chips'"
 [[ "$chips" != *Google* ]] || fail "chip row shows an off-roster provider: '$chips'"
-[[ "$chips" != *Z.ai* ]] || fail "chip row shows an off-roster provider: '$chips'"
+[[ "$chips" != *Anthropic* ]] || fail "chip row shows an off-roster provider: '$chips'"
 
 # --- TUI: number keys map onto the roster, and a short roster cannot crash ---
 
-seed_cache codex codex kimi zai google
+seed_cache codex codex opencode-go google anthropic
 python3 - "$BIN" "$AI_USAGE_SELECTED" <<'PY'
 import contextlib
 import importlib.machinery
@@ -343,8 +346,8 @@ with contextlib.redirect_stdout(io.StringIO()):
 if rc != 0:
     raise SystemExit(f"FAIL: TUI loop exited {rc} on an out-of-range digit")
 selected = Path(sys.argv[2]).read_text(encoding="utf-8").strip()
-if selected != "kimi":
-    raise SystemExit(f"FAIL: TUI key 2 selected '{selected}' want 'kimi' (2nd rostered provider)")
+if selected != "opencode-go":
+    raise SystemExit(f"FAIL: TUI key 2 selected '{selected}' want 'opencode-go' (2nd rostered provider)")
 print("TUI_ROSTER_OK")
 PY
 
